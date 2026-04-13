@@ -1,7 +1,7 @@
-use crate::{auth::AuthProof, http, mode::ProxyMode, socks5, tls};
+use crate::{auth::AuthProof, http, mode::ProxyMode, route, route::FilterMode, route::RouteDecision, socks5, tls};
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use std::{path::PathBuf, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncWriteExt, copy_bidirectional},
     net::{TcpListener, TcpStream},
@@ -30,6 +30,12 @@ pub struct ClientArgs {
     pub mux_path: String,
     #[arg(long)]
     pub mux: bool,
+    #[arg(long, value_enum, default_value_t = FilterMode::Proxy)]
+    pub filter: FilterMode,
+    #[arg(long)]
+    pub rule_file: Option<PathBuf>,
+    #[arg(long)]
+    pub cidr_file: Option<PathBuf>,
     #[arg(long, default_value = "Mozilla/5.0")]
     pub user_agent: String,
     #[arg(long, default_value_t = 10)]
@@ -48,6 +54,7 @@ pub async fn run(args: ClientArgs) -> Result<()> {
         ProxyMode::DazeCzar => return crate::czar::run_client(args).await,
     }
 
+    let router = route::Router::from_args(&args)?;
     let connector = TlsConnector::from(tls::load_client_config(args.ca_cert.as_deref())?);
     let (default_host, _) = tls::split_host_port(&args.server)?;
     let server_name = args
@@ -73,10 +80,11 @@ pub async fn run(args: ClientArgs) -> Result<()> {
         let connector = connector.clone();
         let host_header = default_host.clone();
         let server_name = server_name.clone();
+        let router = router.clone();
 
         tokio::spawn(async move {
             if let Err(err) =
-                handle_connection(socket, peer, args, connector, host_header, server_name).await
+                handle_connection(socket, peer, args, router, connector, host_header, server_name).await
             {
                 warn!(peer = %peer, error = %err, "client session ended with error");
             }
@@ -94,6 +102,7 @@ async fn handle_connection(
     mut inbound: TcpStream,
     peer: std::net::SocketAddr,
     args: ClientArgs,
+    router: Arc<route::Router>,
     connector: TlsConnector,
     host_header: String,
     server_name: String,
@@ -107,6 +116,20 @@ async fn handle_connection(
     .await
     .context("SOCKS handshake timed out")??;
     let target_string = target.to_string();
+
+    match router.decide(&target).await? {
+        RouteDecision::Direct => {
+            let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
+            let _ = route::relay_direct_socks(inbound, &target, connect_timeout).await?;
+            info!(peer = %peer, target = %target_string, route = "direct", "client relay completed");
+            return Ok(());
+        }
+        RouteDecision::Block => {
+            let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
+            bail!("target blocked by proxy control: {}", target_string);
+        }
+        RouteDecision::Remote => {}
+    }
 
     let upstream = timeout(
         Duration::from_secs(args.connect_timeout_secs),

@@ -24,6 +24,7 @@ The design is inspired by lightweight remote proxies such as [daze](https://gith
 - the tunnel request looks like normal HTTP over TLS instead of a bespoke plaintext protocol
 - the hidden tunnel handshake looks like a small JSON API call instead of custom proxy headers
 - an optional multiplexed mode can reuse one TLS session for many local SOCKS connections
+- optional client-side proxy control can decide per target whether to connect directly, proxy remotely, or block it
 - an optional `daze-ashe` mode speaks a daze-style RC4 stream protocol over raw TCP
 - an optional `daze-baboon` mode wraps the daze handshake in an HTTP-looking `/sync` exchange
 - an optional `daze-czar` mode multiplexes many daze-ashe streams over one raw TCP session
@@ -73,6 +74,50 @@ PIPIT_PASSWORD='replace-me' cargo run -- client \
 - `daze-czar`: daze-ashe running on top of a compact raw TCP multiplexing layer.
 
 Native modes require `--cert` and `--key` on the server. `daze-ashe`, `daze-baboon`, and `daze-czar` ignore those TLS settings.
+
+## Proxy Control
+
+The client can now do daze-style proxy control before it decides whether a target should use the remote tunnel.
+
+- `--filter proxy`: always use the remote proxy. This is the default and preserves the old behavior.
+- `--filter direct`: always connect directly from the client machine.
+- `--filter rule`: evaluate glob rules first, then CIDR rules, then fall back to remote.
+
+When `--filter rule` is enabled:
+
+- `--rule-file` loads hostname glob rules in the same `L / R / B` style used by daze.
+- `--cidr-file` loads CIDR rules in the same `L / R / B` style.
+- reserved and loopback IP ranges are treated as direct by default, similar to daze's local-network shortcut.
+
+Example `rule.ls`:
+
+```text
+L *.lan *.local printer.home
+R *.example.com
+B ads.example.net
+```
+
+Example `rule.cidr`:
+
+```text
+L 192.168.0.0/16
+R 1.1.1.0/24
+B 203.0.113.0/24
+```
+
+Example client command:
+
+```bash
+PIPIT_PASSWORD='replace-me' cargo run -- client \
+  --mode native-http \
+  --listen 127.0.0.1:1080 \
+  --server example.com:1443 \
+  --server-name example.com \
+  --ca-cert server.crt \
+  --filter rule \
+  --rule-file ./rule.ls \
+  --cidr-file ./rule.cidr
+```
 
 ## Optional Multiplexing
 

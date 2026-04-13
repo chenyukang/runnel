@@ -25,6 +25,15 @@ impl fmt::Display for TargetAddr {
     }
 }
 
+impl TargetAddr {
+    pub fn host_string(&self) -> String {
+        match self {
+            Self::Ip(addr, _) => addr.to_string(),
+            Self::Domain(host, _) => host.clone(),
+        }
+    }
+}
+
 pub async fn accept(stream: &mut TcpStream) -> Result<TargetAddr> {
     let mut greeting = [0_u8; 2];
     stream.read_exact(&mut greeting).await?;

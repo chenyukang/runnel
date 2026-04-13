@@ -1,4 +1,4 @@
-use crate::{client::ClientArgs, http, mode::ProxyMode, server::ServerArgs, socks5};
+use crate::{client::ClientArgs, http, mode::ProxyMode, route, route::RouteDecision, server::ServerArgs, socks5};
 use anyhow::{Context, Result, bail};
 use md5::Context as Md5Context;
 use reqwest::{
@@ -8,6 +8,7 @@ use reqwest::{
 use sha2::{Digest, Sha256};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -28,6 +29,7 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
         _ => bail!("unsupported daze client mode"),
     }
 
+    let router = route::Router::from_args(&args)?;
     let listener = TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("failed to bind {}", args.listen))?;
@@ -42,8 +44,9 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
         let args = args.clone();
+        let router = router.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_client_connection(socket, peer, args).await {
+            if let Err(err) = handle_client_connection(socket, peer, router, args).await {
                 warn!(peer = %peer, error = %err, "daze-ashe client session ended with error");
             }
         });
@@ -81,6 +84,7 @@ pub async fn run_server(args: ServerArgs) -> Result<()> {
 async fn handle_client_connection(
     mut inbound: TcpStream,
     peer: SocketAddr,
+    router: Arc<route::Router>,
     args: ClientArgs,
 ) -> Result<()> {
     inbound.set_nodelay(true)?;
@@ -91,6 +95,20 @@ async fn handle_client_connection(
     .await
     .context("SOCKS handshake timed out")??;
     let target_string = target.to_string();
+
+    match router.decide(&target).await? {
+        RouteDecision::Direct => {
+            let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
+            let _ = route::relay_direct_socks(inbound, &target, connect_timeout).await?;
+            info!(peer = %peer, target = %target_string, route = "direct", mode = "daze-ashe", "relay completed");
+            return Ok(());
+        }
+        RouteDecision::Block => {
+            let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
+            bail!("target blocked by proxy control: {}", target_string);
+        }
+        RouteDecision::Remote => {}
+    }
 
     if target_string.len() > u8::MAX as usize {
         let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
@@ -143,6 +161,7 @@ async fn handle_server_connection(
 }
 
 async fn run_baboon_client(args: ClientArgs) -> Result<()> {
+    let router = route::Router::from_args(&args)?;
     let listener = TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("failed to bind {}", args.listen))?;
@@ -157,8 +176,9 @@ async fn run_baboon_client(args: ClientArgs) -> Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
         let args = args.clone();
+        let router = router.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_baboon_client_connection(socket, peer, args).await {
+            if let Err(err) = handle_baboon_client_connection(socket, peer, router, args).await {
                 warn!(peer = %peer, error = %err, "daze-baboon client session ended with error");
             }
         });
@@ -197,6 +217,7 @@ async fn run_baboon_server(args: ServerArgs) -> Result<()> {
 async fn handle_baboon_client_connection(
     mut inbound: TcpStream,
     peer: SocketAddr,
+    router: Arc<route::Router>,
     args: ClientArgs,
 ) -> Result<()> {
     inbound.set_nodelay(true)?;
@@ -207,6 +228,20 @@ async fn handle_baboon_client_connection(
     .await
     .context("SOCKS handshake timed out")??;
     let target_string = target.to_string();
+
+    match router.decide(&target).await? {
+        RouteDecision::Direct => {
+            let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
+            let _ = route::relay_direct_socks(inbound, &target, connect_timeout).await?;
+            info!(peer = %peer, target = %target_string, route = "direct", mode = "daze-baboon", "relay completed");
+            return Ok(());
+        }
+        RouteDecision::Block => {
+            let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
+            bail!("target blocked by proxy control: {}", target_string);
+        }
+        RouteDecision::Remote => {}
+    }
 
     if target_string.len() > u8::MAX as usize {
         let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;

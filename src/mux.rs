@@ -1,7 +1,7 @@
 use crate::{
     auth::{AuthProof, ReplayProtector},
     client::ClientArgs,
-    http, server::ServerArgs, socks5, tls,
+    http, route, route::RouteDecision, server::ServerArgs, socks5, tls,
 };
 use anyhow::{Context, Result, bail};
 use std::{
@@ -17,7 +17,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{Mutex, mpsc, watch},
-    time::timeout,
+    time::{Instant, MissedTickBehavior, interval, sleep, timeout},
 };
 use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
@@ -27,11 +27,15 @@ const FRAME_OPEN_OK: u8 = 2;
 const FRAME_OPEN_ERR: u8 = 3;
 const FRAME_DATA: u8 = 4;
 const FRAME_CLOSE: u8 = 5;
+const FRAME_PING: u8 = 6;
+const FRAME_PONG: u8 = 7;
 
 const MAX_FRAME_PAYLOAD: usize = 32 * 1024;
 const MAX_CONTROL_PAYLOAD: usize = 8 * 1024;
 const FRAME_HEADER_LEN: usize = 9;
 const SESSION_AUTH_TARGET: &str = "__mux__";
+const SESSION_KEEPALIVE_SECS: u64 = 32;
+const SESSION_IDLE_TIMEOUT_SECS: u64 = 48;
 
 #[derive(Debug)]
 struct Frame {
@@ -79,6 +83,22 @@ impl Frame {
         Self {
             kind: FRAME_CLOSE,
             stream_id,
+            payload: Vec::new(),
+        }
+    }
+
+    fn ping() -> Self {
+        Self {
+            kind: FRAME_PING,
+            stream_id: 0,
+            payload: Vec::new(),
+        }
+    }
+
+    fn pong() -> Self {
+        Self {
+            kind: FRAME_PONG,
+            stream_id: 0,
             payload: Vec::new(),
         }
     }
@@ -218,6 +238,7 @@ impl MuxClient {
         tokio::spawn(run_client_session(
             reader,
             writer,
+            frame_tx.clone(),
             frame_rx,
             streams.clone(),
             closed_tx,
@@ -239,6 +260,7 @@ impl MuxClient {
 
 pub async fn run_client(args: ClientArgs) -> Result<()> {
     let session = Arc::new(MuxClient::new(&args)?);
+    let router = route::Router::from_args(&args)?;
     let listener = TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("failed to bind {}", args.listen))?;
@@ -254,9 +276,10 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
         let (socket, peer) = listener.accept().await?;
         let session = session.clone();
         let args = args.clone();
+        let router = router.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = handle_client_connection(socket, peer, session, args).await {
+            if let Err(err) = handle_client_connection(socket, peer, session, router, args).await {
                 warn!(peer = %peer, error = %err, "mux client session ended with error");
             }
         });
@@ -267,6 +290,7 @@ async fn handle_client_connection(
     mut inbound: TcpStream,
     peer: SocketAddr,
     mux: Arc<MuxClient>,
+    router: Arc<route::Router>,
     args: ClientArgs,
 ) -> Result<()> {
     inbound.set_nodelay(true)?;
@@ -278,6 +302,20 @@ async fn handle_client_connection(
     .await
     .context("SOCKS handshake timed out")??;
     let target_string = target.to_string();
+
+    match router.decide(&target).await? {
+        RouteDecision::Direct => {
+            let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
+            let _ = route::relay_direct_socks(inbound, &target, connect_timeout).await?;
+            info!(peer = %peer, target = %target_string, route = "direct", "mux relay completed");
+            return Ok(());
+        }
+        RouteDecision::Block => {
+            let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
+            bail!("target blocked by proxy control: {}", target_string);
+        }
+        RouteDecision::Remote => {}
+    }
 
     let session = mux.ensure_session().await?;
     let stream_id = mux.next_stream_id();
@@ -458,6 +496,7 @@ where
 async fn run_client_session<R, W>(
     mut reader: R,
     mut writer: W,
+    frame_tx: mpsc::Sender<Frame>,
     mut frame_rx: mpsc::Receiver<Frame>,
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>>,
     closed_tx: watch::Sender<bool>,
@@ -465,27 +504,47 @@ async fn run_client_session<R, W>(
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let reader_loop = async {
+    let keepalive = Duration::from_secs(SESSION_KEEPALIVE_SECS);
+    let idle_timeout = Duration::from_secs(SESSION_IDLE_TIMEOUT_SECS);
+    let mut heartbeat = interval(keepalive);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let idle_deadline = sleep(idle_timeout);
+    tokio::pin!(idle_deadline);
+
+    let result = async {
         loop {
-            let frame = read_frame(&mut reader, MAX_FRAME_PAYLOAD).await?;
-            dispatch_client_frame(frame, &streams).await?;
+            tokio::select! {
+                maybe_frame = frame_rx.recv() => {
+                    let Some(frame) = maybe_frame else {
+                        break;
+                    };
+                    write_frame(&mut writer, &frame).await?;
+                }
+                frame = read_frame(&mut reader, MAX_FRAME_PAYLOAD) => {
+                    let frame = frame?;
+                    match frame.kind {
+                        FRAME_PING => {
+                            let _ = frame_tx.send(Frame::pong()).await;
+                        }
+                        FRAME_PONG => {}
+                        _ => dispatch_client_frame(frame, &streams).await?,
+                    }
+                    idle_deadline.as_mut().reset(Instant::now() + idle_timeout);
+                }
+                _ = heartbeat.tick() => {
+                    if frame_tx.send(Frame::ping()).await.is_err() {
+                        bail!("mux session closed while sending keepalive");
+                    }
+                }
+                _ = &mut idle_deadline => {
+                    bail!("mux session timed out waiting for peer activity");
+                }
+            }
         }
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
-    };
-
-    let writer_loop = async {
-        while let Some(frame) = frame_rx.recv().await {
-            write_frame(&mut writer, &frame).await?;
-        }
 
         Ok::<(), anyhow::Error>(())
-    };
-
-    let result = tokio::select! {
-        res = reader_loop => res,
-        res = writer_loop => res,
-    };
+    }
+    .await;
 
     if let Err(err) = result {
         warn!(error = %err, "mux client session closed");
@@ -507,68 +566,86 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let reader_loop = async {
+    let keepalive = Duration::from_secs(SESSION_KEEPALIVE_SECS);
+    let idle_timeout = Duration::from_secs(SESSION_IDLE_TIMEOUT_SECS);
+    let mut heartbeat = interval(keepalive);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let idle_deadline = sleep(idle_timeout);
+    tokio::pin!(idle_deadline);
+
+    let result = async {
         loop {
-            let frame = read_frame(&mut reader, MAX_FRAME_PAYLOAD).await?;
-            match frame.kind {
-                FRAME_OPEN => {
-                    let target = String::from_utf8(frame.payload)
-                        .context("mux stream target is not valid UTF-8")?;
-                    let existing = {
-                        let streams = streams.lock().await;
-                        streams.contains_key(&frame.stream_id)
+            tokio::select! {
+                maybe_frame = frame_rx.recv() => {
+                    let Some(frame) = maybe_frame else {
+                        break;
                     };
-                    if existing {
-                        let _ = frame_tx
-                            .send(Frame::open_err(frame.stream_id, "duplicate stream id"))
-                            .await;
-                        continue;
-                    }
+                    write_frame(&mut writer, &frame).await?;
+                }
+                frame = read_frame(&mut reader, MAX_FRAME_PAYLOAD) => {
+                    let frame = frame?;
+                    match frame.kind {
+                        FRAME_OPEN => {
+                            let target = String::from_utf8(frame.payload)
+                                .context("mux stream target is not valid UTF-8")?;
+                            let existing = {
+                                let streams = streams.lock().await;
+                                streams.contains_key(&frame.stream_id)
+                            };
+                            if existing {
+                                let _ = frame_tx
+                                    .send(Frame::open_err(frame.stream_id, "duplicate stream id"))
+                                    .await;
+                                continue;
+                            }
 
-                    let frame_tx = frame_tx.clone();
-                    let streams = streams.clone();
-                    let args = args.clone();
+                            let frame_tx = frame_tx.clone();
+                            let streams = streams.clone();
+                            let args = args.clone();
 
-                    tokio::spawn(async move {
-                        if let Err(err) =
-                            handle_server_open(frame.stream_id, target, frame_tx, streams, args).await
-                        {
-                            warn!(stream_id = frame.stream_id, error = %err, "mux stream failed");
+                            tokio::spawn(async move {
+                                if let Err(err) =
+                                    handle_server_open(frame.stream_id, target, frame_tx, streams, args).await
+                                {
+                                    warn!(stream_id = frame.stream_id, error = %err, "mux stream failed");
+                                }
+                            });
                         }
-                    });
-                }
-                FRAME_DATA => {
-                    let tx = {
-                        let streams = streams.lock().await;
-                        streams.get(&frame.stream_id).cloned()
-                    };
+                        FRAME_DATA => {
+                            let tx = {
+                                let streams = streams.lock().await;
+                                streams.get(&frame.stream_id).cloned()
+                            };
 
-                    if let Some(tx) = tx {
-                        let _ = tx.send(ServerStreamCommand::Data(frame.payload)).await;
+                            if let Some(tx) = tx {
+                                let _ = tx.send(ServerStreamCommand::Data(frame.payload)).await;
+                            }
+                        }
+                        FRAME_CLOSE => {
+                            close_server_stream(&streams, frame.stream_id).await;
+                        }
+                        FRAME_PING => {
+                            let _ = frame_tx.send(Frame::pong()).await;
+                        }
+                        FRAME_PONG => {}
+                        _ => bail!("unexpected mux frame type {}", frame.kind),
+                    }
+                    idle_deadline.as_mut().reset(Instant::now() + idle_timeout);
+                }
+                _ = heartbeat.tick() => {
+                    if frame_tx.send(Frame::ping()).await.is_err() {
+                        bail!("mux session closed while sending keepalive");
                     }
                 }
-                FRAME_CLOSE => {
-                    close_server_stream(&streams, frame.stream_id).await;
+                _ = &mut idle_deadline => {
+                    bail!("mux session timed out waiting for peer activity");
                 }
-                _ => bail!("unexpected mux frame type {}", frame.kind),
             }
         }
-        #[allow(unreachable_code)]
-        Ok::<(), anyhow::Error>(())
-    };
-
-    let writer_loop = async {
-        while let Some(frame) = frame_rx.recv().await {
-            write_frame(&mut writer, &frame).await?;
-        }
 
         Ok::<(), anyhow::Error>(())
-    };
-
-    let result = tokio::select! {
-        res = reader_loop => res,
-        res = writer_loop => res,
-    };
+    }
+    .await;
 
     if let Err(err) = result {
         warn!(error = %err, "mux server session closed");
@@ -692,6 +769,7 @@ async fn dispatch_client_frame(
         ),
         FRAME_DATA => StreamEvent::Data(frame.payload),
         FRAME_CLOSE => StreamEvent::Closed,
+        FRAME_PING | FRAME_PONG => return Ok(()),
         _ => bail!("unexpected mux frame type {}", frame.kind),
     };
 

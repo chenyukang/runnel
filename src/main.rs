@@ -6,6 +6,7 @@ mod mode;
 mod mux;
 mod daze;
 mod czar;
+mod route;
 mod server;
 mod socks5;
 mod tls;

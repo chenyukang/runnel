@@ -1,6 +1,7 @@
 use crate::{
     client::ClientArgs,
     daze::{client_establish_ashe, relay_rc4, server_accept_ashe},
+    route, route::RouteDecision,
     server::ServerArgs,
     socks5,
 };
@@ -10,7 +11,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, duplex},
     net::{TcpListener, TcpStream},
     sync::{Mutex, mpsc, watch},
-    time::timeout,
+    time::{Instant, MissedTickBehavior, interval, sleep, timeout},
 };
 use tracing::{info, warn};
 
@@ -25,6 +26,8 @@ const MAX_FRAME_PAYLOAD: usize = 2048 - FRAME_HEADER_LEN;
 const STREAM_BUFFER_SIZE: usize = 64 * 1024;
 const SESSION_CHANNEL_SIZE: usize = 256;
 const STREAM_CHANNEL_SIZE: usize = 32;
+const SESSION_KEEPALIVE_SECS: u64 = 32;
+const SESSION_IDLE_TIMEOUT_SECS: u64 = 48;
 
 #[derive(Debug)]
 enum CzarFrame {
@@ -152,6 +155,7 @@ impl CzarClient {
 
 pub async fn run_client(args: ClientArgs) -> Result<()> {
     let client = Arc::new(CzarClient::new(&args));
+    let router = route::Router::from_args(&args)?;
     let listener = TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("failed to bind {}", args.listen))?;
@@ -167,9 +171,10 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
         let (socket, peer) = listener.accept().await?;
         let args = args.clone();
         let client = client.clone();
+        let router = router.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = handle_client_connection(socket, peer, client, args).await {
+            if let Err(err) = handle_client_connection(socket, peer, client, router, args).await {
                 warn!(peer = %peer, error = %err, "daze-czar client session ended with error");
             }
         });
@@ -203,7 +208,8 @@ async fn handle_client_connection(
     mut inbound: TcpStream,
     peer: SocketAddr,
     client: Arc<CzarClient>,
-    _args: ClientArgs,
+    router: Arc<route::Router>,
+    args: ClientArgs,
 ) -> Result<()> {
     inbound.set_nodelay(true)?;
     let target = timeout(
@@ -213,6 +219,20 @@ async fn handle_client_connection(
     .await
     .context("SOCKS handshake timed out")??;
     let target_string = target.to_string();
+
+    match router.decide(&target).await? {
+        RouteDecision::Direct => {
+            let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
+            let _ = route::relay_direct_socks(inbound, &target, connect_timeout).await?;
+            info!(peer = %peer, target = %target_string, route = "direct", mode = "daze-czar", "relay completed");
+            return Ok(());
+        }
+        RouteDecision::Block => {
+            let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
+            bail!("target blocked by proxy control: {}", target_string);
+        }
+        RouteDecision::Remote => {}
+    }
 
     if target_string.len() > u8::MAX as usize {
         let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
@@ -296,6 +316,13 @@ async fn run_client_session<R, W>(
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let keepalive = Duration::from_secs(SESSION_KEEPALIVE_SECS);
+    let idle_timeout = Duration::from_secs(SESSION_IDLE_TIMEOUT_SECS);
+    let mut heartbeat = interval(keepalive);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let idle_deadline = sleep(idle_timeout);
+    tokio::pin!(idle_deadline);
+
     let result: Result<()> = async {
         loop {
             tokio::select! {
@@ -319,6 +346,13 @@ async fn run_client_session<R, W>(
                         CzarFrame::Probe { reply: true } => {}
                         CzarFrame::Open { .. } => bail!("unexpected stream open from czar server"),
                     }
+                    idle_deadline.as_mut().reset(Instant::now() + idle_timeout);
+                }
+                _ = heartbeat.tick() => {
+                    write_frame(&mut writer, CzarFrame::Probe { reply: false }).await?;
+                }
+                _ = &mut idle_deadline => {
+                    bail!("czar session timed out waiting for peer activity");
                 }
             }
         }
@@ -346,6 +380,13 @@ async fn run_server_session<R, W>(
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let keepalive = Duration::from_secs(SESSION_KEEPALIVE_SECS);
+    let idle_timeout = Duration::from_secs(SESSION_IDLE_TIMEOUT_SECS);
+    let mut heartbeat = interval(keepalive);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let idle_deadline = sleep(idle_timeout);
+    tokio::pin!(idle_deadline);
+
     let result: Result<()> = async {
         loop {
             tokio::select! {
@@ -390,6 +431,13 @@ async fn run_server_session<R, W>(
                         }
                         CzarFrame::Probe { reply: true } => {}
                     }
+                    idle_deadline.as_mut().reset(Instant::now() + idle_timeout);
+                }
+                _ = heartbeat.tick() => {
+                    write_frame(&mut writer, CzarFrame::Probe { reply: false }).await?;
+                }
+                _ = &mut idle_deadline => {
+                    bail!("czar session timed out waiting for peer activity");
                 }
             }
         }
@@ -516,8 +564,14 @@ async fn close_session(
     closed_tx: watch::Sender<bool>,
 ) {
     let _ = closed_tx.send(true);
-    let mut map = streams.lock().await;
-    map.clear();
+    let channels = {
+        let mut map = streams.lock().await;
+        map.drain().map(|(_, tx)| tx).collect::<Vec<_>>()
+    };
+
+    for tx in channels {
+        let _ = tx.send(StreamEvent::Close).await;
+    }
 }
 
 async fn take_stream_id(ids: &Arc<Mutex<Vec<u8>>>) -> Result<u8> {
