@@ -1,6 +1,8 @@
 use crate::{
     auth::{AuthProof, ReplayProtector},
-    http, tls,
+    http,
+    mode::ProxyMode,
+    tls,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -29,9 +31,11 @@ pub struct ServerArgs {
     #[arg(long, default_value = "0.0.0.0:1443")]
     pub listen: String,
     #[arg(long)]
-    pub cert: PathBuf,
+    pub cert: Option<PathBuf>,
     #[arg(long)]
-    pub key: PathBuf,
+    pub key: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = ProxyMode::NativeHttp)]
+    pub mode: ProxyMode,
     #[arg(long, env = "PIPIT_PASSWORD")]
     pub password: String,
     #[arg(long, default_value = "/connect")]
@@ -59,7 +63,20 @@ pub struct ServerArgs {
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
-    let acceptor = TlsAcceptor::from(tls::load_server_config(&args.cert, &args.key)?);
+    match args.mode {
+        ProxyMode::NativeHttp | ProxyMode::NativeMux => {}
+        ProxyMode::DazeAshe => return crate::daze::run_server(args).await,
+    }
+
+    let cert = args
+        .cert
+        .as_deref()
+        .context("--cert is required for native modes")?;
+    let key = args
+        .key
+        .as_deref()
+        .context("--key is required for native modes")?;
+    let acceptor = TlsAcceptor::from(tls::load_server_config(cert, key)?);
     let replay = Arc::new(ReplayProtector::new(Duration::from_secs(
         args.auth_window_secs,
     )));
@@ -121,12 +138,16 @@ async fn handle_connection(
     .context("request head timed out")??;
     let (head, body_prefix) = head;
 
-    if let Some(mux_head) = http::parse_tunnel_request_head(&head, &args.mux_path)? {
+    if matches!(args.mode, ProxyMode::NativeMux)
+        && let Some(mux_head) = http::parse_tunnel_request_head(&head, &args.mux_path)?
+    {
         return crate::mux::run_server_session(stream, peer, mux_head, &body_prefix, args, replay)
             .await;
     }
 
-    if let Some(tunnel_head) = http::parse_tunnel_request_head(&head, &args.path)? {
+    if matches!(args.mode, ProxyMode::NativeHttp)
+        && let Some(tunnel_head) = http::parse_tunnel_request_head(&head, &args.path)?
+    {
         if let Some(target) =
             authorize_tunnel_request(&mut stream, tunnel_head, &body_prefix, &args, &replay)
                 .await?

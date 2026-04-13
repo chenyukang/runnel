@@ -1,4 +1,4 @@
-use crate::{auth::AuthProof, http, socks5, tls};
+use crate::{auth::AuthProof, http, mode::ProxyMode, socks5, tls};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use std::{path::PathBuf, time::Duration};
@@ -20,6 +20,8 @@ pub struct ClientArgs {
     pub server_name: Option<String>,
     #[arg(long)]
     pub ca_cert: Option<PathBuf>,
+    #[arg(long, value_enum, default_value_t = ProxyMode::NativeHttp)]
+    pub mode: ProxyMode,
     #[arg(long, env = "PIPIT_PASSWORD")]
     pub password: String,
     #[arg(long, default_value = "/connect")]
@@ -39,8 +41,10 @@ pub struct ClientArgs {
 }
 
 pub async fn run(args: ClientArgs) -> Result<()> {
-    if args.mux {
-        return crate::mux::run_client(args).await;
+    match args.effective_mode()? {
+        ProxyMode::NativeHttp => {}
+        ProxyMode::NativeMux => return crate::mux::run_client(args).await,
+        ProxyMode::DazeAshe => return crate::daze::run_client(args).await,
     }
 
     let connector = TlsConnector::from(tls::load_client_config(args.ca_cert.as_deref())?);
@@ -76,6 +80,12 @@ pub async fn run(args: ClientArgs) -> Result<()> {
                 warn!(peer = %peer, error = %err, "client session ended with error");
             }
         });
+    }
+}
+
+impl ClientArgs {
+    pub fn effective_mode(&self) -> Result<ProxyMode> {
+        ProxyMode::from_legacy_mux(self.mux, self.mode)
     }
 }
 
