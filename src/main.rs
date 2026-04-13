@@ -2,6 +2,7 @@ mod auth;
 mod cert;
 mod client;
 mod http;
+mod mux;
 mod server;
 mod socks5;
 mod tls;

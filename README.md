@@ -22,6 +22,7 @@ The design is inspired by lightweight remote proxies such as [daze](https://gith
 - `pipit server` accepts TLS connections and relays authenticated tunnels
 - the tunnel request looks like normal HTTP over TLS instead of a bespoke plaintext protocol
 - the hidden tunnel handshake looks like a small JSON API call instead of custom proxy headers
+- an optional multiplexed mode can reuse one TLS session for many local SOCKS connections
 - the server rejects replayed authentication proofs
 - the server denies literal private IP targets by default
 - the server can proxy unmatched requests to a real upstream website
@@ -57,6 +58,30 @@ PIPIT_PASSWORD='replace-me' cargo run -- client \
 
 4. Point your browser or tools at `socks5://127.0.0.1:1080`.
 
+## Optional Multiplexing
+
+For short-lived connections, you can reuse one TLS session and multiplex multiple SOCKS streams through it:
+
+```bash
+PIPIT_PASSWORD='replace-me' cargo run -- server \
+  --listen 0.0.0.0:1443 \
+  --cert server.crt \
+  --key server.key \
+  --mux-path /mux
+```
+
+```bash
+PIPIT_PASSWORD='replace-me' cargo run -- client \
+  --listen 127.0.0.1:1080 \
+  --server example.com:1443 \
+  --server-name example.com \
+  --ca-cert server.crt \
+  --mux \
+  --mux-path /mux
+```
+
+In `--mux` mode, the client keeps a persistent TLS session and opens lightweight logical streams inside it instead of paying the full TCP + TLS + HTTP handshake cost for every SOCKS connection.
+
 ## Security Notes
 
 - TLS certificate verification is enabled by default.
@@ -70,7 +95,7 @@ PIPIT_PASSWORD='replace-me' cargo run -- client \
 
 ## Protocol Shape
 
-The current handshake is intentionally small:
+The baseline handshake is intentionally small:
 
 1. client accepts a local SOCKS5 `CONNECT`
 2. client opens TLS to the server
@@ -81,6 +106,8 @@ The current handshake is intentionally small:
 
 Requests that do not match the tunnel path are forwarded to a real upstream website. By default that upstream is `https://www.qq.com`, and you can override it with `--fallback-url`.
 
+When `--mux` is enabled on the client, it first establishes an authenticated `POST /mux HTTP/1.1` session inside TLS, then carries multiple logical `open/data/close` streams over a compact binary frame protocol on that single TLS connection.
+
 ## Current Scope
 
 This first implementation is deliberately narrow:
@@ -89,7 +116,7 @@ This first implementation is deliberately narrow:
 - SOCKS5 `CONNECT` only
 - one upstream tunnel per local connection
 - no UDP relay
-- no multiplexing
+- optional multiplexing via `--mux`
 - no traffic shaping yet
 
 That keeps the code smaller and makes reliability easier to reason about before we add more protocol surface.

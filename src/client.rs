@@ -24,6 +24,10 @@ pub struct ClientArgs {
     pub password: String,
     #[arg(long, default_value = "/connect")]
     pub path: String,
+    #[arg(long, default_value = "/mux")]
+    pub mux_path: String,
+    #[arg(long)]
+    pub mux: bool,
     #[arg(long, default_value = "Mozilla/5.0")]
     pub user_agent: String,
     #[arg(long, default_value_t = 10)]
@@ -35,6 +39,10 @@ pub struct ClientArgs {
 }
 
 pub async fn run(args: ClientArgs) -> Result<()> {
+    if args.mux {
+        return crate::mux::run_client(args).await;
+    }
+
     let connector = TlsConnector::from(tls::load_client_config(args.ca_cert.as_deref())?);
     let (default_host, _) = tls::split_host_port(&args.server)?;
     let server_name = args

@@ -36,6 +36,8 @@ pub struct ServerArgs {
     pub password: String,
     #[arg(long, default_value = "/connect")]
     pub path: String,
+    #[arg(long, default_value = "/mux")]
+    pub mux_path: String,
     #[arg(long, default_value_t = 120)]
     pub auth_window_secs: u64,
     #[arg(long, default_value_t = 10)]
@@ -118,6 +120,11 @@ async fn handle_connection(
     .await
     .context("request head timed out")??;
     let (head, body_prefix) = head;
+
+    if let Some(mux_head) = http::parse_tunnel_request_head(&head, &args.mux_path)? {
+        return crate::mux::run_server_session(stream, peer, mux_head, &body_prefix, args, replay)
+            .await;
+    }
 
     if let Some(tunnel_head) = http::parse_tunnel_request_head(&head, &args.path)? {
         if let Some(target) =
