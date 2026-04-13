@@ -117,6 +117,7 @@ async fn handle_connection(
     )
     .await
     .context("request head timed out")??;
+    let (head, body_prefix) = head;
 
     let request = match http::parse_request(&head) {
         Ok(request) => request,
@@ -127,13 +128,13 @@ async fn handle_connection(
     };
 
     if !request.version.starts_with("HTTP/1.") {
-        serve_public_request(&mut stream, request, &fallback).await?;
+        serve_public_request(&mut stream, request, &body_prefix, &fallback).await?;
         return Ok(());
     }
 
     if request.method == "POST" && request.path == args.path {
         if let Some(target) =
-            authorize_tunnel_request(&mut stream, &request, &args, &replay).await?
+            authorize_tunnel_request(&mut stream, &request, &body_prefix, &args, &replay).await?
         {
             if !args.allow_private_targets && is_private_literal_target(&target) {
                 let response = http::build_error_response(
@@ -188,19 +189,20 @@ async fn handle_connection(
         return Ok(());
     }
 
-    serve_public_request(&mut stream, request, &fallback).await?;
+    serve_public_request(&mut stream, request, &body_prefix, &fallback).await?;
     Ok(())
 }
 
 async fn serve_public_request<S>(
     stream: &mut S,
     request: http::HttpRequest,
+    body_prefix: &[u8],
     fallback: &Fallback,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    match fallback.proxy(stream, request).await {
+    match fallback.proxy(stream, request, body_prefix).await {
         Ok(()) => return Ok(()),
         Err(err) => warn!(error = %err, "fallback request failed, serving 404"),
     }
@@ -222,6 +224,7 @@ where
 async fn authorize_tunnel_request<S>(
     stream: &mut S,
     request: &http::HttpRequest,
+    body_prefix: &[u8],
     args: &ServerArgs,
     replay: &ReplayProtector,
 ) -> Result<Option<String>>
@@ -236,7 +239,7 @@ where
         Some(length) => length,
         None => return Ok(None),
     };
-    let body = http::read_body(stream, body_length, args.max_tunnel_body_size).await?;
+    let body = http::read_body(stream, body_prefix, body_length, args.max_tunnel_body_size).await?;
     let payload = match http::parse_tunnel_payload(&body) {
         Ok(payload) => payload,
         Err(_) => return Ok(None),
@@ -286,7 +289,12 @@ impl Fallback {
         })
     }
 
-    async fn proxy<S>(&self, stream: &mut S, request: http::HttpRequest) -> Result<()>
+    async fn proxy<S>(
+        &self,
+        stream: &mut S,
+        request: http::HttpRequest,
+        body_prefix: &[u8],
+    ) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
@@ -298,7 +306,7 @@ impl Fallback {
         let body = if body_length == 0 {
             Vec::new()
         } else {
-            http::read_body(stream, body_length, self.max_body_size).await?
+            http::read_body(stream, body_prefix, body_length, self.max_body_size).await?
         };
 
         let method =

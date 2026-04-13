@@ -4,7 +4,7 @@ use hmac::{Hmac, Mac};
 use rand::{RngCore, rngs::OsRng};
 use sha2::Sha256;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -34,14 +34,20 @@ impl AuthProof {
 #[derive(Debug)]
 pub struct ReplayProtector {
     ttl: Duration,
-    seen: Mutex<HashMap<String, i64>>,
+    seen: Mutex<ReplayState>,
+}
+
+#[derive(Debug, Default)]
+struct ReplayState {
+    seen: HashMap<String, i64>,
+    order: VecDeque<(String, i64)>,
 }
 
 impl ReplayProtector {
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl,
-            seen: Mutex::new(HashMap::new()),
+            seen: Mutex::new(ReplayState::default()),
         }
     }
 
@@ -61,9 +67,17 @@ impl ReplayProtector {
 
         let mut seen = self.seen.lock().expect("replay cache poisoned");
         let oldest = now - self.ttl.as_secs() as i64;
-        seen.retain(|_, ts| *ts >= oldest);
+        while let Some((_, ts)) = seen.order.front() {
+            if *ts >= oldest {
+                break;
+            }
+            let (nonce, ts) = seen.order.pop_front().expect("front element must exist");
+            if seen.seen.get(&nonce).copied() == Some(ts) {
+                seen.seen.remove(&nonce);
+            }
+        }
 
-        if seen.contains_key(&proof.nonce) {
+        if seen.seen.contains_key(&proof.nonce) {
             bail!("nonce already used");
         }
 
@@ -86,7 +100,8 @@ impl ReplayProtector {
             bail!("signature mismatch");
         }
 
-        seen.insert(proof.nonce.clone(), proof.timestamp);
+        seen.order.push_back((proof.nonce.clone(), proof.timestamp));
+        seen.seen.insert(proof.nonce.clone(), proof.timestamp);
         Ok(())
     }
 }

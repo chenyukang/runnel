@@ -131,7 +131,7 @@ async fn handle_connection(
     )
     .await
     {
-        Ok(Ok(head)) => head,
+        Ok(Ok((head, _body_prefix))) => head,
         Ok(Err(err)) => {
             let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
             return Err(err).context("failed to read server response");

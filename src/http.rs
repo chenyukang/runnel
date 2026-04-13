@@ -26,28 +26,40 @@ pub struct TunnelPayload {
     pub signature: String,
 }
 
-pub async fn read_head<R>(reader: &mut R, max_bytes: usize) -> Result<Vec<u8>>
+const HEADER_END: &[u8] = b"\r\n\r\n";
+const HEAD_READ_CHUNK: usize = 1024;
+
+pub async fn read_head<R>(reader: &mut R, max_bytes: usize) -> Result<(Vec<u8>, Vec<u8>)>
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = Vec::with_capacity(1024);
-    let mut byte = [0_u8; 1];
+    let mut buf = Vec::with_capacity(HEAD_READ_CHUNK.min(max_bytes));
+    let mut chunk = [0_u8; HEAD_READ_CHUNK];
 
     while buf.len() < max_bytes {
-        let n = reader.read(&mut byte).await?;
+        let remaining = max_bytes - buf.len();
+        let chunk_len = remaining.min(HEAD_READ_CHUNK);
+        let n = reader.read(&mut chunk[..chunk_len]).await?;
         if n == 0 {
             bail!("connection closed before HTTP head completed");
         }
-        buf.push(byte[0]);
-        if buf.ends_with(b"\r\n\r\n") {
-            return Ok(buf);
+        buf.extend_from_slice(&chunk[..n]);
+
+        if let Some(head_end) = find_header_end(&buf) {
+            let body = buf.split_off(head_end);
+            return Ok((buf, body));
         }
     }
 
     bail!("HTTP head exceeded {max_bytes} bytes")
 }
 
-pub async fn read_body<R>(reader: &mut R, length: usize, max_bytes: usize) -> Result<Vec<u8>>
+pub async fn read_body<R>(
+    reader: &mut R,
+    prefix: &[u8],
+    length: usize,
+    max_bytes: usize,
+) -> Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
 {
@@ -55,8 +67,13 @@ where
         bail!("HTTP body exceeded {max_bytes} bytes");
     }
 
+    if prefix.len() > length {
+        bail!("HTTP body prefix exceeded declared content-length");
+    }
+
     let mut body = vec![0_u8; length];
-    reader.read_exact(&mut body).await?;
+    body[..prefix.len()].copy_from_slice(prefix);
+    reader.read_exact(&mut body[prefix.len()..]).await?;
     Ok(body)
 }
 
@@ -84,8 +101,7 @@ pub fn parse_request(bytes: &[u8]) -> Result<HttpRequest> {
 
 pub fn parse_response(bytes: &[u8]) -> Result<HttpResponse> {
     let text = std::str::from_utf8(bytes).context("response is not valid UTF-8")?;
-    let mut lines = text.split("\r\n");
-    let start = lines.next().context("missing status line")?;
+    let start = text.split_once("\r\n").map(|(line, _)| line).unwrap_or(text);
     let mut parts = start.split_whitespace();
 
     let version = parts.next().context("missing response version")?.to_owned();
@@ -96,7 +112,6 @@ pub fn parse_response(bytes: &[u8]) -> Result<HttpResponse> {
         .context("invalid response status")?;
     let reason = parts.collect::<Vec<_>>().join(" ");
 
-    let _headers = parse_headers(lines)?;
     Ok(HttpResponse {
         version,
         status,
@@ -235,11 +250,17 @@ fn empty_response(status: u16, reason: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(HEADER_END.len())
+        .position(|window| window == HEADER_END)
+        .map(|idx| idx + HEADER_END.len())
+}
+
 fn parse_headers<'a, I>(lines: I) -> Result<HashMap<String, String>>
 where
     I: IntoIterator<Item = &'a str>,
 {
-    let mut headers = HashMap::new();
+    let mut headers = HashMap::with_capacity(8);
 
     for line in lines {
         if line.is_empty() {
@@ -259,6 +280,7 @@ where
 mod tests {
     use super::*;
     use crate::auth::AuthProof;
+    use tokio::io::{AsyncWriteExt, duplex};
 
     #[test]
     fn parse_built_request() {
@@ -290,5 +312,20 @@ mod tests {
 
         let parsed_payload = parse_tunnel_payload(&req[header_end + 4..]).unwrap();
         assert_eq!(parsed_payload.target, "example.com:443");
+    }
+
+    #[tokio::test]
+    async fn read_head_preserves_prefetched_body_bytes() {
+        let (mut writer, mut reader) = duplex(128);
+        let frame = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+
+        writer.write_all(frame).await.unwrap();
+        drop(writer);
+
+        let (head, prefix) = read_head(&mut reader, 64).await.unwrap();
+        assert_eq!(std::str::from_utf8(&head).unwrap(), "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+        assert_eq!(prefix, b"hello");
+        let body = read_body(&mut reader, &prefix, 5, 16).await.unwrap();
+        assert_eq!(body, b"hello");
     }
 }
