@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use std::{
+    io::Cursor,
     collections::HashMap,
     net::SocketAddr,
     sync::{
@@ -17,7 +18,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{Mutex, mpsc, watch},
-    time::{Instant, MissedTickBehavior, interval, sleep, timeout},
+    time::{Instant, MissedTickBehavior, interval_at, sleep, timeout},
 };
 use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
@@ -214,7 +215,7 @@ impl MuxClient {
             http::build_tunnel_request(&self.host_header, &self.mux_path, &payload, &self.user_agent)?;
         tunnel.write_all(&request).await?;
 
-        let (head, _) = timeout(
+        let (head, body_prefix) = timeout(
             self.handshake_timeout,
             http::read_head(&mut tunnel, self.max_header_size),
         )
@@ -231,6 +232,7 @@ impl MuxClient {
         }
 
         let (reader, writer) = tokio::io::split(tunnel);
+        let reader = Cursor::new(body_prefix).chain(reader);
         let (frame_tx, frame_rx) = mpsc::channel(256);
         let (closed_tx, closed_rx) = watch::channel(false);
         let streams = Arc::new(Mutex::new(HashMap::new()));
@@ -506,7 +508,7 @@ async fn run_client_session<R, W>(
 {
     let keepalive = Duration::from_secs(SESSION_KEEPALIVE_SECS);
     let idle_timeout = Duration::from_secs(SESSION_IDLE_TIMEOUT_SECS);
-    let mut heartbeat = interval(keepalive);
+    let mut heartbeat = interval_at(Instant::now() + keepalive, keepalive);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let idle_deadline = sleep(idle_timeout);
     tokio::pin!(idle_deadline);
@@ -568,7 +570,7 @@ where
 {
     let keepalive = Duration::from_secs(SESSION_KEEPALIVE_SECS);
     let idle_timeout = Duration::from_secs(SESSION_IDLE_TIMEOUT_SECS);
-    let mut heartbeat = interval(keepalive);
+    let mut heartbeat = interval_at(Instant::now() + keepalive, keepalive);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let idle_deadline = sleep(idle_timeout);
     tokio::pin!(idle_deadline);
@@ -890,6 +892,7 @@ fn host_from_target(target: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[tokio::test]
     async fn frame_round_trip() {
@@ -906,5 +909,22 @@ mod tests {
         assert_eq!(read.kind, FRAME_DATA);
         assert_eq!(read.stream_id, 7);
         assert_eq!(read.payload, b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_frame_with_prefetched_prefix() {
+        let frame = Frame::data(9, b"hello world".to_vec());
+        let mut encoded = Vec::new();
+        write_frame(&mut encoded, &frame).await.unwrap();
+
+        let prefix_len = 5;
+        let prefix = encoded[..prefix_len].to_vec();
+        let suffix = encoded[prefix_len..].to_vec();
+        let mut reader = Cursor::new(prefix).chain(Cursor::new(suffix));
+
+        let read = read_frame(&mut reader, 64).await.unwrap();
+        assert_eq!(read.kind, FRAME_DATA);
+        assert_eq!(read.stream_id, 9);
+        assert_eq!(read.payload, b"hello world");
     }
 }

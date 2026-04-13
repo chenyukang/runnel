@@ -11,7 +11,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, duplex},
     net::{TcpListener, TcpStream},
     sync::{Mutex, mpsc, watch},
-    time::{Instant, MissedTickBehavior, interval, sleep, timeout},
+    time::{Instant, MissedTickBehavior, interval_at, sleep, timeout},
 };
 use tracing::{info, warn};
 
@@ -318,7 +318,7 @@ async fn run_client_session<R, W>(
 {
     let keepalive = Duration::from_secs(SESSION_KEEPALIVE_SECS);
     let idle_timeout = Duration::from_secs(SESSION_IDLE_TIMEOUT_SECS);
-    let mut heartbeat = interval(keepalive);
+    let mut heartbeat = interval_at(Instant::now() + keepalive, keepalive);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let idle_deadline = sleep(idle_timeout);
     tokio::pin!(idle_deadline);
@@ -382,7 +382,7 @@ async fn run_server_session<R, W>(
 {
     let keepalive = Duration::from_secs(SESSION_KEEPALIVE_SECS);
     let idle_timeout = Duration::from_secs(SESSION_IDLE_TIMEOUT_SECS);
-    let mut heartbeat = interval(keepalive);
+    let mut heartbeat = interval_at(Instant::now() + keepalive, keepalive);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let idle_deadline = sleep(idle_timeout);
     tokio::pin!(idle_deadline);
