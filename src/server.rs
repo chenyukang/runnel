@@ -2,6 +2,7 @@ use crate::{
     auth::{AuthProof, ReplayProtector},
     http,
     mode::ProxyMode,
+    netlog,
     tls,
 };
 use anyhow::{Context, Result, bail};
@@ -108,7 +109,11 @@ pub async fn run(args: ServerArgs) -> Result<()> {
             if let Err(err) =
                 handle_connection(socket, peer, acceptor, replay, fallback, args).await
             {
-                warn!(peer = %peer, error = %err, "server connection ended with error");
+                if netlog::is_noisy_disconnect(&err) {
+                    info!(peer = %peer, error = %err, "server connection ended");
+                } else {
+                    warn!(peer = %peer, error = %err, "server connection ended with error");
+                }
             }
         });
     }

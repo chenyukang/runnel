@@ -6,6 +6,7 @@ pub mod daze;
 pub mod http;
 pub mod mode;
 pub mod mux;
+pub mod netlog;
 pub mod route;
 pub mod server;
 pub mod socks5;

@@ -1,6 +1,6 @@
 use crate::{
     auth::{AuthProof, ReplayProtector},
-    client::ClientArgs,
+    client::ClientArgs, netlog,
     http, route, route::RouteDecision, server::ServerArgs, socks5, tls,
 };
 use anyhow::{Context, Result, bail};
@@ -31,10 +31,10 @@ const FRAME_CLOSE: u8 = 5;
 const FRAME_PING: u8 = 6;
 const FRAME_PONG: u8 = 7;
 
-// Keep mux data frames comfortably below the ~32 KiB regime that can desynchronize
-// under concurrent TLS stress. Local stress tests reproduced bad headers at 32 KiB
-// and 32 KiB-1, while 16 KiB remained stable.
-const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
+// Keep mux data frames conservative. Local stress tests reproduced bad headers in the
+// ~32 KiB regime, and real-world WAN traffic still showed desync at 16 KiB. A smaller
+// frame size costs some throughput, but is safer for now.
+const MAX_FRAME_PAYLOAD: usize = 4 * 1024;
 const MAX_CONTROL_PAYLOAD: usize = 8 * 1024;
 const FRAME_HEADER_LEN: usize = 9;
 const SESSION_AUTH_TARGET: &str = "__mux__";
@@ -285,7 +285,11 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
 
         tokio::spawn(async move {
             if let Err(err) = handle_client_connection(socket, peer, session, router, args).await {
-                warn!(peer = %peer, error = %err, "mux client session ended with error");
+                if netlog::is_noisy_disconnect(&err) {
+                    info!(peer = %peer, error = %err, "mux client session ended");
+                } else {
+                    warn!(peer = %peer, error = %err, "mux client session ended with error");
+                }
             }
         });
     }
@@ -552,7 +556,11 @@ async fn run_client_session<R, W>(
     .await;
 
     if let Err(err) = result {
-        warn!(error = %err, "mux client session closed");
+        if netlog::is_noisy_disconnect(&err) {
+            info!(error = %err, "mux client session closed");
+        } else {
+            warn!(error = %err, "mux client session closed");
+        }
     }
 
     close_client_streams(&streams).await;
@@ -612,7 +620,11 @@ where
                                 if let Err(err) =
                                     handle_server_open(frame.stream_id, target, frame_tx, streams, args).await
                                 {
-                                    warn!(stream_id = frame.stream_id, error = %err, "mux stream failed");
+                                    if netlog::is_noisy_disconnect(&err) {
+                                        info!(stream_id = frame.stream_id, error = %err, "mux stream ended");
+                                    } else {
+                                        warn!(stream_id = frame.stream_id, error = %err, "mux stream failed");
+                                    }
                                 }
                             });
                         }
@@ -653,7 +665,11 @@ where
     .await;
 
     if let Err(err) = result {
-        warn!(error = %err, "mux server session closed");
+        if netlog::is_noisy_disconnect(&err) {
+            info!(error = %err, "mux server session closed");
+        } else {
+            warn!(error = %err, "mux server session closed");
+        }
     }
 
     close_all_server_streams(&streams).await;
@@ -751,7 +767,11 @@ async fn handle_server_open(
     };
 
     if let Err(err) = result {
-        warn!(stream_id, target = %target, error = %err, "mux upstream stream closed with error");
+        if netlog::is_noisy_disconnect(&err) {
+            info!(stream_id, target = %target, error = %err, "mux upstream stream closed");
+        } else {
+            warn!(stream_id, target = %target, error = %err, "mux upstream stream closed with error");
+        }
     }
 
     {
@@ -878,7 +898,8 @@ where
     let mut encoded = Vec::with_capacity(FRAME_HEADER_LEN + frame.payload.len());
     encoded.extend_from_slice(&header);
     encoded.extend_from_slice(&frame.payload);
-    writer.write_all(&encoded).await
+    writer.write_all(&encoded).await?;
+    writer.flush().await
 }
 
 fn is_private_literal_target(target: &str) -> bool {

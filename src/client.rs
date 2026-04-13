@@ -1,4 +1,4 @@
-use crate::{auth::AuthProof, http, mode::ProxyMode, route, route::FilterMode, route::RouteDecision, socks5, tls};
+use crate::{auth::AuthProof, http, mode::ProxyMode, netlog, route, route::FilterMode, route::RouteDecision, socks5, tls};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -86,7 +86,11 @@ pub async fn run(args: ClientArgs) -> Result<()> {
             if let Err(err) =
                 handle_connection(socket, peer, args, router, connector, host_header, server_name).await
             {
-                warn!(peer = %peer, error = %err, "client session ended with error");
+                if netlog::is_noisy_disconnect(&err) {
+                    info!(peer = %peer, error = %err, "client session ended");
+                } else {
+                    warn!(peer = %peer, error = %err, "client session ended with error");
+                }
             }
         });
     }

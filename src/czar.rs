@@ -1,6 +1,7 @@
 use crate::{
     client::ClientArgs,
     daze::{client_establish_ashe, relay_rc4, server_accept_ashe},
+    netlog,
     route, route::RouteDecision,
     server::ServerArgs,
     socks5,
@@ -175,7 +176,11 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
 
         tokio::spawn(async move {
             if let Err(err) = handle_client_connection(socket, peer, client, router, args).await {
-                warn!(peer = %peer, error = %err, "daze-czar client session ended with error");
+                if netlog::is_noisy_disconnect(&err) {
+                    info!(peer = %peer, error = %err, "daze-czar client session ended");
+                } else {
+                    warn!(peer = %peer, error = %err, "daze-czar client session ended with error");
+                }
             }
         });
     }
@@ -198,7 +203,11 @@ pub async fn run_server(args: ServerArgs) -> Result<()> {
 
         tokio::spawn(async move {
             if let Err(err) = handle_server_connection(socket, peer, args).await {
-                warn!(peer = %peer, error = %err, "daze-czar server connection ended with error");
+                if netlog::is_noisy_disconnect(&err) {
+                    info!(peer = %peer, error = %err, "daze-czar server connection ended");
+                } else {
+                    warn!(peer = %peer, error = %err, "daze-czar server connection ended with error");
+                }
             }
         });
     }
@@ -277,7 +286,11 @@ async fn handle_server_connection(
         let args = args.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_server_stream(stream, args).await {
-                warn!(peer = %peer, error = %err, "daze-czar stream ended with error");
+                if netlog::is_noisy_disconnect(&err) {
+                    info!(peer = %peer, error = %err, "daze-czar stream ended");
+                } else {
+                    warn!(peer = %peer, error = %err, "daze-czar stream ended with error");
+                }
             }
         });
     }
@@ -362,7 +375,11 @@ async fn run_client_session<R, W>(
     .await;
 
     if let Err(err) = result {
-        warn!(error = %err, "czar client session closed");
+        if netlog::is_noisy_disconnect(&err) {
+            info!(error = %err, "czar client session closed");
+        } else {
+            warn!(error = %err, "czar client session closed");
+        }
     }
 
     close_session(streams, closed_tx).await;
@@ -447,7 +464,11 @@ async fn run_server_session<R, W>(
     .await;
 
     if let Err(err) = result {
-        warn!(error = %err, "czar server session closed");
+        if netlog::is_noisy_disconnect(&err) {
+            info!(error = %err, "czar server session closed");
+        } else {
+            warn!(error = %err, "czar server session closed");
+        }
     }
 
     close_session(streams, closed_tx).await;

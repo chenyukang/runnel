@@ -1,4 +1,4 @@
-use crate::{client::ClientArgs, http, mode::ProxyMode, route, route::RouteDecision, server::ServerArgs, socks5};
+use crate::{client::ClientArgs, http, mode::ProxyMode, netlog, route, route::RouteDecision, server::ServerArgs, socks5};
 use anyhow::{Context, Result, bail};
 use md5::Context as Md5Context;
 use reqwest::{
@@ -47,7 +47,11 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
         let router = router.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_client_connection(socket, peer, router, args).await {
-                warn!(peer = %peer, error = %err, "daze-ashe client session ended with error");
+                if netlog::is_noisy_disconnect(&err) {
+                    info!(peer = %peer, error = %err, "daze-ashe client session ended");
+                } else {
+                    warn!(peer = %peer, error = %err, "daze-ashe client session ended with error");
+                }
             }
         });
     }
@@ -75,7 +79,11 @@ pub async fn run_server(args: ServerArgs) -> Result<()> {
         let args = args.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_server_connection(socket, peer, args).await {
-                warn!(peer = %peer, error = %err, "daze-ashe server session ended with error");
+                if netlog::is_noisy_disconnect(&err) {
+                    info!(peer = %peer, error = %err, "daze-ashe server session ended");
+                } else {
+                    warn!(peer = %peer, error = %err, "daze-ashe server session ended with error");
+                }
             }
         });
     }
@@ -179,7 +187,11 @@ async fn run_baboon_client(args: ClientArgs) -> Result<()> {
         let router = router.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_baboon_client_connection(socket, peer, router, args).await {
-                warn!(peer = %peer, error = %err, "daze-baboon client session ended with error");
+                if netlog::is_noisy_disconnect(&err) {
+                    info!(peer = %peer, error = %err, "daze-baboon client session ended");
+                } else {
+                    warn!(peer = %peer, error = %err, "daze-baboon client session ended with error");
+                }
             }
         });
     }
@@ -208,7 +220,11 @@ async fn run_baboon_server(args: ServerArgs) -> Result<()> {
         let fallback = fallback.clone();
         tokio::spawn(async move {
             if let Err(err) = handle_baboon_server_connection(socket, peer, args, fallback).await {
-                warn!(peer = %peer, error = %err, "daze-baboon server session ended with error");
+                if netlog::is_noisy_disconnect(&err) {
+                    info!(peer = %peer, error = %err, "daze-baboon server session ended");
+                } else {
+                    warn!(peer = %peer, error = %err, "daze-baboon server session ended with error");
+                }
             }
         });
     }
