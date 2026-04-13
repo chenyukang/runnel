@@ -65,7 +65,8 @@ pub struct ServerArgs {
 pub async fn run(args: ServerArgs) -> Result<()> {
     match args.mode {
         ProxyMode::NativeHttp | ProxyMode::NativeMux => {}
-        ProxyMode::DazeAshe => return crate::daze::run_server(args).await,
+        ProxyMode::DazeAshe | ProxyMode::DazeBaboon => return crate::daze::run_server(args).await,
+        ProxyMode::DazeCzar => return crate::czar::run_server(args).await,
     }
 
     let cert = args

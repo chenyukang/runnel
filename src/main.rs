@@ -5,6 +5,7 @@ mod http;
 mod mode;
 mod mux;
 mod daze;
+mod czar;
 mod server;
 mod socks5;
 mod tls;

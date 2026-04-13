@@ -6,6 +6,8 @@ pub enum ProxyMode {
     NativeHttp,
     NativeMux,
     DazeAshe,
+    DazeBaboon,
+    DazeCzar,
 }
 
 impl ProxyMode {
@@ -14,7 +16,9 @@ impl ProxyMode {
             match mode {
                 ProxyMode::NativeHttp => Ok(ProxyMode::NativeMux),
                 ProxyMode::NativeMux => Ok(ProxyMode::NativeMux),
-                ProxyMode::DazeAshe => bail!("--mux cannot be combined with --mode daze-ashe"),
+                ProxyMode::DazeAshe | ProxyMode::DazeBaboon | ProxyMode::DazeCzar => {
+                    bail!("--mux cannot be combined with a daze mode")
+                }
             }
         } else {
             Ok(mode)

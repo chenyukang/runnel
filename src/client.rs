@@ -44,7 +44,8 @@ pub async fn run(args: ClientArgs) -> Result<()> {
     match args.effective_mode()? {
         ProxyMode::NativeHttp => {}
         ProxyMode::NativeMux => return crate::mux::run_client(args).await,
-        ProxyMode::DazeAshe => return crate::daze::run_client(args).await,
+        ProxyMode::DazeAshe | ProxyMode::DazeBaboon => return crate::daze::run_client(args).await,
+        ProxyMode::DazeCzar => return crate::czar::run_client(args).await,
     }
 
     let connector = TlsConnector::from(tls::load_client_config(args.ca_cert.as_deref())?);

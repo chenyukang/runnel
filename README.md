@@ -25,6 +25,8 @@ The design is inspired by lightweight remote proxies such as [daze](https://gith
 - the hidden tunnel handshake looks like a small JSON API call instead of custom proxy headers
 - an optional multiplexed mode can reuse one TLS session for many local SOCKS connections
 - an optional `daze-ashe` mode speaks a daze-style RC4 stream protocol over raw TCP
+- an optional `daze-baboon` mode wraps the daze handshake in an HTTP-looking `/sync` exchange
+- an optional `daze-czar` mode multiplexes many daze-ashe streams over one raw TCP session
 - the server rejects replayed authentication proofs
 - the server denies literal private IP targets by default
 - the server can proxy unmatched requests to a real upstream website
@@ -67,8 +69,10 @@ PIPIT_PASSWORD='replace-me' cargo run -- client \
 - `native-http`: one TLS tunnel per local SOCKS connection. This is the default mode.
 - `native-mux`: one persistent TLS session carrying many logical streams.
 - `daze-ashe`: a daze-style raw TCP mode using the ashe handshake and RC4 stream encryption.
+- `daze-baboon`: daze-ashe hidden behind an HTTP-looking `POST /sync` request plus fallback website masking.
+- `daze-czar`: daze-ashe running on top of a compact raw TCP multiplexing layer.
 
-Native modes require `--cert` and `--key` on the server. `daze-ashe` ignores those TLS settings.
+Native modes require `--cert` and `--key` on the server. `daze-ashe`, `daze-baboon`, and `daze-czar` ignore those TLS settings.
 
 ## Optional Multiplexing
 
@@ -115,6 +119,45 @@ PIPIT_PASSWORD='replace-me' cargo run -- client \
 
 This mode skips TLS entirely and uses a daze-style per-connection handshake plus RC4 stream encryption. It is useful as an alternate strategy layer, but it does not provide the camouflage properties of the native HTTP-over-TLS modes.
 
+## Daze Baboon Mode
+
+If you want the daze handshake to be hidden behind a normal-looking HTTP request:
+
+```bash
+PIPIT_PASSWORD='replace-me' cargo run -- server \
+  --mode daze-baboon \
+  --listen 0.0.0.0:1081 \
+  --fallback-url https://www.qq.com
+```
+
+```bash
+PIPIT_PASSWORD='replace-me' cargo run -- client \
+  --mode daze-baboon \
+  --listen 127.0.0.1:1080 \
+  --server example.com:1081
+```
+
+`daze-baboon` starts with a `POST /sync` request carrying an `Authorization` signature. Unmatched requests are proxied to `--fallback-url`, so the server can still look like a normal website from the outside.
+
+## Daze Czar Mode
+
+If you want a daze-style multiplexed transport over one long-lived raw TCP session:
+
+```bash
+PIPIT_PASSWORD='replace-me' cargo run -- server \
+  --mode daze-czar \
+  --listen 0.0.0.0:1081
+```
+
+```bash
+PIPIT_PASSWORD='replace-me' cargo run -- client \
+  --mode daze-czar \
+  --listen 127.0.0.1:1080 \
+  --server example.com:1081
+```
+
+`daze-czar` keeps one raw TCP connection open to the server and multiplexes many logical streams over it. Each logical stream still uses the daze-ashe encrypted open handshake before switching into relay mode.
+
 ## Security Notes
 
 - TLS certificate verification is enabled by default.
@@ -143,6 +186,10 @@ When `native-mux` is enabled on the client, it first establishes an authenticate
 
 When `daze-ashe` is enabled, the client and server speak a daze-style raw TCP handshake using a password-derived key, a random salt, an encrypted timestamp, and then an encrypted target open request.
 
+When `daze-baboon` is enabled, the client first sends a signed `POST /sync HTTP/1.1` request. After the server returns `200 OK`, both sides immediately switch into the daze-ashe handshake on that same socket.
+
+When `daze-czar` is enabled, the client keeps one raw TCP session open and exchanges 4-byte `open/data/close/probe` frames. Each logical stream then runs the daze-ashe handshake inside that multiplexed channel.
+
 ## Current Scope
 
 This first implementation is deliberately narrow:
@@ -152,7 +199,7 @@ This first implementation is deliberately narrow:
 - one upstream tunnel per local connection
 - no UDP relay
 - optional multiplexing via `--mode native-mux`
-- optional daze-style raw TCP transport via `--mode daze-ashe`
+- optional daze-style raw TCP transports via `--mode daze-ashe`, `--mode daze-baboon`, and `--mode daze-czar`
 - no traffic shaping yet
 
 That keeps the code smaller and makes reliability easier to reason about before we add more protocol surface.
