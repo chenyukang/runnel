@@ -13,6 +13,7 @@ pub struct FileConfig {
     pub log: Option<String>,
     pub log_file: Option<PathBuf>,
     pub tui: Option<bool>,
+    pub daemon: Option<bool>,
     pub client: Option<ClientConfig>,
     pub server: Option<ServerConfig>,
     pub cert: Option<CertConfig>,
@@ -88,6 +89,7 @@ pub fn apply_globals(
     log: &mut String,
     log_file: &mut PathBuf,
     tui: &mut bool,
+    daemon: &mut bool,
     config: &FileConfig,
     matches: &ArgMatches,
     base_dir: &Path,
@@ -99,6 +101,7 @@ pub fn apply_globals(
         }
     }
     maybe_assign(tui, &config.tui, should_override(matches, "tui"));
+    maybe_assign(daemon, &config.daemon, should_override(matches, "daemon"));
 }
 
 pub fn apply_client(
@@ -361,6 +364,7 @@ mod tests {
         let raw = r#"
 log: debug
 tui: true
+daemon: true
 client:
   server: 127.0.0.1:1443
   mode: native-mux
@@ -371,6 +375,7 @@ server:
         let parsed: FileConfig = serde_yaml::from_str(raw).unwrap();
         assert_eq!(parsed.log.as_deref(), Some("debug"));
         assert_eq!(parsed.tui, Some(true));
+        assert_eq!(parsed.daemon, Some(true));
         assert_eq!(
             parsed.client.as_ref().and_then(|cfg| cfg.server.as_deref()),
             Some("127.0.0.1:1443")

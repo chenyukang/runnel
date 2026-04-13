@@ -86,6 +86,41 @@ Config precedence is:
 
 Relative paths inside the YAML file are resolved relative to the config file itself, so this works well for portable bundles.
 
+You can also enable background mode from YAML:
+
+```yaml
+daemon: true
+```
+
+`daemon: true` is supported for `client` and `server`. If `tui: true` is also set, daemon mode automatically disables TUI.
+
+## Daemon Mode
+
+`pipit client` and `pipit server` can run in the background with `--daemon`:
+
+```bash
+PIPIT_PASSWORD='replace-me' cargo run -- --daemon client \
+  --mode native-http \
+  --listen 127.0.0.1:1080 \
+  --server example.com:1443 \
+  --server-name example.com \
+  --ca-cert server.crt
+```
+
+```bash
+PIPIT_PASSWORD='replace-me' cargo run -- --daemon server \
+  --mode native-http \
+  --listen 0.0.0.0:1443 \
+  --cert server.crt \
+  --key server.key
+```
+
+Notes:
+
+- `--daemon` is supported for `client` and `server`
+- if `tui: true` or `--tui` is also set, daemon mode automatically disables TUI
+- logs still go to `--log-file`, which defaults to `proxy.log`
+
 ## Modes
 
 - `native-http`: one TLS tunnel per local SOCKS connection. This is the default mode.

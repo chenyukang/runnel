@@ -1,8 +1,13 @@
 use anyhow::{Context, Result};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use pipit::{cert, client, config, server, telemetry, tui};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+const DAEMON_ENV: &str = "PIPIT_DAEMONIZED";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -17,6 +22,8 @@ struct Cli {
     log_file: PathBuf,
     #[arg(long, global = true)]
     tui: bool,
+    #[arg(long, global = true)]
+    daemon: bool,
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -41,6 +48,7 @@ async fn main() -> Result<()> {
             &mut cli.log,
             &mut cli.log_file,
             &mut cli.tui,
+            &mut cli.daemon,
             &file_config,
             &matches,
             &base_dir,
@@ -60,8 +68,14 @@ async fn main() -> Result<()> {
             }
         }
     }
+    normalize_daemon_mode(&mut cli);
+    validate_daemon_mode(&cli)?;
+    if should_spawn_daemon(&cli) {
+        spawn_daemon_process()?;
+        return Ok(());
+    }
     telemetry::init_channel(2048);
-    let observability = init_tracing(&cli.log, &cli.log_file, !cli.tui)?;
+    let observability = init_tracing(&cli.log, &cli.log_file, !cli.tui && !cli.daemon)?;
     let dashboard_context = dashboard_context(&cli, observability.log_file.clone());
 
     let command = async move {
@@ -85,6 +99,60 @@ async fn main() -> Result<()> {
     } else {
         command.await
     }
+}
+
+fn normalize_daemon_mode(cli: &mut Cli) {
+    if cli.daemon && cli.tui {
+        eprintln!("pipit: disabling TUI because daemon mode runs in the background");
+        cli.tui = false;
+    }
+}
+
+fn validate_daemon_mode(cli: &Cli) -> Result<()> {
+    if !cli.daemon {
+        return Ok(());
+    }
+
+    match cli.command {
+        Commands::Client(_) | Commands::Server(_) => Ok(()),
+        Commands::Cert(_) => anyhow::bail!("--daemon is only supported for client and server"),
+    }
+}
+
+fn should_spawn_daemon(cli: &Cli) -> bool {
+    cli.daemon && std::env::var_os(DAEMON_ENV).is_none()
+}
+
+fn spawn_daemon_process() -> Result<()> {
+    let executable = std::env::current_exe().context("failed to locate current executable")?;
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let mut command = Command::new(executable);
+    command
+        .args(args)
+        .env(DAEMON_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::{io, os::unix::process::CommandExt};
+
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let child = command
+        .spawn()
+        .context("failed to start daemon process in background")?;
+    println!("pipit daemon started pid={}", child.id());
+    Ok(())
 }
 
 struct ObservabilityGuard {
