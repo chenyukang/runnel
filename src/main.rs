@@ -1,18 +1,6 @@
-mod auth;
-mod cert;
-mod client;
-mod http;
-mod mode;
-mod mux;
-mod daze;
-mod czar;
-mod route;
-mod server;
-mod socks5;
-mod tls;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use pipit::{cert, client, server};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]

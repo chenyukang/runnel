@@ -31,7 +31,10 @@ const FRAME_CLOSE: u8 = 5;
 const FRAME_PING: u8 = 6;
 const FRAME_PONG: u8 = 7;
 
-const MAX_FRAME_PAYLOAD: usize = 32 * 1024;
+// Keep mux data frames comfortably below the ~32 KiB regime that can desynchronize
+// under concurrent TLS stress. Local stress tests reproduced bad headers at 32 KiB
+// and 32 KiB-1, while 16 KiB remained stable.
+const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
 const MAX_CONTROL_PAYLOAD: usize = 8 * 1024;
 const FRAME_HEADER_LEN: usize = 9;
 const SESSION_AUTH_TARGET: &str = "__mux__";
@@ -844,7 +847,14 @@ where
     let payload_len =
         u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
     if payload_len > max_payload {
-        bail!("mux frame exceeded {} bytes", max_payload);
+        bail!(
+            "mux frame exceeded {} bytes (kind={} stream_id={} payload_len={} raw={:02x?})",
+            max_payload,
+            kind,
+            stream_id,
+            payload_len,
+            header,
+        );
     }
 
     let mut payload = vec![0_u8; payload_len];
@@ -865,8 +875,10 @@ where
     header[0] = frame.kind;
     header[1..5].copy_from_slice(&frame.stream_id.to_be_bytes());
     header[5..9].copy_from_slice(&(frame.payload.len() as u32).to_be_bytes());
-    writer.write_all(&header).await?;
-    writer.write_all(&frame.payload).await
+    let mut encoded = Vec::with_capacity(FRAME_HEADER_LEN + frame.payload.len());
+    encoded.extend_from_slice(&header);
+    encoded.extend_from_slice(&frame.payload);
+    writer.write_all(&encoded).await
 }
 
 fn is_private_literal_target(target: &str) -> bool {
