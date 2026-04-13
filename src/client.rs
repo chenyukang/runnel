@@ -18,6 +18,7 @@ pub struct ClientArgs {
     #[arg(long, default_value = "127.0.0.1:1080")]
     pub listen: String,
     #[arg(long)]
+    #[arg(default_value = "")]
     pub server: String,
     #[arg(long)]
     pub server_name: Option<String>,
@@ -26,6 +27,7 @@ pub struct ClientArgs {
     #[arg(long, value_enum, default_value_t = ProxyMode::NativeHttp)]
     pub mode: ProxyMode,
     #[arg(long, env = "PIPIT_PASSWORD")]
+    #[arg(default_value = "")]
     pub password: String,
     #[arg(long, default_value = "/connect")]
     pub path: String,
@@ -50,6 +52,8 @@ pub struct ClientArgs {
 }
 
 pub async fn run(args: ClientArgs) -> Result<()> {
+    args.validate_required()?;
+
     match args.effective_mode()? {
         ProxyMode::NativeHttp => {}
         ProxyMode::NativeMux => return crate::mux::run_client(args).await,
@@ -110,6 +114,18 @@ pub async fn run(args: ClientArgs) -> Result<()> {
 impl ClientArgs {
     pub fn effective_mode(&self) -> Result<ProxyMode> {
         ProxyMode::from_legacy_mux(self.mux, self.mode)
+    }
+
+    pub fn validate_required(&self) -> Result<()> {
+        if self.server.trim().is_empty() {
+            bail!("client server is required; pass --server or set it in --config");
+        }
+        if self.password.trim().is_empty() {
+            bail!(
+                "client password is required; pass --password, set PIPIT_PASSWORD, or set it in --config"
+            );
+        }
+        Ok(())
     }
 }
 

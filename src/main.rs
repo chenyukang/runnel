@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use pipit::{cert, client, server, telemetry, tui};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use pipit::{cert, client, config, server, telemetry, tui};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -17,6 +17,8 @@ struct Cli {
     log_file: PathBuf,
     #[arg(long, global = true)]
     tui: bool,
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -31,7 +33,33 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches).context("failed to parse CLI arguments")?;
+    if let Some(config_path) = &cli.config {
+        let (file_config, base_dir) = config::load(config_path)?;
+        config::apply_globals(
+            &mut cli.log,
+            &mut cli.log_file,
+            &mut cli.tui,
+            &file_config,
+            &matches,
+            &base_dir,
+        );
+        if let Some((name, sub_matches)) = matches.subcommand() {
+            match (&mut cli.command, name) {
+                (Commands::Client(args), "client") => {
+                    config::apply_client(args, &file_config, sub_matches, &base_dir);
+                }
+                (Commands::Server(args), "server") => {
+                    config::apply_server(args, &file_config, sub_matches, &base_dir);
+                }
+                (Commands::Cert(args), "cert") => {
+                    config::apply_cert(args, &file_config, sub_matches, &base_dir);
+                }
+                _ => {}
+            }
+        }
+    }
     telemetry::init_channel(2048);
     let observability = init_tracing(&cli.log, &cli.log_file, !cli.tui)?;
     let dashboard_context = dashboard_context(&cli, observability.log_file.clone());

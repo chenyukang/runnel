@@ -1,8 +1,10 @@
 use anyhow::{Result, bail};
 use clap::ValueEnum;
+use serde::Deserialize;
 use std::fmt;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ProxyMode {
     NativeHttp,
     NativeMux,

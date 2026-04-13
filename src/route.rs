@@ -1,6 +1,7 @@
 use crate::{client::ClientArgs, socks5, socks5::TargetAddr, traffic};
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
+use serde::Deserialize;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -14,7 +15,8 @@ use tokio::{
     time::timeout,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum FilterMode {
     Proxy,
     Direct,

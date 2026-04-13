@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod cert;
 pub mod client;
+pub mod config;
 pub mod czar;
 pub mod daze;
 pub mod http;

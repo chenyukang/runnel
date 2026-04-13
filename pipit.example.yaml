@@ -1,0 +1,42 @@
+log: info
+log_file: proxy.log
+tui: true
+
+client:
+  listen: 127.0.0.1:1080
+  server: server-ip:1443
+  server_name: example.com
+  ca_cert: server.crt
+  mode: native-http
+  password: PASSWORD-PALCE-HOLDER
+  filter: rule
+  rule_file: rule.ls
+  cidr_file: rule.cidr
+  user_agent: Mozilla/5.0
+  handshake_timeout_secs: 10
+  connect_timeout_secs: 10
+  max_header_size: 8192
+
+server:
+  listen: 0.0.0.0:1443
+  cert: server.crt
+  key: server.key
+  mode: native-http
+  password: PASSWORD-PALCE-HOLDER
+  path: /connect
+  mux_path: /mux
+  auth_window_secs: 120
+  handshake_timeout_secs: 10
+  connect_timeout_secs: 10
+  max_header_size: 16384
+  max_tunnel_body_size: 8192
+  allow_private_targets: false
+  fallback_url: https://www.qq.com
+  fallback_timeout_secs: 15
+  max_fallback_body_size: 1048576
+
+cert:
+  cert: server.crt
+  key: server.key
+  names:
+    - example.com

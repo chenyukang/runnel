@@ -65,6 +65,27 @@ PIPIT_PASSWORD='replace-me' cargo run -- client \
 
 4. Point your browser or tools at `socks5://127.0.0.1:1080`.
 
+## Config File
+
+You can move most CLI flags into a YAML config file and load it with `--config`.
+
+Example:
+
+```bash
+PIPIT_PASSWORD='replace-me' cargo run -- --config ./pipit.example.yaml client
+```
+
+The repository includes a ready-to-copy example at [`pipit.example.yaml`](./pipit.example.yaml).
+
+Config precedence is:
+
+- explicit CLI flags
+- environment variables
+- YAML config
+- built-in defaults
+
+Relative paths inside the YAML file are resolved relative to the config file itself, so this works well for portable bundles.
+
 ## Modes
 
 - `native-http`: one TLS tunnel per local SOCKS connection. This is the default mode.

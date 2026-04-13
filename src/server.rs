@@ -37,6 +37,7 @@ pub struct ServerArgs {
     #[arg(long, value_enum, default_value_t = ProxyMode::NativeHttp)]
     pub mode: ProxyMode,
     #[arg(long, env = "PIPIT_PASSWORD")]
+    #[arg(default_value = "")]
     pub password: String,
     #[arg(long, default_value = "/connect")]
     pub path: String,
@@ -63,6 +64,8 @@ pub struct ServerArgs {
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
+    args.validate_required()?;
+
     match args.mode {
         ProxyMode::NativeHttp | ProxyMode::NativeMux => {}
         ProxyMode::DazeAshe | ProxyMode::DazeBaboon => return crate::daze::run_server(args).await,
@@ -115,6 +118,17 @@ pub async fn run(args: ServerArgs) -> Result<()> {
                 }
             }
         });
+    }
+}
+
+impl ServerArgs {
+    pub fn validate_required(&self) -> Result<()> {
+        if self.password.trim().is_empty() {
+            bail!(
+                "server password is required; pass --password, set PIPIT_PASSWORD, or set it in --config"
+            );
+        }
+        Ok(())
     }
 }
 
