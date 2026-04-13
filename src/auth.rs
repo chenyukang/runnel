@@ -84,7 +84,15 @@ impl ReplayProtector {
         let actual = URL_SAFE_NO_PAD
             .decode(proof.signature.as_bytes())
             .context("invalid signature encoding")?;
-        verify(password, method, path, target, proof.timestamp, &proof.nonce, &actual)?;
+        verify(
+            password,
+            method,
+            path,
+            target,
+            proof.timestamp,
+            &proof.nonce,
+            &actual,
+        )?;
 
         seen.order.push_back((proof.nonce.clone(), proof.timestamp));
         seen.seen.insert(proof.nonce.clone(), proof.timestamp);
@@ -150,7 +158,12 @@ fn update_signature_input(
     }
 
     let timestamp = timestamp.to_string();
-    for part in [path.as_bytes(), target.as_bytes(), timestamp.as_bytes(), nonce.as_bytes()] {
+    for part in [
+        path.as_bytes(),
+        target.as_bytes(),
+        timestamp.as_bytes(),
+        nonce.as_bytes(),
+    ] {
         mac.update(b"\n");
         mac.update(part);
     }

@@ -1,8 +1,8 @@
 use crate::{
     client::ClientArgs,
     daze::{client_establish_ashe, relay_rc4, server_accept_ashe},
-    netlog,
-    route, route::RouteDecision,
+    netlog, route,
+    route::RouteDecision,
     server::ServerArgs,
     socks5,
 };
@@ -100,7 +100,12 @@ impl CzarClient {
         let (frame_tx, frame_rx) = mpsc::channel(SESSION_CHANNEL_SIZE);
         let (closed_tx, closed_rx) = watch::channel(false);
         let streams = Arc::new(Mutex::new(HashMap::new()));
-        let ids = Arc::new(Mutex::new((0..STREAM_POOL_SIZE as u16).rev().map(|id| id as u8).collect()));
+        let ids = Arc::new(Mutex::new(
+            (0..STREAM_POOL_SIZE as u16)
+                .rev()
+                .map(|id| id as u8)
+                .collect(),
+        ));
 
         tokio::spawn(run_client_session(
             reader,
@@ -221,18 +226,16 @@ async fn handle_client_connection(
     args: ClientArgs,
 ) -> Result<()> {
     inbound.set_nodelay(true)?;
-    let target = timeout(
-        client.handshake_timeout,
-        socks5::accept(&mut inbound),
-    )
-    .await
-    .context("SOCKS handshake timed out")??;
+    let target = timeout(client.handshake_timeout, socks5::accept(&mut inbound))
+        .await
+        .context("SOCKS handshake timed out")??;
     let target_string = target.to_string();
 
     match router.decide(&target).await? {
         RouteDecision::Direct => {
             let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
-            let _ = route::relay_direct_socks(inbound, &target, connect_timeout).await?;
+            let _ = route::relay_direct_socks(inbound, &target, connect_timeout, Some("daze-czar"))
+                .await?;
             info!(peer = %peer, target = %target_string, route = "direct", mode = "daze-czar", "relay completed");
             return Ok(());
         }
@@ -608,9 +611,7 @@ where
     reader.read_exact(&mut head).await?;
 
     match head[0] {
-        FRAME_OPEN => Ok(CzarFrame::Open {
-            stream_id: head[1],
-        }),
+        FRAME_OPEN => Ok(CzarFrame::Open { stream_id: head[1] }),
         FRAME_DATA => {
             let len = u16::from_be_bytes([head[2], head[3]]) as usize;
             let mut payload = vec![0_u8; len];

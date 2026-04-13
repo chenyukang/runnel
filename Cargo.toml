@@ -24,4 +24,8 @@ sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 tracing = "0.1"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ratatui = "0.29"
+crossterm = "0.28"
+sysinfo = "0.33"

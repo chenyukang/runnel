@@ -10,8 +10,8 @@ use std::{
     fs,
     net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener},
     path::PathBuf,
-    sync::{Once, OnceLock},
     sync::atomic::{AtomicU64, Ordering},
+    sync::{Once, OnceLock},
     time::Duration,
 };
 use tokio::{

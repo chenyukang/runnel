@@ -1,4 +1,4 @@
-use crate::{client::ClientArgs, socks5, socks5::TargetAddr};
+use crate::{client::ClientArgs, socks5, socks5::TargetAddr, traffic};
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use std::{
@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::copy_bidirectional,
     net::{TcpStream, lookup_host},
     sync::Mutex,
     time::timeout,
@@ -48,10 +47,7 @@ pub struct Router {
 impl Router {
     pub fn from_args(args: &ClientArgs) -> Result<Arc<Self>> {
         let mut table = if matches!(args.filter, FilterMode::Rule) {
-            RuleTable::load(
-                args.rule_file.as_deref(),
-                args.cidr_file.as_deref(),
-            )?
+            RuleTable::load(args.rule_file.as_deref(), args.cidr_file.as_deref())?
         } else {
             RuleTable::default()
         };
@@ -144,7 +140,12 @@ impl RuleTable {
                 continue;
             }
             let cidr = parts[1].parse::<ipnet::IpNet>().with_context(|| {
-                format!("invalid CIDR '{}' at {}:{}", parts[1], path.display(), index + 1)
+                format!(
+                    "invalid CIDR '{}' at {}:{}",
+                    parts[1],
+                    path.display(),
+                    index + 1
+                )
             })?;
             match parts[0] {
                 "L" => self.direct_cidrs.push(cidr),
@@ -192,18 +193,27 @@ pub async fn relay_direct_socks(
     mut inbound: TcpStream,
     target: &TargetAddr,
     connect_timeout: Duration,
-) -> Result<(u64, u64)> {
+    mode: Option<&str>,
+) -> Result<traffic::RelayStats> {
     let target_string = target.to_string();
-    let mut outbound = timeout(connect_timeout, TcpStream::connect(&target_string))
+    let outbound = timeout(connect_timeout, TcpStream::connect(&target_string))
         .await
         .context("direct connect timed out")??;
     outbound.set_nodelay(true)?;
     socks5::send_success(&mut inbound)
         .await
         .context("failed to send SOCKS success reply")?;
-    copy_bidirectional(&mut inbound, &mut outbound)
-        .await
-        .context("direct relay failed")
+    traffic::relay_with_telemetry(
+        inbound,
+        outbound,
+        traffic::RelayLabels {
+            target: target_string,
+            route: Some("direct".to_owned()),
+            mode: mode.map(str::to_owned),
+        },
+    )
+    .await
+    .context("direct relay failed")
 }
 
 fn matches_any(patterns: &[String], host: &str) -> Result<bool> {
@@ -219,7 +229,8 @@ fn matches_any(patterns: &[String], host: &str) -> Result<bool> {
 }
 
 fn contains_any(cidrs: &[ipnet::IpNet], addrs: &[IpAddr]) -> bool {
-    addrs.iter()
+    addrs
+        .iter()
         .any(|addr| cidrs.iter().any(|cidr| cidr.contains(addr)))
 }
 

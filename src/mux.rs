@@ -1,12 +1,15 @@
 use crate::{
     auth::{AuthProof, ReplayProtector},
-    client::ClientArgs, netlog,
-    http, route, route::RouteDecision, server::ServerArgs, socks5, tls,
+    client::ClientArgs,
+    http, netlog, route,
+    route::RouteDecision,
+    server::ServerArgs,
+    socks5, tls,
 };
 use anyhow::{Context, Result, bail};
 use std::{
-    io::Cursor,
     collections::HashMap,
+    io::Cursor,
     net::SocketAddr,
     sync::{
         Arc,
@@ -204,20 +207,19 @@ impl MuxClient {
         .await
         .context("mux TLS handshake timed out")??;
 
-        let proof = AuthProof::sign(
-            &self.password,
-            "POST",
-            &self.mux_path,
-            SESSION_AUTH_TARGET,
-        )?;
+        let proof = AuthProof::sign(&self.password, "POST", &self.mux_path, SESSION_AUTH_TARGET)?;
         let payload = http::TunnelPayload {
             target: SESSION_AUTH_TARGET.to_owned(),
             timestamp: proof.timestamp,
             nonce: proof.nonce,
             signature: proof.signature,
         };
-        let request =
-            http::build_tunnel_request(&self.host_header, &self.mux_path, &payload, &self.user_agent)?;
+        let request = http::build_tunnel_request(
+            &self.host_header,
+            &self.mux_path,
+            &payload,
+            &self.user_agent,
+        )?;
         tunnel.write_all(&request).await?;
 
         let (head, body_prefix) = timeout(
@@ -233,7 +235,11 @@ impl MuxClient {
             bail!("mux server returned an unsupported HTTP version");
         }
         if status != 200 {
-            bail!("mux server refused session with status {} {}", status, reason);
+            bail!(
+                "mux server refused session with status {} {}",
+                status,
+                reason
+            );
         }
 
         let (reader, writer) = tokio::io::split(tunnel);
@@ -317,7 +323,9 @@ async fn handle_client_connection(
     match router.decide(&target).await? {
         RouteDecision::Direct => {
             let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
-            let _ = route::relay_direct_socks(inbound, &target, connect_timeout).await?;
+            let _ =
+                route::relay_direct_socks(inbound, &target, connect_timeout, Some("native-mux"))
+                    .await?;
             info!(peer = %peer, target = %target_string, route = "direct", "mux relay completed");
             return Ok(());
         }
@@ -453,8 +461,13 @@ where
         }
     };
 
-    let body = http::read_body(&mut stream, body_prefix, body_length, args.max_tunnel_body_size)
-        .await?;
+    let body = http::read_body(
+        &mut stream,
+        body_prefix,
+        body_length,
+        args.max_tunnel_body_size,
+    )
+    .await?;
     let payload = match http::parse_tunnel_payload(&body) {
         Ok(payload) => payload,
         Err(_) => {
@@ -817,9 +830,7 @@ async fn remove_client_stream(session: &ClientSession, stream_id: u32) {
     streams.remove(&stream_id);
 }
 
-async fn close_client_streams(
-    streams: &Arc<Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>>,
-) {
+async fn close_client_streams(streams: &Arc<Mutex<HashMap<u32, mpsc::Sender<StreamEvent>>>>) {
     let channels = {
         let mut active = streams.lock().await;
         active.drain().map(|(_, tx)| tx).collect::<Vec<_>>()
@@ -870,7 +881,10 @@ where
         reader.read_exact(&mut magic[1..]).await?;
     }
     if skipped > 0 {
-        info!(skipped, "mux frame reader resynchronized after skipping bytes");
+        info!(
+            skipped,
+            "mux frame reader resynchronized after skipping bytes"
+        );
     }
 
     let mut header = [0_u8; FRAME_HEADER_LEN - FRAME_MAGIC.len()];
@@ -878,8 +892,7 @@ where
 
     let kind = header[0];
     let stream_id = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-    let payload_len =
-        u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
+    let payload_len = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
     if payload_len > max_payload {
         bail!(
             "mux frame exceeded {} bytes (kind={} stream_id={} payload_len={} raw_magic={:02x?} raw={:02x?})",

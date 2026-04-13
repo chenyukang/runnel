@@ -10,4 +10,7 @@ pub mod netlog;
 pub mod route;
 pub mod server;
 pub mod socks5;
+pub mod telemetry;
 pub mod tls;
+pub mod traffic;
+pub mod tui;

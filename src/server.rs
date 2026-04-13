@@ -2,8 +2,7 @@ use crate::{
     auth::{AuthProof, ReplayProtector},
     http,
     mode::ProxyMode,
-    netlog,
-    tls,
+    netlog, tls, traffic,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -20,7 +19,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, copy_bidirectional},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::timeout,
 };
@@ -155,8 +154,7 @@ async fn handle_connection(
         && let Some(tunnel_head) = http::parse_tunnel_request_head(&head, &args.path)?
     {
         if let Some(target) =
-            authorize_tunnel_request(&mut stream, tunnel_head, &body_prefix, &args, &replay)
-                .await?
+            authorize_tunnel_request(&mut stream, tunnel_head, &body_prefix, &args, &replay).await?
         {
             if !args.allow_private_targets && is_private_literal_target(&target) {
                 let response = http::build_error_response(
@@ -168,7 +166,7 @@ async fn handle_connection(
                 return Ok(());
             }
 
-            let mut outbound = match timeout(
+            let outbound = match timeout(
                 Duration::from_secs(args.connect_timeout_secs),
                 TcpStream::connect(&target),
             )
@@ -194,13 +192,23 @@ async fn handle_connection(
             outbound.set_nodelay(true)?;
 
             stream.write_all(&http::build_tunnel_established()).await?;
-            let (from_client, from_target) = copy_bidirectional(&mut stream, &mut outbound).await?;
+            let stats = traffic::relay_with_telemetry(
+                stream,
+                outbound,
+                traffic::RelayLabels {
+                    target: target.clone(),
+                    route: Some("remote".to_owned()),
+                    mode: Some("native-http".to_owned()),
+                },
+            )
+            .await?;
 
             info!(
                 peer = %peer,
                 target = %target,
-                uploaded = from_client,
-                downloaded = from_target,
+                uploaded = stats.uploaded,
+                downloaded = stats.downloaded,
+                sampled = stats.sampled,
                 "relay completed"
             );
 
@@ -287,13 +295,7 @@ where
     };
 
     if replay
-        .validate(
-            &args.password,
-            "POST",
-            &args.path,
-            &target,
-            &proof,
-        )
+        .validate(&args.password, "POST", &args.path, &target, &proof)
         .is_err()
     {
         return Ok(None);

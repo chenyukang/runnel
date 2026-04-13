@@ -1,9 +1,12 @@
-use crate::{auth::AuthProof, http, mode::ProxyMode, netlog, route, route::FilterMode, route::RouteDecision, socks5, tls};
+use crate::{
+    auth::AuthProof, http, mode::ProxyMode, netlog, route, route::FilterMode, route::RouteDecision,
+    socks5, tls, traffic,
+};
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
-    io::{AsyncWriteExt, copy_bidirectional},
+    io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
     time::timeout,
 };
@@ -83,8 +86,16 @@ pub async fn run(args: ClientArgs) -> Result<()> {
         let router = router.clone();
 
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_connection(socket, peer, args, router, connector, host_header, server_name).await
+            if let Err(err) = handle_connection(
+                socket,
+                peer,
+                args,
+                router,
+                connector,
+                host_header,
+                server_name,
+            )
+            .await
             {
                 if netlog::is_noisy_disconnect(&err) {
                     info!(peer = %peer, error = %err, "client session ended");
@@ -124,7 +135,9 @@ async fn handle_connection(
     match router.decide(&target).await? {
         RouteDecision::Direct => {
             let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
-            let _ = route::relay_direct_socks(inbound, &target, connect_timeout).await?;
+            let _ =
+                route::relay_direct_socks(inbound, &target, connect_timeout, Some("native-http"))
+                    .await?;
             info!(peer = %peer, target = %target_string, route = "direct", "client relay completed");
             return Ok(());
         }
@@ -200,13 +213,23 @@ async fn handle_connection(
     }
 
     socks5::send_success(&mut inbound).await?;
-    let (uploaded, downloaded) = copy_bidirectional(&mut inbound, &mut tunnel).await?;
+    let stats = traffic::relay_with_telemetry(
+        inbound,
+        tunnel,
+        traffic::RelayLabels {
+            target: target_string.clone(),
+            route: Some("remote".to_owned()),
+            mode: Some("native-http".to_owned()),
+        },
+    )
+    .await?;
 
     info!(
         peer = %peer,
         target = %target_string,
-        uploaded,
-        downloaded,
+        uploaded = stats.uploaded,
+        downloaded = stats.downloaded,
+        sampled = stats.sampled,
         "client relay completed"
     );
 

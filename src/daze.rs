@@ -1,9 +1,14 @@
-use crate::{client::ClientArgs, http, mode::ProxyMode, netlog, route, route::RouteDecision, server::ServerArgs, socks5};
+use crate::{
+    client::ClientArgs, http, mode::ProxyMode, netlog, route, route::RouteDecision,
+    server::ServerArgs, socks5,
+};
 use anyhow::{Context, Result, bail};
 use md5::Context as Md5Context;
 use reqwest::{
     Client as HttpClient, Method, Url,
-    header::{CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue, TRANSFER_ENCODING},
+    header::{
+        CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue, TRANSFER_ENCODING,
+    },
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -107,7 +112,8 @@ async fn handle_client_connection(
     match router.decide(&target).await? {
         RouteDecision::Direct => {
             let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
-            let _ = route::relay_direct_socks(inbound, &target, connect_timeout).await?;
+            let _ = route::relay_direct_socks(inbound, &target, connect_timeout, Some("daze-ashe"))
+                .await?;
             info!(peer = %peer, target = %target_string, route = "direct", mode = "daze-ashe", "relay completed");
             return Ok(());
         }
@@ -131,7 +137,8 @@ async fn handle_client_connection(
     .context("server connect timed out")??;
     upstream.set_nodelay(true)?;
 
-    let (upload, download) = client_establish_ashe(&mut upstream, &args.password, &target_string).await?;
+    let (upload, download) =
+        client_establish_ashe(&mut upstream, &args.password, &target_string).await?;
 
     socks5::send_success(&mut inbound).await?;
     relay_rc4(inbound, upstream, upload, download).await?;
@@ -248,7 +255,9 @@ async fn handle_baboon_client_connection(
     match router.decide(&target).await? {
         RouteDecision::Direct => {
             let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
-            let _ = route::relay_direct_socks(inbound, &target, connect_timeout).await?;
+            let _ =
+                route::relay_direct_socks(inbound, &target, connect_timeout, Some("daze-baboon"))
+                    .await?;
             info!(peer = %peer, target = %target_string, route = "direct", mode = "daze-baboon", "relay completed");
             return Ok(());
         }
@@ -285,10 +294,15 @@ async fn handle_baboon_client_connection(
         http::parse_tunnel_response(&head).context("invalid baboon response")?;
     if !is_http1 || status != 200 {
         let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
-        bail!("daze-baboon server refused sync with status {} {}", status, reason);
+        bail!(
+            "daze-baboon server refused sync with status {} {}",
+            status,
+            reason
+        );
     }
 
-    let (upload, download) = client_establish_ashe(&mut upstream, &args.password, &target_string).await?;
+    let (upload, download) =
+        client_establish_ashe(&mut upstream, &args.password, &target_string).await?;
 
     socks5::send_success(&mut inbound).await?;
     relay_rc4(inbound, upstream, upload, download).await?;
@@ -321,7 +335,10 @@ async fn handle_baboon_server_connection(
         }
     };
 
-    if request.method == "POST" && request.path == BABOON_PATH && validate_baboon_request(&request, &args.password) {
+    if request.method == "POST"
+        && request.path == BABOON_PATH
+        && validate_baboon_request(&request, &args.password)
+    {
         inbound
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: keep-alive\r\n\r\n",
@@ -738,9 +755,7 @@ impl Rc4State {
 
         let mut j = 0_u8;
         for i in 0..256 {
-            j = j
-                .wrapping_add(s[i])
-                .wrapping_add(key[i % key.len()]);
+            j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
             s.swap(i, j as usize);
         }
 

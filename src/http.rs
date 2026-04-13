@@ -100,7 +100,10 @@ pub fn parse_request(bytes: &[u8]) -> Result<HttpRequest> {
 
 pub fn parse_tunnel_response(bytes: &[u8]) -> Result<(bool, u16, String)> {
     let text = std::str::from_utf8(bytes).context("response is not valid UTF-8")?;
-    let start = text.split_once("\r\n").map(|(line, _)| line).unwrap_or(text);
+    let start = text
+        .split_once("\r\n")
+        .map(|(line, _)| line)
+        .unwrap_or(text);
     let mut parts = start.split_whitespace();
 
     let version = parts.next().context("missing response version")?;
@@ -393,7 +396,10 @@ mod tests {
         drop(writer);
 
         let (head, prefix) = read_head(&mut reader, 64).await.unwrap();
-        assert_eq!(std::str::from_utf8(&head).unwrap(), "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+        assert_eq!(
+            std::str::from_utf8(&head).unwrap(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n"
+        );
         assert_eq!(prefix, b"hello");
         let body = read_body(&mut reader, &prefix, 5, 16).await.unwrap();
         assert_eq!(body, b"hello");
