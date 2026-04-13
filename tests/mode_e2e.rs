@@ -10,13 +10,14 @@ use std::{
     fs,
     net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener},
     path::PathBuf,
-    sync::Once,
+    sync::{Once, OnceLock},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::Mutex,
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -24,6 +25,7 @@ use tracing_subscriber::EnvFilter;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static TRACING: Once = Once::new();
+static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct TestEnv {
     _target_handle: JoinHandle<()>,
@@ -51,16 +53,19 @@ impl Drop for TestEnv {
 
 #[tokio::test]
 async fn native_http_mode_round_trip_works() {
+    let _guard = test_lock().lock().await;
     assert_mode_round_trip(ProxyMode::NativeHttp).await.unwrap();
 }
 
 #[tokio::test]
 async fn native_mux_mode_round_trip_works() {
+    let _guard = test_lock().lock().await;
     assert_mode_round_trip(ProxyMode::NativeMux).await.unwrap();
 }
 
 #[tokio::test]
 async fn native_mux_mode_survives_concurrent_large_responses() {
+    let _guard = test_lock().lock().await;
     let env = start_env(ProxyMode::NativeMux).await.unwrap();
     let mut tasks = Vec::new();
 
@@ -89,16 +94,19 @@ async fn native_mux_mode_survives_concurrent_large_responses() {
 
 #[tokio::test]
 async fn daze_ashe_mode_round_trip_works() {
+    let _guard = test_lock().lock().await;
     assert_mode_round_trip(ProxyMode::DazeAshe).await.unwrap();
 }
 
 #[tokio::test]
 async fn daze_baboon_mode_round_trip_works() {
+    let _guard = test_lock().lock().await;
     assert_mode_round_trip(ProxyMode::DazeBaboon).await.unwrap();
 }
 
 #[tokio::test]
 async fn daze_czar_mode_round_trip_works() {
+    let _guard = test_lock().lock().await;
     assert_mode_round_trip(ProxyMode::DazeCzar).await.unwrap();
 }
 
@@ -183,7 +191,7 @@ async fn start_env(mode: ProxyMode) -> Result<TestEnv> {
     let client_handle = tokio::spawn(async move {
         let _ = client::run(client_args).await;
     });
-    sleep(Duration::from_millis(200)).await;
+    wait_for_tcp_listener(socks_port).await?;
 
     Ok(TestEnv {
         _target_handle: target_handle,
@@ -204,6 +212,10 @@ fn init_test_tracing() {
             .with_test_writer()
             .try_init();
     });
+}
+
+fn test_lock() -> &'static Mutex<()> {
+    TEST_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 async fn run_http_target(port: u16) {
@@ -283,6 +295,24 @@ fn free_port() -> Result<u16> {
     let listener = StdTcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .context("failed to allocate local port")?;
     Ok(listener.local_addr()?.port())
+}
+
+async fn wait_for_tcp_listener(port: u16) -> Result<()> {
+    timeout(Duration::from_secs(2), async move {
+        loop {
+            match TcpStream::connect(("127.0.0.1", port)).await {
+                Ok(stream) => {
+                    drop(stream);
+                    return Ok::<(), anyhow::Error>(());
+                }
+                Err(_) => sleep(Duration::from_millis(25)).await,
+            }
+        }
+    })
+    .await
+    .context("timed out waiting for test listener to accept connections")??;
+
+    Ok(())
 }
 
 fn write_temp_cert_pair() -> Result<(PathBuf, PathBuf)> {

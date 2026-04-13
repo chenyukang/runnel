@@ -30,13 +30,15 @@ const FRAME_DATA: u8 = 4;
 const FRAME_CLOSE: u8 = 5;
 const FRAME_PING: u8 = 6;
 const FRAME_PONG: u8 = 7;
+const FRAME_MAGIC: [u8; 2] = *b"PM";
 
 // Keep mux data frames conservative. Local stress tests reproduced bad headers in the
-// ~32 KiB regime, and real-world WAN traffic still showed desync at 16 KiB. A smaller
-// frame size costs some throughput, but is safer for now.
-const MAX_FRAME_PAYLOAD: usize = 4 * 1024;
+// ~32 KiB regime before frames carried a magic prefix, and even with magic + resync
+// the concurrent large-response stress test still regresses at 32 KiB. 16 KiB is the
+// current largest payload size that remains stable under the local stress suite.
+const MAX_FRAME_PAYLOAD: usize = 16 * 1024;
 const MAX_CONTROL_PAYLOAD: usize = 8 * 1024;
-const FRAME_HEADER_LEN: usize = 9;
+const FRAME_HEADER_LEN: usize = 11;
 const SESSION_AUTH_TARGET: &str = "__mux__";
 const SESSION_KEEPALIVE_SECS: u64 = 32;
 const SESSION_IDLE_TIMEOUT_SECS: u64 = 48;
@@ -859,7 +861,19 @@ async fn read_frame<R>(reader: &mut R, max_payload: usize) -> Result<Frame>
 where
     R: AsyncRead + Unpin,
 {
-    let mut header = [0_u8; FRAME_HEADER_LEN];
+    let mut magic = [0_u8; FRAME_MAGIC.len()];
+    reader.read_exact(&mut magic).await?;
+    let mut skipped = 0_usize;
+    while magic != FRAME_MAGIC {
+        skipped += 1;
+        magic[0] = magic[1];
+        reader.read_exact(&mut magic[1..]).await?;
+    }
+    if skipped > 0 {
+        info!(skipped, "mux frame reader resynchronized after skipping bytes");
+    }
+
+    let mut header = [0_u8; FRAME_HEADER_LEN - FRAME_MAGIC.len()];
     reader.read_exact(&mut header).await?;
 
     let kind = header[0];
@@ -868,11 +882,12 @@ where
         u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
     if payload_len > max_payload {
         bail!(
-            "mux frame exceeded {} bytes (kind={} stream_id={} payload_len={} raw={:02x?})",
+            "mux frame exceeded {} bytes (kind={} stream_id={} payload_len={} raw_magic={:02x?} raw={:02x?})",
             max_payload,
             kind,
             stream_id,
             payload_len,
+            magic,
             header,
         );
     }
@@ -892,9 +907,12 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut header = [0_u8; FRAME_HEADER_LEN];
-    header[0] = frame.kind;
-    header[1..5].copy_from_slice(&frame.stream_id.to_be_bytes());
-    header[5..9].copy_from_slice(&(frame.payload.len() as u32).to_be_bytes());
+    header[..FRAME_MAGIC.len()].copy_from_slice(&FRAME_MAGIC);
+    header[FRAME_MAGIC.len()] = frame.kind;
+    header[FRAME_MAGIC.len() + 1..FRAME_MAGIC.len() + 5]
+        .copy_from_slice(&frame.stream_id.to_be_bytes());
+    header[FRAME_MAGIC.len() + 5..FRAME_MAGIC.len() + 9]
+        .copy_from_slice(&(frame.payload.len() as u32).to_be_bytes());
     let mut encoded = Vec::with_capacity(FRAME_HEADER_LEN + frame.payload.len());
     encoded.extend_from_slice(&header);
     encoded.extend_from_slice(&frame.payload);
@@ -959,5 +977,36 @@ mod tests {
         assert_eq!(read.kind, FRAME_DATA);
         assert_eq!(read.stream_id, 9);
         assert_eq!(read.payload, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn read_frame_resynchronizes_after_garbage_prefix() {
+        let frame = Frame::data(11, b"resync me".to_vec());
+        let mut encoded = b"garbage-before-frame".to_vec();
+        write_frame(&mut encoded, &frame).await.unwrap();
+
+        let read = read_frame(&mut Cursor::new(encoded), 64).await.unwrap();
+        assert_eq!(read.kind, FRAME_DATA);
+        assert_eq!(read.stream_id, 11);
+        assert_eq!(read.payload, b"resync me");
+    }
+
+    #[tokio::test]
+    async fn read_frame_resynchronizes_between_frames() {
+        let first = Frame::data(21, b"first".to_vec());
+        let second = Frame::data(22, b"second".to_vec());
+        let mut encoded = Vec::new();
+        write_frame(&mut encoded, &first).await.unwrap();
+        encoded.extend_from_slice(b"desync");
+        write_frame(&mut encoded, &second).await.unwrap();
+
+        let mut reader = Cursor::new(encoded);
+        let read_first = read_frame(&mut reader, 64).await.unwrap();
+        let read_second = read_frame(&mut reader, 64).await.unwrap();
+
+        assert_eq!(read_first.stream_id, 21);
+        assert_eq!(read_first.payload, b"first");
+        assert_eq!(read_second.stream_id, 22);
+        assert_eq!(read_second.payload, b"second");
     }
 }
