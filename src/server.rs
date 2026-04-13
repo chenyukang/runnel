@@ -119,22 +119,10 @@ async fn handle_connection(
     .context("request head timed out")??;
     let (head, body_prefix) = head;
 
-    let request = match http::parse_request(&head) {
-        Ok(request) => request,
-        Err(err) => {
-            send_not_found(&mut stream).await?;
-            return Err(err.context("invalid HTTP request"));
-        }
-    };
-
-    if !request.version.starts_with("HTTP/1.") {
-        serve_public_request(&mut stream, request, &body_prefix, &fallback).await?;
-        return Ok(());
-    }
-
-    if request.method == "POST" && request.path == args.path {
+    if let Some(tunnel_head) = http::parse_tunnel_request_head(&head, &args.path)? {
         if let Some(target) =
-            authorize_tunnel_request(&mut stream, &request, &body_prefix, &args, &replay).await?
+            authorize_tunnel_request(&mut stream, tunnel_head, &body_prefix, &args, &replay)
+                .await?
         {
             if !args.allow_private_targets && is_private_literal_target(&target) {
                 let response = http::build_error_response(
@@ -189,6 +177,19 @@ async fn handle_connection(
         return Ok(());
     }
 
+    let request = match http::parse_request(&head) {
+        Ok(request) => request,
+        Err(err) => {
+            send_not_found(&mut stream).await?;
+            return Err(err.context("invalid HTTP request"));
+        }
+    };
+
+    if !request.version.starts_with("HTTP/1.") {
+        serve_public_request(&mut stream, request, &body_prefix, &fallback).await?;
+        return Ok(());
+    }
+
     serve_public_request(&mut stream, request, &body_prefix, &fallback).await?;
     Ok(())
 }
@@ -223,7 +224,7 @@ where
 
 async fn authorize_tunnel_request<S>(
     stream: &mut S,
-    request: &http::HttpRequest,
+    request: http::TunnelRequestHead,
     body_prefix: &[u8],
     args: &ServerArgs,
     replay: &ReplayProtector,
@@ -231,11 +232,11 @@ async fn authorize_tunnel_request<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if http::is_chunked(&request.headers) {
+    if request.chunked {
         return Ok(None);
     }
 
-    let body_length = match http::content_length(&request.headers)? {
+    let body_length = match request.content_length {
         Some(length) => length,
         None => return Ok(None),
     };
@@ -254,8 +255,8 @@ where
     if replay
         .validate(
             &args.password,
-            &request.method,
-            &request.path,
+            "POST",
+            &args.path,
             &target,
             &proof,
         )

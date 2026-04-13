@@ -142,18 +142,15 @@ async fn handle_connection(
         }
     };
 
-    let response = http::parse_response(&response_head).context("invalid server response")?;
-    if !response.version.starts_with("HTTP/1.") {
+    let (is_http1, status, reason) =
+        http::parse_tunnel_response(&response_head).context("invalid server response")?;
+    if !is_http1 {
         let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
         bail!("server returned an unsupported HTTP version");
     }
-    if response.status != 200 {
+    if status != 200 {
         let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
-        bail!(
-            "server refused tunnel with status {} {}",
-            response.status,
-            response.reason
-        );
+        bail!("server refused tunnel with status {} {}", status, reason);
     }
 
     socks5::send_success(&mut inbound).await?;

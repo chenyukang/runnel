@@ -12,10 +12,9 @@ pub struct HttpRequest {
 }
 
 #[derive(Debug)]
-pub struct HttpResponse {
-    pub version: String,
-    pub status: u16,
-    pub reason: String,
+pub struct TunnelRequestHead {
+    pub content_length: Option<usize>,
+    pub chunked: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -99,24 +98,68 @@ pub fn parse_request(bytes: &[u8]) -> Result<HttpRequest> {
     })
 }
 
-pub fn parse_response(bytes: &[u8]) -> Result<HttpResponse> {
+pub fn parse_tunnel_response(bytes: &[u8]) -> Result<(bool, u16, String)> {
     let text = std::str::from_utf8(bytes).context("response is not valid UTF-8")?;
     let start = text.split_once("\r\n").map(|(line, _)| line).unwrap_or(text);
     let mut parts = start.split_whitespace();
 
-    let version = parts.next().context("missing response version")?.to_owned();
+    let version = parts.next().context("missing response version")?;
     let status = parts
         .next()
         .context("missing response status")?
         .parse::<u16>()
         .context("invalid response status")?;
     let reason = parts.collect::<Vec<_>>().join(" ");
+    Ok((version.starts_with("HTTP/1."), status, reason))
+}
 
-    Ok(HttpResponse {
-        version,
-        status,
-        reason,
-    })
+pub fn parse_tunnel_request_head(bytes: &[u8], path: &str) -> Result<Option<TunnelRequestHead>> {
+    let text = std::str::from_utf8(bytes).context("request is not valid UTF-8")?;
+    let mut lines = text.split("\r\n");
+    let start = lines.next().context("missing request line")?;
+    let mut parts = start.split_whitespace();
+
+    let method = parts.next().context("missing request method")?;
+    let request_path = parts.next().context("missing request path")?;
+    let version = parts.next().context("missing request version")?;
+    if parts.next().is_some() {
+        bail!("request line contains too many fields");
+    }
+
+    if !version.starts_with("HTTP/1.") || method != "POST" || request_path != path {
+        return Ok(None);
+    }
+
+    let mut content_length = None;
+    let mut chunked = false;
+
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+
+        let (name, value) = line
+            .split_once(':')
+            .context("malformed header line without colon")?;
+        let value = value.trim();
+
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            content_length = Some(
+                value
+                    .parse::<usize>()
+                    .context("invalid content-length header")?,
+            );
+        } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            chunked = value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("chunked"));
+        }
+    }
+
+    Ok(Some(TunnelRequestHead {
+        content_length,
+        chunked,
+    }))
 }
 
 pub fn build_tunnel_request(
@@ -312,6 +355,33 @@ mod tests {
 
         let parsed_payload = parse_tunnel_payload(&req[header_end + 4..]).unwrap();
         assert_eq!(parsed_payload.target, "example.com:443");
+    }
+
+    #[test]
+    fn parse_tunnel_request_head_fast_path() {
+        let proof = AuthProof {
+            timestamp: 1,
+            nonce: "nonce".to_owned(),
+            signature: "sig".to_owned(),
+        };
+        let payload = TunnelPayload {
+            target: "example.com:443".to_owned(),
+            timestamp: proof.timestamp,
+            nonce: proof.nonce,
+            signature: proof.signature,
+        };
+        let req =
+            build_tunnel_request("demo.example", "/connect", &payload, "Mozilla/5.0").unwrap();
+        let header_end = req
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .unwrap();
+
+        let parsed = parse_tunnel_request_head(&req[..header_end + 4], "/connect")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.content_length, Some(req.len() - (header_end + 4)));
+        assert!(!parsed.chunked);
     }
 
     #[tokio::test]

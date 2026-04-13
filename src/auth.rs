@@ -81,24 +81,10 @@ impl ReplayProtector {
             bail!("nonce already used");
         }
 
-        let expected = sign(
-            password,
-            method,
-            path,
-            target,
-            proof.timestamp,
-            &proof.nonce,
-        )?;
         let actual = URL_SAFE_NO_PAD
             .decode(proof.signature.as_bytes())
             .context("invalid signature encoding")?;
-        let expected = URL_SAFE_NO_PAD
-            .decode(expected.as_bytes())
-            .context("invalid locally generated signature encoding")?;
-
-        if actual != expected {
-            bail!("signature mismatch");
-        }
+        verify(password, method, path, target, proof.timestamp, &proof.nonce, &actual)?;
 
         seen.order.push_back((proof.nonce.clone(), proof.timestamp));
         seen.seen.insert(proof.nonce.clone(), proof.timestamp);
@@ -114,20 +100,61 @@ pub fn sign(
     timestamp: i64,
     nonce: &str,
 ) -> Result<String> {
-    let mut mac = HmacSha256::new_from_slice(password.as_bytes()).context("invalid HMAC key")?;
-    mac.update(signature_input(method, path, target, timestamp, nonce).as_bytes());
-    Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
+    Ok(URL_SAFE_NO_PAD.encode(sign_bytes(
+        password, method, path, target, timestamp, nonce,
+    )?))
 }
 
-fn signature_input(method: &str, path: &str, target: &str, timestamp: i64, nonce: &str) -> String {
-    format!(
-        "{}\n{}\n{}\n{}\n{}\n",
-        method.to_ascii_uppercase(),
-        path,
-        target,
-        timestamp,
-        nonce
-    )
+fn sign_bytes(
+    password: &str,
+    method: &str,
+    path: &str,
+    target: &str,
+    timestamp: i64,
+    nonce: &str,
+) -> Result<Vec<u8>> {
+    let mut mac = HmacSha256::new_from_slice(password.as_bytes()).context("invalid HMAC key")?;
+    update_signature_input(&mut mac, method, path, target, timestamp, nonce);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
+fn verify(
+    password: &str,
+    method: &str,
+    path: &str,
+    target: &str,
+    timestamp: i64,
+    nonce: &str,
+    actual: &[u8],
+) -> Result<()> {
+    let mut mac = HmacSha256::new_from_slice(password.as_bytes()).context("invalid HMAC key")?;
+    update_signature_input(&mut mac, method, path, target, timestamp, nonce);
+    mac.verify_slice(actual)
+        .map_err(|_| anyhow::anyhow!("signature mismatch"))
+}
+
+fn update_signature_input(
+    mac: &mut HmacSha256,
+    method: &str,
+    path: &str,
+    target: &str,
+    timestamp: i64,
+    nonce: &str,
+) {
+    match method.bytes().any(|byte| byte.is_ascii_lowercase()) {
+        true => {
+            let uppercase = method.to_ascii_uppercase();
+            mac.update(uppercase.as_bytes());
+        }
+        false => mac.update(method.as_bytes()),
+    }
+
+    let timestamp = timestamp.to_string();
+    for part in [path.as_bytes(), target.as_bytes(), timestamp.as_bytes(), nonce.as_bytes()] {
+        mac.update(b"\n");
+        mac.update(part);
+    }
+    mac.update(b"\n");
 }
 
 fn unix_timestamp() -> Result<i64> {
