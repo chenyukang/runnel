@@ -6,16 +6,19 @@ use serde::Deserialize;
 
 use crate::{
     cert::CertArgs, client::ClientArgs, mode::ProxyMode, route::FilterMode, server::ServerArgs,
+    tun::TunArgs,
 };
 
 #[derive(Debug, Default, Deserialize)]
 pub struct FileConfig {
     pub log: Option<String>,
     pub log_file: Option<PathBuf>,
+    pub telemetry_sock: Option<PathBuf>,
     pub tui: Option<bool>,
     pub daemon: Option<bool>,
     pub client: Option<ClientConfig>,
     pub server: Option<ServerConfig>,
+    pub tun: Option<TunConfig>,
     pub cert: Option<CertConfig>,
 }
 
@@ -66,6 +69,16 @@ pub struct CertConfig {
     pub names: Option<Vec<String>>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct TunConfig {
+    pub device: Option<String>,
+    pub shell: Option<String>,
+    pub helper_cmd: Option<String>,
+    pub helper_ready_delay_ms: Option<u64>,
+    pub up: Option<Vec<String>>,
+    pub down: Option<Vec<String>>,
+}
+
 pub fn load(path: &Path) -> Result<(FileConfig, PathBuf)> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -88,6 +101,7 @@ pub fn load(path: &Path) -> Result<(FileConfig, PathBuf)> {
 pub fn apply_globals(
     log: &mut String,
     log_file: &mut PathBuf,
+    telemetry_sock: &mut Option<PathBuf>,
     tui: &mut bool,
     daemon: &mut bool,
     config: &FileConfig,
@@ -98,6 +112,11 @@ pub fn apply_globals(
     if should_override(matches, "log_file") {
         if let Some(path) = &config.log_file {
             *log_file = resolve_path(base_dir, path);
+        }
+    }
+    if should_override(matches, "telemetry_sock") {
+        if let Some(path) = &config.telemetry_sock {
+            *telemetry_sock = Some(resolve_path(base_dir, path));
         }
     }
     maybe_assign(tui, &config.tui, should_override(matches, "tui"));
@@ -289,6 +308,37 @@ pub fn apply_server(
     );
 }
 
+pub fn apply_tun(args: &mut TunArgs, config: &FileConfig, matches: &ArgMatches, base_dir: &Path) {
+    apply_client(&mut args.client, config, matches, base_dir);
+
+    let Some(tun) = &config.tun else {
+        return;
+    };
+
+    maybe_assign(
+        &mut args.device,
+        &tun.device,
+        should_override(matches, "device"),
+    );
+    maybe_assign(
+        &mut args.shell,
+        &tun.shell,
+        should_override(matches, "shell"),
+    );
+    maybe_assign(
+        &mut args.helper_cmd,
+        &tun.helper_cmd,
+        should_override(matches, "helper_cmd"),
+    );
+    maybe_assign(
+        &mut args.helper_ready_delay_ms,
+        &tun.helper_ready_delay_ms,
+        should_override(matches, "helper_ready_delay_ms"),
+    );
+    maybe_assign(&mut args.up, &tun.up, should_override(matches, "up"));
+    maybe_assign(&mut args.down, &tun.down, should_override(matches, "down"));
+}
+
 pub fn apply_cert(args: &mut CertArgs, config: &FileConfig, matches: &ArgMatches, base_dir: &Path) {
     let Some(cert) = &config.cert else {
         return;
@@ -363,17 +413,25 @@ mod tests {
     fn yaml_parse_smoke() {
         let raw = r#"
 log: debug
+telemetry_sock: run/pipit.sock
 tui: true
 daemon: true
 client:
   server: 127.0.0.1:1443
   mode: native-mux
   rule_file: rules/rule.ls
+tun:
+  device: utun233
+  helper_cmd: tun2socks --device {device} --proxy socks5://{socks}
 server:
   listen: 0.0.0.0:1443
 "#;
         let parsed: FileConfig = serde_yaml::from_str(raw).unwrap();
         assert_eq!(parsed.log.as_deref(), Some("debug"));
+        assert_eq!(
+            parsed.telemetry_sock.as_deref(),
+            Some(Path::new("run/pipit.sock"))
+        );
         assert_eq!(parsed.tui, Some(true));
         assert_eq!(parsed.daemon, Some(true));
         assert_eq!(
@@ -383,6 +441,10 @@ server:
         assert_eq!(
             parsed.server.as_ref().and_then(|cfg| cfg.listen.as_deref()),
             Some("0.0.0.0:1443")
+        );
+        assert_eq!(
+            parsed.tun.as_ref().and_then(|cfg| cfg.device.as_deref()),
+            Some("utun233")
         );
     }
 

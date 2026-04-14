@@ -15,3 +15,4 @@ pub mod telemetry;
 pub mod tls;
 pub mod traffic;
 pub mod tui;
+pub mod tun;

@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event as CEvent, KeyCode, KeyEventKind},
+    event::{self, Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -23,14 +23,17 @@ use ratatui::{
 use sysinfo::{ProcessesToUpdate, System};
 use tokio::{
     sync::broadcast,
+    sync::mpsc,
     time::{MissedTickBehavior, interval},
 };
 
-use crate::telemetry::TraceEvent;
+use crate::telemetry::{
+    DashboardSnapshot, MonitorContext, RecentTargetSnapshot, TraceEvent, attach_socket,
+};
 
 const HISTORY_LEN: usize = 48;
-const RECENT_TARGETS: usize = 32;
 const RECENT_EVENTS: usize = 40;
+const RECENT_TARGETS: usize = RECENT_EVENTS;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Clone, Debug)]
@@ -48,19 +51,33 @@ pub async fn run(
     context: DashboardContext,
     mut receiver: broadcast::Receiver<TraceEvent>,
 ) -> Result<()> {
+    run_loop(DashboardApp::new(context), move || receiver.try_recv()).await
+}
+
+pub async fn run_attached(socket_path: PathBuf) -> Result<()> {
+    let (snapshot, mut receiver) = attach_socket(&socket_path).await?;
+    run_loop(DashboardApp::from_snapshot(snapshot), move || {
+        receiver.try_recv().map_err(map_mpsc_try_recv)
+    })
+    .await
+}
+
+async fn run_loop<F>(mut app: DashboardApp, mut next_event: F) -> Result<()>
+where
+    F: FnMut() -> std::result::Result<TraceEvent, broadcast::error::TryRecvError>,
+{
     let _terminal_guard = TerminalGuard::enter()?;
     let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut app = DashboardApp::new(context);
     let mut ticker = interval(Duration::from_millis(160));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         loop {
-            match receiver.try_recv() {
+            match next_event() {
                 Ok(event) => app.ingest(event),
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
@@ -73,7 +90,7 @@ pub async fn run(
         if event::poll(Duration::from_millis(0))?
             && let CEvent::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+            && is_exit_key(key)
         {
             return Ok(());
         }
@@ -100,10 +117,14 @@ impl Drop for TerminalGuard {
     }
 }
 
+fn is_exit_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+}
+
 #[derive(Clone, Debug)]
 struct RecentTarget {
     seen_at: String,
-    target: String,
     route: String,
     link: String,
     uploaded: u64,
@@ -138,12 +159,37 @@ struct ProcessStats {
     threads: Option<usize>,
 }
 
+impl From<MonitorContext> for DashboardContext {
+    fn from(value: MonitorContext) -> Self {
+        Self {
+            command_label: value.command_label,
+            mode_label: value.mode_label,
+            listen: value.listen,
+            upstream: value.upstream,
+            path: value.path,
+            log_file: value.log_file,
+            log_filter: value.log_filter,
+        }
+    }
+}
+
+impl From<RecentTargetSnapshot> for RecentTarget {
+    fn from(value: RecentTargetSnapshot) -> Self {
+        Self {
+            seen_at: value.seen_at,
+            route: value.route,
+            link: value.link,
+            uploaded: value.uploaded,
+            downloaded: value.downloaded,
+        }
+    }
+}
+
 impl DashboardApp {
     fn new(context: DashboardContext) -> Self {
-        let pid = std::process::id();
         let mut app = Self {
             context,
-            pid,
+            pid: std::process::id(),
             started_at: Instant::now(),
             spinner_index: 0,
             total_relays: 0,
@@ -161,6 +207,49 @@ impl DashboardApp {
             last_traffic_at: None,
             recent_targets: VecDeque::with_capacity(RECENT_TARGETS),
             recent_events: VecDeque::with_capacity(RECENT_EVENTS),
+        };
+        app.refresh_process_stats();
+        app
+    }
+
+    fn from_snapshot(snapshot: DashboardSnapshot) -> Self {
+        let DashboardSnapshot {
+            context,
+            uptime_secs,
+            total_relays,
+            total_errors,
+            total_warnings,
+            total_uploaded,
+            total_downloaded,
+            upload_history,
+            download_history,
+            recent_targets,
+            recent_events,
+            last_event_age_ms,
+            last_warning_age_ms,
+            last_traffic_age_ms,
+        } = snapshot;
+
+        let mut app = Self {
+            pid: context.pid,
+            context: DashboardContext::from(context),
+            started_at: Instant::now() - Duration::from_secs(uptime_secs),
+            spinner_index: 0,
+            total_relays,
+            total_errors,
+            total_warnings,
+            total_uploaded,
+            total_downloaded,
+            upload_history: fit_history(upload_history),
+            download_history: fit_history(download_history),
+            last_bucket_at: Instant::now(),
+            last_process_refresh: Instant::now() - Duration::from_secs(3),
+            process_stats: ProcessStats::default(),
+            last_event_at: age_to_instant(last_event_age_ms),
+            last_warning_at: age_to_instant(last_warning_age_ms),
+            last_traffic_at: age_to_instant(last_traffic_age_ms),
+            recent_targets: recent_targets.into_iter().map(RecentTarget::from).collect(),
+            recent_events: recent_events.into_iter().collect(),
         };
         app.refresh_process_stats();
         app
@@ -239,7 +328,6 @@ impl DashboardApp {
             self.recent_targets.push_front(RecentTarget {
                 seen_at: clock_stamp(event.at),
                 link: link_from_target(&target),
-                target,
                 route,
                 uploaded,
                 downloaded,
@@ -482,13 +570,12 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
 
     let lower = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[3]);
 
     let rows = app.recent_targets.iter().map(|item| {
         Row::new(vec![
             Cell::from(item.seen_at.clone()),
-            Cell::from(item.target.clone()),
             Cell::from(item.route.clone()),
             Cell::from(item.link.clone()),
             Cell::from(format!(
@@ -502,14 +589,13 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
         rows,
         [
             Constraint::Length(8),
-            Constraint::Percentage(33),
             Constraint::Length(7),
-            Constraint::Percentage(39),
+            Constraint::Percentage(55),
             Constraint::Length(18),
         ],
     )
     .header(
-        Row::new(vec!["When", "Target", "Route", "Link", "Up / Down"]).style(
+        Row::new(vec!["When", "Route", "Link", "Up / Down"]).style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -600,6 +686,29 @@ fn rotate_history(history: &mut Vec<u64>) {
     history.rotate_left(1);
     if let Some(last) = history.last_mut() {
         *last = 0;
+    }
+}
+
+fn fit_history(mut history: Vec<u64>) -> Vec<u64> {
+    if history.len() > HISTORY_LEN {
+        return history.split_off(history.len() - HISTORY_LEN);
+    }
+    if history.len() < HISTORY_LEN {
+        let mut padded = vec![0; HISTORY_LEN - history.len()];
+        padded.extend(history);
+        return padded;
+    }
+    history
+}
+
+fn age_to_instant(age_ms: Option<u64>) -> Option<Instant> {
+    age_ms.map(|age| Instant::now() - Duration::from_millis(age))
+}
+
+fn map_mpsc_try_recv(error: mpsc::error::TryRecvError) -> broadcast::error::TryRecvError {
+    match error {
+        mpsc::error::TryRecvError::Empty => broadcast::error::TryRecvError::Empty,
+        mpsc::error::TryRecvError::Disconnected => broadcast::error::TryRecvError::Closed,
     }
 }
 

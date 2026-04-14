@@ -92,7 +92,13 @@ You can also enable background mode from YAML:
 daemon: true
 ```
 
-`daemon: true` is supported for `client` and `server`. If `tui: true` is also set, daemon mode automatically disables TUI.
+`daemon: true` is supported for `client`, `server`, and `tun`. If `tui: true` is also set, daemon mode automatically disables TUI.
+
+You can also pin the local telemetry socket path in YAML:
+
+```yaml
+telemetry_sock: ./proxy.client.sock
+```
 
 ## Daemon Mode
 
@@ -117,9 +123,62 @@ PIPIT_PASSWORD='replace-me' cargo run -- --daemon server \
 
 Notes:
 
-- `--daemon` is supported for `client` and `server`
+- `--daemon` is supported for `client`, `server`, and `tun`
 - if `tui: true` or `--tui` is also set, daemon mode automatically disables TUI
 - logs still go to `--log-file`, which defaults to `proxy.log`
+
+## Attach TUI
+
+Once a daemon is already running, you can open a separate dashboard process with:
+
+```bash
+cargo run -- tui --attach ./proxy.client.sock
+```
+
+If you already use a config file with `telemetry_sock`, you can reuse it:
+
+```bash
+cargo run -- --config ./pipit.client.yaml tui
+```
+
+By default, `pipit tui` looks for an existing `client`, `server`, or `tun` socket derived from `--log-file`.
+
+## Experimental Tun Mode
+
+`pipit tun` is the first step toward a VPN-style setup that does not rely on the system SOCKS proxy.
+
+This mode does not yet embed a full userspace IP stack. Instead, it:
+
+- runs the normal `pipit client` internally as a local SOCKS endpoint
+- starts an external TUN helper command
+- runs optional `up` and `down` shell hooks so you can add or remove routes
+- keeps everything under one `pipit` process, so daemon mode, logging, and TUI attach still work
+
+Example:
+
+```bash
+sudo PIPIT_PASSWORD='replace-me' cargo run -- --config ./pipit.tun.yaml tun
+```
+
+The repository includes a starter template at [`pipit.tun.yaml`](./pipit.tun.yaml).
+
+Important notes:
+
+- `pipit` only uses standalone helpers now; if `tun.helper_cmd` is omitted, it looks for `PIPIT_TUN_HELPER`, then `tun2socks` from `PATH`
+- on macOS, the simplest path is usually to install a standalone `tun2socks` binary and let `pipit` discover it from `PATH`
+- on macOS, if `tun.up` / `tun.down` are omitted and the upstream server resolves to IPv4, `pipit` configures the TUN device as `198.18.0.1`, pins the upstream server IP to the original egress path, and installs the same split route family commonly used by tun2socks (`1.0.0.0/8`, `2.0.0.0/7`, ..., `128.0.0.0/1`, plus `198.18.0.0/15`)
+- the default route hooks need elevated privileges, so `sudo` is usually required
+- you can still override `tun.helper_cmd`, `tun.up`, and `tun.down` if you want a different helper or route policy
+- placeholders available in commands and hooks are:
+  - `{device}`
+  - `{socks}` or `{socks_listen}`
+  - `{server}`
+  - `{server_host}`
+  - `{server_port}`
+  - `{server_ip}`
+  - `{egress_interface}`
+  - `{egress_gateway}`
+  - `{log_file}`
 
 ## Modes
 
