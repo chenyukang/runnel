@@ -181,6 +181,8 @@ async fn start_env(mode: ProxyMode) -> Result<TestEnv> {
         handshake_timeout_secs: 10,
         connect_timeout_secs: 10,
         max_header_size: 16 * 1024,
+        system_proxy: false,
+        system_proxy_services: Vec::new(),
     };
 
     let server_handle = tokio::spawn(async move {

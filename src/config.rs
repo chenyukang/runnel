@@ -40,6 +40,8 @@ pub struct ClientConfig {
     pub handshake_timeout_secs: Option<u64>,
     pub connect_timeout_secs: Option<u64>,
     pub max_header_size: Option<usize>,
+    pub system_proxy: Option<bool>,
+    pub system_proxy_services: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -211,6 +213,16 @@ pub fn apply_client(
         &mut args.max_header_size,
         &client.max_header_size,
         should_override(matches, "max_header_size"),
+    );
+    maybe_assign(
+        &mut args.system_proxy,
+        &client.system_proxy,
+        should_override(matches, "system_proxy"),
+    );
+    maybe_assign(
+        &mut args.system_proxy_services,
+        &client.system_proxy_services,
+        should_override(matches, "system_proxy_services"),
     );
 }
 
@@ -420,6 +432,9 @@ client:
   server: 127.0.0.1:1443
   mode: native-mux
   rule_file: rules/rule.ls
+  system_proxy: true
+  system_proxy_services:
+    - Wi-Fi
 tun:
   device: utun233
   helper_cmd: tun2socks --device {device} --proxy socks5://{socks}
@@ -437,6 +452,18 @@ server:
         assert_eq!(
             parsed.client.as_ref().and_then(|cfg| cfg.server.as_deref()),
             Some("127.0.0.1:1443")
+        );
+        assert_eq!(
+            parsed.client.as_ref().and_then(|cfg| cfg.system_proxy),
+            Some(true)
+        );
+        assert_eq!(
+            parsed
+                .client
+                .as_ref()
+                .and_then(|cfg| cfg.system_proxy_services.as_ref())
+                .map(|items| items.len()),
+            Some(1)
         );
         assert_eq!(
             parsed.server.as_ref().and_then(|cfg| cfg.listen.as_deref()),

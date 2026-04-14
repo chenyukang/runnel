@@ -65,6 +65,40 @@ PIPIT_PASSWORD='replace-me' cargo run -- client \
 
 4. Point your browser or tools at `socks5://127.0.0.1:1080`.
 
+## macOS System Proxy
+
+On macOS, `pipit client` can temporarily point the system SOCKS proxy at its local listener and restore the previous SOCKS settings when `pipit` exits normally.
+
+Example:
+
+```bash
+PIPIT_PASSWORD='replace-me' cargo run -- client \
+  --mode native-http \
+  --listen 127.0.0.1:1080 \
+  --server example.com:1443 \
+  --server-name example.com \
+  --ca-cert server.crt \
+  --system-proxy
+```
+
+If you only want to touch specific macOS network services, repeat `--system-proxy-service`:
+
+```bash
+cargo run -- client \
+  --listen 127.0.0.1:1080 \
+  --server example.com:1443 \
+  --system-proxy \
+  --system-proxy-service Wi-Fi \
+  --system-proxy-service "USB 10/100/1000 LAN"
+```
+
+Notes:
+
+- this feature is only supported on macOS
+- `pipit` snapshots the current SOCKS settings first, then restores them on a normal shutdown such as `Ctrl-C` or `SIGTERM`
+- if the existing SOCKS proxy uses authentication, `pipit` refuses to overwrite it because `networksetup` does not expose enough information to restore credentials safely
+- changing macOS network services may require running `pipit` from an administrator account
+
 ## Config File
 
 You can move most CLI flags into a YAML config file and load it with `--config`.

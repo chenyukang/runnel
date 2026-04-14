@@ -1,6 +1,6 @@
 use crate::{
     auth::AuthProof, http, mode::ProxyMode, netlog, route, route::FilterMode, route::RouteDecision,
-    socks5, tls, traffic,
+    socks5, system_proxy, tls, traffic,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -49,16 +49,37 @@ pub struct ClientArgs {
     pub connect_timeout_secs: u64,
     #[arg(long, default_value_t = 8 * 1024)]
     pub max_header_size: usize,
+    #[arg(long)]
+    pub system_proxy: bool,
+    #[arg(long = "system-proxy-service")]
+    pub system_proxy_services: Vec<String>,
 }
 
 pub async fn run(args: ClientArgs) -> Result<()> {
     args.validate_required()?;
+    let _system_proxy = system_proxy::maybe_activate(&args)?;
 
+    tokio::select! {
+        result = async move {
+            match args.effective_mode()? {
+                ProxyMode::NativeHttp => run_native_http(args).await,
+                ProxyMode::NativeMux => crate::mux::run_client(args).await,
+                ProxyMode::DazeAshe | ProxyMode::DazeBaboon => crate::daze::run_client(args).await,
+                ProxyMode::DazeCzar => crate::czar::run_client(args).await,
+            }
+        } => result,
+        signal = wait_for_shutdown_signal() => {
+            signal?;
+            info!("client shutting down");
+            Ok(())
+        }
+    }
+}
+
+async fn run_native_http(args: ClientArgs) -> Result<()> {
     match args.effective_mode()? {
         ProxyMode::NativeHttp => {}
-        ProxyMode::NativeMux => return crate::mux::run_client(args).await,
-        ProxyMode::DazeAshe | ProxyMode::DazeBaboon => return crate::daze::run_client(args).await,
-        ProxyMode::DazeCzar => return crate::czar::run_client(args).await,
+        _ => bail!("run_native_http only supports native-http mode"),
     }
 
     let router = route::Router::from_args(&args)?;
@@ -250,4 +271,29 @@ async fn handle_connection(
     );
 
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate =
+            signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed to wait for Ctrl-C")?;
+            }
+            _ = terminate.recv() => {}
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to wait for Ctrl-C")?;
+        Ok(())
+    }
 }

@@ -11,6 +11,7 @@ pub mod netlog;
 pub mod route;
 pub mod server;
 pub mod socks5;
+pub mod system_proxy;
 pub mod telemetry;
 pub mod tls;
 pub mod traffic;

@@ -12,6 +12,9 @@ client:
   filter: rule
   rule_file: rule.ls
   cidr_file: rule.cidr
+  system_proxy: false
+  system_proxy_services:
+    - Wi-Fi
   user_agent: Mozilla/5.0
   handshake_timeout_secs: 10
   connect_timeout_secs: 10
