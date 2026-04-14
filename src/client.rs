@@ -205,10 +205,15 @@ async fn handle_connection(
     match router.decide(&target).await? {
         RouteDecision::Direct => {
             let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
-            let _ =
+            let stats =
                 route::relay_direct_socks(inbound, &target, connect_timeout, Some("native-http"))
                     .await?;
-            info!(peer = %peer, target = %target_string, route = "direct", "client relay completed");
+            info!(
+                peer = %peer,
+                target = %stats.display_target,
+                route = "direct",
+                "client relay completed"
+            );
             return Ok(());
         }
         RouteDecision::Block => {
@@ -297,7 +302,7 @@ async fn handle_connection(
 
     info!(
         peer = %peer,
-        target = %target_string,
+        target = %stats.display_target,
         uploaded = stats.uploaded,
         downloaded = stats.downloaded,
         sampled = stats.sampled,

@@ -234,9 +234,10 @@ async fn handle_client_connection(
     match router.decide(&target).await? {
         RouteDecision::Direct => {
             let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
-            let _ = route::relay_direct_socks(inbound, &target, connect_timeout, Some("daze-czar"))
-                .await?;
-            info!(peer = %peer, target = %target_string, route = "direct", mode = "daze-czar", "relay completed");
+            let stats =
+                route::relay_direct_socks(inbound, &target, connect_timeout, Some("daze-czar"))
+                    .await?;
+            info!(peer = %peer, target = %stats.display_target, route = "direct", mode = "daze-czar", "relay completed");
             return Ok(());
         }
         RouteDecision::Block => {

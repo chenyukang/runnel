@@ -324,10 +324,10 @@ async fn handle_client_connection(
     match router.decide(&target).await? {
         RouteDecision::Direct => {
             let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
-            let _ =
+            let stats =
                 route::relay_direct_socks(inbound, &target, connect_timeout, Some("native-mux"))
                     .await?;
-            info!(peer = %peer, target = %target_string, route = "direct", "mux relay completed");
+            info!(peer = %peer, target = %stats.display_target, route = "direct", "mux relay completed");
             return Ok(());
         }
         RouteDecision::Block => {

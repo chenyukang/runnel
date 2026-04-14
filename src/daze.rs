@@ -112,9 +112,10 @@ async fn handle_client_connection(
     match router.decide(&target).await? {
         RouteDecision::Direct => {
             let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
-            let _ = route::relay_direct_socks(inbound, &target, connect_timeout, Some("daze-ashe"))
-                .await?;
-            info!(peer = %peer, target = %target_string, route = "direct", mode = "daze-ashe", "relay completed");
+            let stats =
+                route::relay_direct_socks(inbound, &target, connect_timeout, Some("daze-ashe"))
+                    .await?;
+            info!(peer = %peer, target = %stats.display_target, route = "direct", mode = "daze-ashe", "relay completed");
             return Ok(());
         }
         RouteDecision::Block => {
@@ -255,10 +256,10 @@ async fn handle_baboon_client_connection(
     match router.decide(&target).await? {
         RouteDecision::Direct => {
             let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
-            let _ =
+            let stats =
                 route::relay_direct_socks(inbound, &target, connect_timeout, Some("daze-baboon"))
                     .await?;
-            info!(peer = %peer, target = %target_string, route = "direct", mode = "daze-baboon", "relay completed");
+            info!(peer = %peer, target = %stats.display_target, route = "direct", mode = "daze-baboon", "relay completed");
             return Ok(());
         }
         RouteDecision::Block => {

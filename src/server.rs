@@ -222,7 +222,7 @@ async fn handle_connection(
 
                     info!(
                         peer = %peer,
-                        target = %tunnel.target,
+                        target = %stats.display_target,
                         uploaded = stats.uploaded,
                         downloaded = stats.downloaded,
                         sampled = stats.sampled,

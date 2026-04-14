@@ -457,7 +457,7 @@ client:
     - Wi-Fi
 tun:
   device: auto
-  helper_cmd: tun2socks --device {device} --proxy socks5://{socks}
+  helper_cmd: tun2proxy-bin --tun {device} --proxy socks5://{socks}
   print_hooks: true
   dry_run: true
 server:

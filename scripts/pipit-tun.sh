@@ -28,7 +28,7 @@ Usage:
 
 Commands:
   doctor  Print a macOS-oriented diagnosis of the current pipit tun state.
-  reset   Stop stale pipit/tun2socks processes, remove pipit split routes, and
+  reset   Stop stale pipit/tun helper processes, remove pipit split routes, and
           bring down leftover utun interfaces that still hold 198.18.0.1.
 
 Options:
@@ -151,7 +151,7 @@ print_split_routes() {
 
 print_active_processes() {
   ps -axo pid,ppid,user,etime,command | awk '
-    /pipit|tun2socks|AmneziaVPN|wireguard-go/ &&
+    /pipit|tun2proxy|tun2socks|AmneziaVPN|wireguard-go/ &&
     $0 !~ /scripts\/pipit-tun\.sh/ &&
     $0 !~ /awk/ {
       print
@@ -189,12 +189,13 @@ collect_pipit_tun_pids() {
   ' | sort -u
 }
 
-collect_tun2socks_pids_for_ifaces() {
+collect_tun_helper_pids_for_ifaces() {
   local iface
   for iface in "$@"; do
     [[ -n "${iface}" ]] || continue
     ps -axo pid=,command= | awk -v iface="${iface}" '
-      /tun2socks/ && $0 ~ ("-device " iface "($| )") {
+      (/tun2proxy/ && $0 ~ ("--tun " iface "($| )")) ||
+      (/tun2socks/ && $0 ~ ("-device " iface "($| )")) {
         print $1
       }
     '
@@ -260,7 +261,7 @@ doctor() {
   print_section "Quick Read"
   cat <<EOF
 - If default route still points to en0 but 1/8..128.0/1 point to utun233/234/235, pipit tun is actively diverting most traffic through TUN.
-- If those split routes remain after pipit/tun2socks dies, the Mac may look "offline" even though Wi-Fi itself is fine.
+- If those split routes remain after pipit/tun helper dies, the Mac may look "offline" even though Wi-Fi itself is fine.
 - The pinned host route for ${server_host:-the upstream server} should stay on the original interface so the proxy server itself does not loop back into the tunnel.
 EOF
 }
@@ -282,7 +283,7 @@ reset() {
   done < <(list_utun_with_pipit_addr)
 
   local pipit_pids=()
-  local tun2socks_pids=()
+  local tun_helper_pids=()
   local pid
   while IFS= read -r pid; do
     [[ -n "${pid}" ]] || continue
@@ -290,15 +291,15 @@ reset() {
   done < <(collect_pipit_tun_pids)
   while IFS= read -r pid; do
     [[ -n "${pid}" ]] || continue
-    tun2socks_pids+=("${pid}")
-  done < <(collect_tun2socks_pids_for_ifaces "${ifaces[@]}")
+    tun_helper_pids+=("${pid}")
+  done < <(collect_tun_helper_pids_for_ifaces "${ifaces[@]}")
 
   print_section "Reset Plan"
   printf 'server: %s\n' "${server_spec:-<unknown>}"
   printf 'server_host: %s\n' "${server_host:-<unknown>}"
   printf 'utun interfaces with 198.18.0.1: %s\n' "${ifaces[*]:-<none>}"
   printf 'pipit tun pids: %s\n' "${pipit_pids[*]:-<none>}"
-  printf 'tun2socks pids: %s\n' "${tun2socks_pids[*]:-<none>}"
+  printf 'tun helper pids: %s\n' "${tun_helper_pids[*]:-<none>}"
   printf 'reset dry-run: %s\n' "$( [[ "${RESET_DRY_RUN}" -eq 1 ]] && echo yes || echo no )"
 
   if [[ "${ASSUME_YES}" -ne 1 && "${RESET_DRY_RUN}" -ne 1 ]]; then
@@ -308,7 +309,7 @@ reset() {
   fi
 
   term_then_kill "pipit tun" "${pipit_pids[@]}"
-  term_then_kill "tun2socks" "${tun2socks_pids[@]}"
+  term_then_kill "tun helper" "${tun_helper_pids[@]}"
 
   local cidr
   for cidr in "${ROUTE_SET[@]}"; do

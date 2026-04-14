@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
+    io::{self, Write},
     net::IpAddr,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
@@ -94,8 +94,76 @@ struct TunStateGuard {
     state: TunState,
 }
 
+#[derive(Clone, Debug)]
+enum TunHelperConfig {
+    EmbeddedTun2Proxy,
+    ExternalCommand(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TunHelperFlavor {
+    Tun2Proxy,
+    Tun2Socks,
+}
+
+#[derive(Clone, Debug)]
+struct TunHelperBinary {
+    path: PathBuf,
+    flavor: TunHelperFlavor,
+}
+
+enum RunningTunHelper {
+    Embedded {
+        task: JoinHandle<Result<()>>,
+        shutdown_token: tun2proxy::CancellationToken,
+    },
+    External(Child),
+}
+
 pub fn set_embedded_tui(active: bool) {
     EMBEDDED_TUI_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+impl TunHelperConfig {
+    fn describe(&self, context: &CommandContext) -> String {
+        match self {
+            Self::EmbeddedTun2Proxy => format!(
+                "embedded tun2proxy crate --tun {} --proxy socks5://{} --dns direct --verbosity info --exit-on-fatal-error",
+                context.device, context.socks_listen
+            ),
+            Self::ExternalCommand(template) => context.expand(template),
+        }
+    }
+}
+
+impl TunHelperBinary {
+    fn default_command(&self, context: &CommandContext) -> String {
+        match self.flavor {
+            TunHelperFlavor::Tun2Proxy => format!(
+                "{} --tun {{device}} --proxy socks5://{{socks}} --dns direct --verbosity info --exit-on-fatal-error",
+                shell_quote_path(&self.path)
+            ),
+            TunHelperFlavor::Tun2Socks => {
+                let mut command = format!(
+                    "{} -device {{device}} -proxy socks5://{{socks}} -loglevel info -tcp-auto-tuning",
+                    shell_quote_path(&self.path)
+                );
+                if let Some(interface) = &context.egress_interface {
+                    command.push_str(&format!(" -interface {interface}"));
+                }
+                command
+            }
+        }
+    }
+}
+
+impl RunningTunHelper {
+    fn id(&self) -> Option<u32> {
+        match self {
+            Self::Embedded { .. } => None,
+            Self::External(child) => child.id(),
+        }
+    }
 }
 
 impl TunStateGuard {
@@ -188,11 +256,11 @@ pub async fn run(mut args: TunArgs) -> Result<()> {
     normalize_client_args_for_tun(&mut args.client);
     args.validate_required()?;
     let context = CommandContext::from_args(&args).await?;
-    let helper_cmd = effective_helper_cmd(&args, &context)?;
+    let helper = effective_helper(&args, &context)?;
     let up_hooks = effective_up_hooks(&args, &context)?;
     let down_hooks = effective_down_hooks(&args, &context)?;
     if args.print_hooks || args.dry_run {
-        let plan_lines = plan_lines(&args, &context, &helper_cmd, &up_hooks, &down_hooks);
+        let plan_lines = plan_lines(&args, &context, &helper, &up_hooks, &down_hooks);
         if EMBEDDED_TUI_ACTIVE.load(Ordering::Relaxed) {
             log_plan_lines(&plan_lines);
         } else {
@@ -208,8 +276,8 @@ pub async fn run(mut args: TunArgs) -> Result<()> {
     wait_for_listener(&args.client.listen, Duration::from_secs(5)).await?;
     ensure_device_available(&context.device).await?;
 
-    let mut helper = spawn_shell_command("tun helper", &args.shell, &helper_cmd, &context, false)?;
-    tun_state.update_helper_pid(helper.id())?;
+    let mut helper_handle = spawn_tun_helper(&args.shell, &helper, &context)?;
+    tun_state.update_helper_pid(helper_handle.id())?;
     info!(
         device = %context.device,
         socks = %args.client.listen,
@@ -217,11 +285,14 @@ pub async fn run(mut args: TunArgs) -> Result<()> {
         server_ip = %context.server_ip,
         egress_interface = context.egress_interface.as_deref().unwrap_or("-"),
         egress_gateway = context.egress_gateway.as_deref().unwrap_or("-"),
+        helper = %helper.describe(&context),
         "tun helper started"
     );
 
     sleep(Duration::from_millis(args.helper_ready_delay_ms)).await;
-    if let Err(err) = ensure_helper_alive(&mut helper, &context.device, "before up hooks") {
+    if let Err(err) =
+        ensure_helper_alive(&mut helper_handle, &context.device, "before up hooks").await
+    {
         abort_client_task(&mut client_task).await;
         tun_state.clear();
         return Err(err);
@@ -231,19 +302,21 @@ pub async fn run(mut args: TunArgs) -> Result<()> {
             &args.shell,
             &down_hooks,
             &context,
-            &mut helper,
+            &mut helper_handle,
             &mut client_task,
         )
         .await;
         tun_state.clear();
         return Err(err);
     }
-    if let Err(err) = ensure_helper_alive(&mut helper, &context.device, "after up hooks") {
+    if let Err(err) =
+        ensure_helper_alive(&mut helper_handle, &context.device, "after up hooks").await
+    {
         shutdown(
             &args.shell,
             &down_hooks,
             &context,
-            &mut helper,
+            &mut helper_handle,
             &mut client_task,
         )
         .await;
@@ -253,14 +326,7 @@ pub async fn run(mut args: TunArgs) -> Result<()> {
 
     let result = tokio::select! {
         result = &mut client_task => join_client(result),
-        status = helper.wait() => {
-            let status = status.context("failed to wait for tun helper")?;
-            if status.success() {
-                bail!("tun helper exited unexpectedly")
-            } else {
-                bail!("tun helper exited with status {status}")
-            }
-        }
+        helper_result = wait_for_tun_helper(&mut helper_handle) => helper_result,
         signal = wait_for_shutdown_signal() => {
             signal?;
             Ok(())
@@ -276,7 +342,7 @@ pub async fn run(mut args: TunArgs) -> Result<()> {
         &args.shell,
         &down_hooks,
         &context,
-        &mut helper,
+        &mut helper_handle,
         &mut client_task,
     )
     .await;
@@ -384,8 +450,10 @@ impl CommandContext {
 }
 
 fn needs_egress_metadata(args: &TunArgs) -> bool {
-    args.helper_cmd.trim().is_empty()
-        || needs_placeholder(&args.helper_cmd, "{egress_")
+    let helper_override =
+        !args.helper_cmd.trim().is_empty() || std::env::var_os("PIPIT_TUN_HELPER").is_some();
+    (helper_override
+        && (args.helper_cmd.trim().is_empty() || needs_placeholder(&args.helper_cmd, "{egress_")))
         || args
             .up
             .iter()
@@ -401,12 +469,12 @@ fn needs_placeholder(template: &str, prefix: &str) -> bool {
     template.contains(prefix)
 }
 
-fn effective_helper_cmd(args: &TunArgs, context: &CommandContext) -> Result<String> {
+fn effective_helper(args: &TunArgs, context: &CommandContext) -> Result<TunHelperConfig> {
     if !args.helper_cmd.trim().is_empty() {
-        return Ok(args.helper_cmd.clone());
+        return Ok(TunHelperConfig::ExternalCommand(args.helper_cmd.clone()));
     }
 
-    default_helper_cmd(context)
+    default_helper(context)
 }
 
 fn effective_up_hooks(args: &TunArgs, context: &CommandContext) -> Result<Vec<String>> {
@@ -425,18 +493,14 @@ fn effective_down_hooks(args: &TunArgs, context: &CommandContext) -> Result<Vec<
     default_down_hooks(context)
 }
 
-fn default_helper_cmd(context: &CommandContext) -> Result<String> {
-    let helper = detect_tun_helper().context(
-        "no standalone tun helper found; install tun2socks in PATH, set PIPIT_TUN_HELPER, or set tun.helper_cmd",
-    )?;
-    let mut command = format!(
-        "{} -device {{device}} -proxy socks5://{{socks}} -loglevel info -tcp-auto-tuning",
-        shell_quote_path(&helper)
-    );
-    if let Some(interface) = &context.egress_interface {
-        command.push_str(&format!(" -interface {interface}"));
+fn default_helper(context: &CommandContext) -> Result<TunHelperConfig> {
+    if let Some(helper) = detect_helper_override() {
+        return Ok(TunHelperConfig::ExternalCommand(
+            helper.default_command(context),
+        ));
     }
-    Ok(command)
+
+    Ok(TunHelperConfig::EmbeddedTun2Proxy)
 }
 
 fn default_up_hooks(context: &CommandContext) -> Result<Vec<String>> {
@@ -523,26 +587,31 @@ fn ensure_default_macos_server_route(_context: &CommandContext) -> Result<()> {
     Ok(())
 }
 
-fn detect_tun_helper() -> Option<PathBuf> {
+fn detect_helper_override() -> Option<TunHelperBinary> {
     if let Some(path) = std::env::var_os("PIPIT_TUN_HELPER") {
         let candidate = PathBuf::from(path);
         if candidate.is_file() {
-            return Some(candidate);
+            return Some(TunHelperBinary {
+                flavor: detect_tun_helper_flavor(&candidate),
+                path: candidate,
+            });
         }
     }
 
-    find_in_path("tun2socks")
+    None
 }
 
-fn find_in_path(binary: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for entry in std::env::split_paths(&path) {
-        let candidate = entry.join(binary);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+fn detect_tun_helper_flavor(path: &Path) -> TunHelperFlavor {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name.contains("tun2socks") {
+        TunHelperFlavor::Tun2Socks
+    } else {
+        TunHelperFlavor::Tun2Proxy
     }
-    None
 }
 
 fn resolve_tun_state_path(context: &CommandContext) -> Result<PathBuf> {
@@ -585,7 +654,7 @@ async fn cleanup_stale_tun_state(path: &Path, state: &TunState) -> Result<()> {
         "detected stale tun state; attempting cleanup before startup"
     );
     if let Some(helper_pid) = state.helper_pid {
-        terminate_process(helper_pid, "stale tun helper").await;
+        terminate_process_group(helper_pid, "stale tun helper").await;
     }
     run_expanded_hooks("stale down hook", &state.shell, &state.down_hooks).await?;
     Ok(())
@@ -619,22 +688,28 @@ fn process_alive(_pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-async fn terminate_process(pid: u32, label: &str) {
-    if !process_alive(pid) {
+async fn terminate_process_group(pgid: u32, label: &str) {
+    let target = -(pgid as i32);
+    let rc = unsafe { libc::kill(target, 0) };
+    if rc != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
         return;
     }
-    info!(pid, "{label} stopping");
-    let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+
+    info!(pgid, "{label} stopping");
+    let _ = unsafe { libc::kill(target, libc::SIGTERM) };
     sleep(Duration::from_millis(300)).await;
-    if process_alive(pid) {
-        warn!(pid, "{label} did not exit after SIGTERM; sending SIGKILL");
-        let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+
+    let rc = unsafe { libc::kill(target, 0) };
+    if rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
+        warn!(pgid, "{label} did not exit after SIGTERM; sending SIGKILL");
+        let _ = unsafe { libc::kill(target, libc::SIGKILL) };
         sleep(Duration::from_millis(150)).await;
     }
 }
 
 #[cfg(not(unix))]
-async fn terminate_process(_pid: u32, _label: &str) {}
+async fn terminate_process_group(_pgid: u32, _label: &str) {
+}
 
 fn is_auto_device(device: &str) -> bool {
     let requested = device.trim();
@@ -827,11 +902,24 @@ fn spawn_shell_command(
     template: &str,
     context: &CommandContext,
     quiet: bool,
+    isolated_process_group: bool,
 ) -> Result<Child> {
     let expanded = context.expand(template);
     let mut command = Command::new(shell);
     command.arg("-lc").arg(&expanded);
     context.apply_envs(&mut command);
+    command.kill_on_drop(true);
+    #[cfg(unix)]
+    if isolated_process_group {
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     if quiet {
         command.stdout(std::process::Stdio::null());
         command.stderr(std::process::Stdio::null());
@@ -846,6 +934,56 @@ fn spawn_shell_command(
         attach_child_logs(label, &mut child);
     }
     Ok(child)
+}
+
+fn spawn_tun_helper(
+    shell: &str,
+    helper: &TunHelperConfig,
+    context: &CommandContext,
+) -> Result<RunningTunHelper> {
+    match helper {
+        TunHelperConfig::EmbeddedTun2Proxy => {
+            let helper_context = context.clone();
+            let shutdown_token = tun2proxy::CancellationToken::new();
+            let task_shutdown = shutdown_token.clone();
+            let task =
+                tokio::spawn(
+                    async move { run_embedded_tun2proxy(helper_context, task_shutdown).await },
+                );
+            Ok(RunningTunHelper::Embedded {
+                task,
+                shutdown_token,
+            })
+        }
+        TunHelperConfig::ExternalCommand(template) => Ok(RunningTunHelper::External(
+            spawn_shell_command("tun helper", shell, template, context, false, true)?,
+        )),
+    }
+}
+
+async fn run_embedded_tun2proxy(
+    context: CommandContext,
+    shutdown_token: tun2proxy::CancellationToken,
+) -> Result<()> {
+    let proxy_url = format!("socks5://{}", context.socks_listen);
+    let proxy = tun2proxy::ArgProxy::try_from(proxy_url.as_str())
+        .map_err(|err| anyhow::anyhow!("invalid tun2proxy proxy URL {proxy_url}: {err}"))?;
+    let mut args = tun2proxy::Args::default();
+    args.proxy(proxy)
+        .tun(context.device.clone())
+        .dns(tun2proxy::ArgDns::Direct)
+        .verbosity(tun2proxy::ArgVerbosity::Info)
+        .setup(false);
+    args.exit_on_fatal_error = true;
+    tun2proxy::general_run_async(
+        args,
+        tun2proxy::DEFAULT_MTU,
+        cfg!(target_os = "macos"),
+        shutdown_token,
+    )
+    .await
+    .context("embedded tun2proxy failed")?;
+    Ok(())
 }
 
 fn attach_child_logs(label: &str, child: &mut Child) {
@@ -933,18 +1071,14 @@ async fn shutdown(
     shell: &str,
     down_hooks: &[String],
     context: &CommandContext,
-    helper: &mut Child,
+    helper: &mut RunningTunHelper,
     client_task: &mut JoinHandle<Result<()>>,
 ) {
     if let Err(err) = run_hooks("down hook", shell, down_hooks, context).await {
         warn!(error = %err, "tun down hook failed");
     }
 
-    if let Some(pid) = helper.id() {
-        info!(pid, "stopping tun helper");
-    }
-    let _ = helper.start_kill();
-    let _ = timeout(Duration::from_secs(2), helper.wait()).await;
+    shutdown_tun_helper(helper).await;
     client_task.abort();
     let _ = client_task.await;
 }
@@ -954,16 +1088,88 @@ async fn abort_client_task(client_task: &mut JoinHandle<Result<()>>) {
     let _ = client_task.await;
 }
 
-fn ensure_helper_alive(helper: &mut Child, device: &str, stage: &str) -> Result<()> {
-    if let Some(status) = helper
-        .try_wait()
-        .with_context(|| format!("failed to inspect tun helper status {stage}"))?
-    {
-        bail!(
-            "tun helper exited {stage} with status {status}; if the helper logged `create tun: resource busy`, `{device}` was already in use"
-        );
+async fn shutdown_tun_helper(helper: &mut RunningTunHelper) {
+    match helper {
+        RunningTunHelper::Embedded {
+            task,
+            shutdown_token,
+        } => {
+            info!("stopping embedded tun2proxy");
+            shutdown_token.cancel();
+            if timeout(Duration::from_secs(2), &mut *task).await.is_err() {
+                warn!("embedded tun2proxy did not exit in time; aborting task");
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        RunningTunHelper::External(child) => {
+            if let Some(pid) = child.id() {
+                terminate_process_group(pid, "tun helper").await;
+            }
+            let _ = timeout(Duration::from_secs(2), child.wait()).await;
+        }
     }
-    Ok(())
+}
+
+async fn ensure_helper_alive(
+    helper: &mut RunningTunHelper,
+    device: &str,
+    stage: &str,
+) -> Result<()> {
+    match helper {
+        RunningTunHelper::Embedded { task, .. } => {
+            if task.is_finished() {
+                return match task.await {
+                    Ok(Ok(())) => Err(anyhow::anyhow!(
+                        "embedded tun2proxy exited {stage} unexpectedly"
+                    )),
+                    Ok(Err(err)) => {
+                        Err(err).with_context(|| format!("embedded tun2proxy exited {stage}"))
+                    }
+                    Err(err) if err.is_cancelled() => {
+                        Err(anyhow::anyhow!("embedded tun2proxy was cancelled {stage}"))
+                    }
+                    Err(err) => {
+                        Err(err).with_context(|| format!("embedded tun2proxy task failed {stage}"))
+                    }
+                };
+            }
+            Ok(())
+        }
+        RunningTunHelper::External(child) => {
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("failed to inspect tun helper status {stage}"))?
+            {
+                bail!(
+                    "tun helper exited {stage} with status {status}; if the helper logged `create tun: resource busy`, `{device}` was already in use"
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn wait_for_tun_helper(helper: &mut RunningTunHelper) -> Result<()> {
+    match helper {
+        RunningTunHelper::Embedded { task, .. } => match task.await {
+            Ok(Ok(())) => bail!("embedded tun2proxy exited unexpectedly"),
+            Ok(Err(err)) => Err(err).context("embedded tun2proxy exited"),
+            Err(err) if err.is_cancelled() => Ok(()),
+            Err(err) => Err(err).context("embedded tun2proxy task failed"),
+        },
+        RunningTunHelper::External(child) => {
+            let status = child
+                .wait()
+                .await
+                .context("failed to wait for tun helper")?;
+            if status.success() {
+                bail!("tun helper exited unexpectedly")
+            } else {
+                bail!("tun helper exited with status {status}")
+            }
+        }
+    }
 }
 
 async fn wait_for_listener(listen: &str, timeout_window: Duration) -> Result<()> {
@@ -1035,7 +1241,7 @@ fn shell_envs(context: &CommandContext) -> BTreeMap<&'static str, String> {
 fn plan_lines(
     args: &TunArgs,
     context: &CommandContext,
-    helper_cmd: &str,
+    helper: &TunHelperConfig,
     up_hooks: &[String],
     down_hooks: &[String],
 ) -> Vec<String> {
@@ -1057,7 +1263,7 @@ fn plan_lines(
         "  egress_gateway: {}",
         context.egress_gateway.as_deref().unwrap_or("-")
     ));
-    lines.push(format!("  helper: {}", context.expand(helper_cmd)));
+    lines.push(format!("  helper: {}", helper.describe(context)));
     lines.push("  up hooks:".to_owned());
     if up_hooks.is_empty() {
         lines.push("    - (none)".to_owned());
@@ -1093,8 +1299,9 @@ fn log_plan_lines(lines: &[String]) {
 mod tests {
     use super::{
         AUTO_TUN_DEVICE, CommandContext, MACOS_TUN_GATEWAY_V4, TEST_SERVER_ENDPOINT,
-        TEST_SERVER_HOST, TEST_SERVER_IP, TunArgs, default_down_hooks, default_server_bypass_route,
-        default_up_hooks, is_auto_device, parse_macos_route_get, plan_lines, print_plan,
+        TEST_SERVER_HOST, TEST_SERVER_IP, TunArgs, TunHelperBinary, TunHelperConfig,
+        TunHelperFlavor, default_down_hooks, default_server_bypass_route, default_up_hooks,
+        detect_tun_helper_flavor, is_auto_device, parse_macos_route_get, plan_lines, print_plan,
         shell_envs,
     };
     use crate::{client::ClientArgs, mode::ProxyMode, route::FilterMode};
@@ -1114,11 +1321,92 @@ mod tests {
             log_file: Some("proxy.log".to_owned()),
         };
         let expanded = context.expand(
-            "tun2socks --device {device} --proxy socks5://{socks} --server {server} --iface {egress_interface} --host {server_host} --ip {server_ip}",
+            "tun2proxy-bin --tun {device} --proxy socks5://{socks} --server {server} --iface {egress_interface} --host {server_host} --ip {server_ip}",
         );
         assert_eq!(
             expanded,
-            "tun2socks --device utun233 --proxy socks5://127.0.0.1:1080 --server 198.51.100.10:1443 --iface en0 --host 198.51.100.10 --ip 198.51.100.10"
+            "tun2proxy-bin --tun utun233 --proxy socks5://127.0.0.1:1080 --server 198.51.100.10:1443 --iface en0 --host 198.51.100.10 --ip 198.51.100.10"
+        );
+    }
+
+    #[test]
+    fn helper_flavor_detection_prefers_tun2proxy_for_unknown_names() {
+        assert_eq!(
+            detect_tun_helper_flavor(std::path::Path::new("/usr/local/bin/tun2proxy-bin")),
+            TunHelperFlavor::Tun2Proxy
+        );
+        assert_eq!(
+            detect_tun_helper_flavor(std::path::Path::new("/usr/local/bin/custom-helper")),
+            TunHelperFlavor::Tun2Proxy
+        );
+        assert_eq!(
+            detect_tun_helper_flavor(std::path::Path::new("/usr/local/bin/tun2socks")),
+            TunHelperFlavor::Tun2Socks
+        );
+    }
+
+    #[test]
+    fn tun2proxy_default_helper_command_uses_new_cli_flags() {
+        let context = CommandContext {
+            device: "utun233".to_owned(),
+            socks_listen: "127.0.0.1:1080".to_owned(),
+            server: TEST_SERVER_ENDPOINT.to_owned(),
+            server_host: TEST_SERVER_HOST.to_owned(),
+            server_port: 1443,
+            server_ip: TEST_SERVER_IP.to_owned(),
+            egress_interface: Some("en0".to_owned()),
+            egress_gateway: Some("192.168.3.1".to_owned()),
+            log_file: Some("proxy.log".to_owned()),
+        };
+        let helper = TunHelperBinary {
+            path: PathBuf::from("/usr/local/bin/tun2proxy-bin"),
+            flavor: TunHelperFlavor::Tun2Proxy,
+        };
+        assert_eq!(
+            helper.default_command(&context),
+            "'/usr/local/bin/tun2proxy-bin' --tun {device} --proxy socks5://{socks} --dns direct --verbosity info --exit-on-fatal-error"
+        );
+    }
+
+    #[test]
+    fn tun2socks_default_helper_command_keeps_legacy_interface_flag() {
+        let context = CommandContext {
+            device: "utun233".to_owned(),
+            socks_listen: "127.0.0.1:1080".to_owned(),
+            server: TEST_SERVER_ENDPOINT.to_owned(),
+            server_host: TEST_SERVER_HOST.to_owned(),
+            server_port: 1443,
+            server_ip: TEST_SERVER_IP.to_owned(),
+            egress_interface: Some("en0".to_owned()),
+            egress_gateway: Some("192.168.3.1".to_owned()),
+            log_file: Some("proxy.log".to_owned()),
+        };
+        let helper = TunHelperBinary {
+            path: PathBuf::from("/usr/local/bin/tun2socks"),
+            flavor: TunHelperFlavor::Tun2Socks,
+        };
+        assert_eq!(
+            helper.default_command(&context),
+            "'/usr/local/bin/tun2socks' -device {device} -proxy socks5://{socks} -loglevel info -tcp-auto-tuning -interface en0"
+        );
+    }
+
+    #[test]
+    fn embedded_tun2proxy_helper_description_is_human_readable() {
+        let context = CommandContext {
+            device: "utun233".to_owned(),
+            socks_listen: "127.0.0.1:1080".to_owned(),
+            server: TEST_SERVER_ENDPOINT.to_owned(),
+            server_host: TEST_SERVER_HOST.to_owned(),
+            server_port: 1443,
+            server_ip: TEST_SERVER_IP.to_owned(),
+            egress_interface: Some("en0".to_owned()),
+            egress_gateway: Some("192.168.3.1".to_owned()),
+            log_file: Some("proxy.log".to_owned()),
+        };
+        assert_eq!(
+            TunHelperConfig::EmbeddedTun2Proxy.describe(&context),
+            "embedded tun2proxy crate --tun utun233 --proxy socks5://127.0.0.1:1080 --dns direct --verbosity info --exit-on-fatal-error"
         );
     }
 
@@ -1255,7 +1543,7 @@ mod tests {
         let lines = plan_lines(
             &args,
             &context,
-            "tun2socks -device {device} -proxy socks5://{socks}",
+            &TunHelperConfig::EmbeddedTun2Proxy,
             &["ifconfig {device} inet 198.18.0.1 198.18.0.1 up".to_owned()],
             &["ifconfig {device} down >/dev/null 2>&1 || true".to_owned()],
         );

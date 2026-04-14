@@ -246,13 +246,14 @@ sudo ./scripts/pipit-tun.sh reset --dry-run
 
 Important notes:
 
-- `pipit` only uses standalone helpers now; if `tun.helper_cmd` is omitted, it looks for `PIPIT_TUN_HELPER`, then `tun2socks` from `PATH`
-- on macOS, the simplest path is usually to install a standalone `tun2socks` binary and let `pipit` discover it from `PATH`
+- `pipit tun` now embeds `tun2proxy` by default, so the normal path no longer needs a separate helper binary in `PATH`
+- if you still want an external helper process, set `tun.helper_cmd` explicitly or point `PIPIT_TUN_HELPER` at a standalone helper binary
 - if `tun.device` or `--device` is omitted, `pipit` now auto-picks the first free TUN device; on macOS it scans upward from `utun233` to avoid colliding with lower-numbered VPN interfaces such as `utun5`
 - `pipit tun` keeps a small state file next to the log file so it can reject a second live tun instance and attempt stale cleanup on the next startup if the previous run crashed
-- on macOS, if `tun.up` / `tun.down` are omitted and the upstream server resolves to IPv4, `pipit` configures the TUN device as `198.18.0.1`, pins the upstream server IP to the original egress path, and installs the same split route family commonly used by tun2socks (`1.0.0.0/8`, `2.0.0.0/7`, ..., `128.0.0.0/1`, plus `198.18.0.0/15`)
+- on macOS, if `tun.up` / `tun.down` are omitted and the upstream server resolves to IPv4, `pipit` configures the TUN device as `198.18.0.1`, pins the upstream server IP to the original egress path, and installs the same split route family commonly used by tun2proxy/tun2socks (`1.0.0.0/8`, `2.0.0.0/7`, ..., `128.0.0.0/1`, plus `198.18.0.0/15`)
 - `tun` currently forces the embedded client to use `filter: proxy`; `direct` or `rule` decisions can recurse traffic back into the TUN split routes unless you build explicit bypass routes yourself
 - the default route hooks need elevated privileges, so `sudo` is usually required
+- the built-in default still keeps route setup inside `pipit`; if you want tun2proxy-managed features such as `--setup`, `--bypass`, or a different DNS strategy, override `tun.helper_cmd`
 - you can still override `tun.helper_cmd`, `tun.up`, and `tun.down` if you want a different helper or route policy
 - placeholders available in commands and hooks are:
   - `{device}`
