@@ -3,4 +3,4 @@
 *.key
 *.log
 *.yaml
-
+*.state.json

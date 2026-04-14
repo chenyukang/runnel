@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     client::{self, ClientArgs},
+    route::FilterMode,
     tls,
 };
 
@@ -183,7 +184,8 @@ impl Drop for TunStateGuard {
     }
 }
 
-pub async fn run(args: TunArgs) -> Result<()> {
+pub async fn run(mut args: TunArgs) -> Result<()> {
+    normalize_client_args_for_tun(&mut args.client);
     args.validate_required()?;
     let context = CommandContext::from_args(&args).await?;
     let helper_cmd = effective_helper_cmd(&args, &context)?;
@@ -265,6 +267,11 @@ pub async fn run(args: TunArgs) -> Result<()> {
         }
     };
 
+    match &result {
+        Ok(()) => info!("tun session ending"),
+        Err(err) => warn!(error = %err, "tun session ending with error"),
+    }
+
     shutdown(
         &args.shell,
         &down_hooks,
@@ -275,6 +282,18 @@ pub async fn run(args: TunArgs) -> Result<()> {
     .await;
     tun_state.clear();
     result
+}
+
+fn normalize_client_args_for_tun(args: &mut ClientArgs) {
+    if !matches!(args.filter, FilterMode::Proxy) {
+        warn!(
+            requested_filter = ?args.filter,
+            "tun mode currently forces client filter=proxy; direct/rule routing can loop traffic back into the TUN device"
+        );
+        args.filter = FilterMode::Proxy;
+        args.rule_file = None;
+        args.cidr_file = None;
+    }
 }
 
 impl TunArgs {
@@ -1158,6 +1177,36 @@ mod tests {
         };
         let path = super::resolve_tun_state_path(&context).expect("state path resolves");
         assert_eq!(path, PathBuf::from("/tmp/proxy.tun.state.json"));
+    }
+
+    #[test]
+    fn tun_mode_forces_proxy_filter_to_avoid_loops() {
+        let mut args = ClientArgs {
+            listen: "127.0.0.1:1080".to_owned(),
+            server: TEST_SERVER_ENDPOINT.to_owned(),
+            server_name: Some("example.com".to_owned()),
+            ca_cert: None,
+            mode: ProxyMode::NativeHttp,
+            password: "secret".to_owned(),
+            path: "/connect".to_owned(),
+            mux_path: "/mux".to_owned(),
+            mux: false,
+            filter: FilterMode::Rule,
+            rule_file: Some(PathBuf::from("rule.ls")),
+            cidr_file: Some(PathBuf::from("rule.cidr")),
+            user_agent: "Mozilla/5.0".to_owned(),
+            handshake_timeout_secs: 10,
+            connect_timeout_secs: 10,
+            max_header_size: 8 * 1024,
+            system_proxy: false,
+            system_proxy_services: Vec::new(),
+        };
+
+        super::normalize_client_args_for_tun(&mut args);
+
+        assert_eq!(args.filter, FilterMode::Proxy);
+        assert!(args.rule_file.is_none());
+        assert!(args.cidr_file.is_none());
     }
 
     #[test]

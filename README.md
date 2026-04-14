@@ -236,6 +236,14 @@ cargo run -- --config ./pipit.tun.yaml tun --print-hooks
 
 The repository includes a starter template at [`pipit.tun.yaml`](./pipit.tun.yaml).
 
+There is also a small troubleshooting helper at [`scripts/pipit-tun.sh`](./scripts/pipit-tun.sh):
+
+```bash
+./scripts/pipit-tun.sh doctor
+sudo ./scripts/pipit-tun.sh reset
+sudo ./scripts/pipit-tun.sh reset --dry-run
+```
+
 Important notes:
 
 - `pipit` only uses standalone helpers now; if `tun.helper_cmd` is omitted, it looks for `PIPIT_TUN_HELPER`, then `tun2socks` from `PATH`
@@ -243,6 +251,7 @@ Important notes:
 - if `tun.device` or `--device` is omitted, `pipit` now auto-picks the first free TUN device; on macOS it scans upward from `utun233` to avoid colliding with lower-numbered VPN interfaces such as `utun5`
 - `pipit tun` keeps a small state file next to the log file so it can reject a second live tun instance and attempt stale cleanup on the next startup if the previous run crashed
 - on macOS, if `tun.up` / `tun.down` are omitted and the upstream server resolves to IPv4, `pipit` configures the TUN device as `198.18.0.1`, pins the upstream server IP to the original egress path, and installs the same split route family commonly used by tun2socks (`1.0.0.0/8`, `2.0.0.0/7`, ..., `128.0.0.0/1`, plus `198.18.0.0/15`)
+- `tun` currently forces the embedded client to use `filter: proxy`; `direct` or `rule` decisions can recurse traffic back into the TUN split routes unless you build explicit bypass routes yourself
 - the default route hooks need elevated privileges, so `sudo` is usually required
 - you can still override `tun.helper_cmd`, `tun.up`, and `tun.down` if you want a different helper or route policy
 - placeholders available in commands and hooks are:
