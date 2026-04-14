@@ -4,3 +4,4 @@
 *.log
 *.yaml
 *.state.json
+.cargo

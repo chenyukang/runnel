@@ -47,16 +47,20 @@ where
     let uploaded = Arc::new(AtomicU64::new(0));
     let downloaded = Arc::new(AtomicU64::new(0));
     let sampled = Arc::new(AtomicBool::new(false));
-    let (stop_tx, stop_rx) = watch::channel(false);
-
-    let sampler = tokio::spawn(sample_traffic(
-        labels,
-        display_target.clone(),
-        uploaded.clone(),
-        downloaded.clone(),
-        sampled.clone(),
-        stop_rx,
-    ));
+    let sampler = if telemetry::has_live_subscribers() {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(sample_traffic(
+            labels,
+            display_target.clone(),
+            uploaded.clone(),
+            downloaded.clone(),
+            sampled.clone(),
+            stop_rx,
+        ));
+        Some((stop_tx, task))
+    } else {
+        None
+    };
 
     let transfer = tokio::try_join!(
         copy_one_direction(
@@ -73,8 +77,10 @@ where
         ),
     );
 
-    let _ = stop_tx.send(true);
-    let _ = sampler.await;
+    if let Some((stop_tx, task)) = sampler {
+        let _ = stop_tx.send(true);
+        let _ = task.await;
+    }
 
     transfer?;
 
@@ -175,7 +181,7 @@ fn emit_delta(
     *last_uploaded = current_uploaded;
     *last_downloaded = current_downloaded;
 
-    if delta_uploaded == 0 && delta_downloaded == 0 {
+    if (delta_uploaded == 0 && delta_downloaded == 0) || !telemetry::has_live_subscribers() {
         return;
     }
 

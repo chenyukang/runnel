@@ -432,22 +432,37 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
 
     let endpoint_line = if app.context.command_label == "server" {
         Line::from(vec![
-            Span::styled("listen ", Style::default().fg(Color::DarkGray)),
-            Span::raw(app.context.listen.as_deref().unwrap_or("-")),
+            Span::styled("listen ", overview_label_style()),
+            Span::styled(
+                app.context.listen.as_deref().unwrap_or("-"),
+                overview_value_style(),
+            ),
             Span::raw("    "),
-            Span::styled("path ", Style::default().fg(Color::DarkGray)),
-            Span::raw(app.context.path.as_deref().unwrap_or("-")),
+            Span::styled("path ", overview_label_style()),
+            Span::styled(
+                app.context.path.as_deref().unwrap_or("-"),
+                overview_value_style(),
+            ),
         ])
     } else {
         Line::from(vec![
-            Span::styled("listen ", Style::default().fg(Color::DarkGray)),
-            Span::raw(app.context.listen.as_deref().unwrap_or("-")),
+            Span::styled("listen ", overview_label_style()),
+            Span::styled(
+                app.context.listen.as_deref().unwrap_or("-"),
+                overview_value_style(),
+            ),
             Span::raw("    "),
-            Span::styled("upstream ", Style::default().fg(Color::DarkGray)),
-            Span::raw(app.context.upstream.as_deref().unwrap_or("-")),
+            Span::styled("upstream ", overview_label_style()),
+            Span::styled(
+                app.context.upstream.as_deref().unwrap_or("-"),
+                overview_value_style(),
+            ),
             Span::raw("    "),
-            Span::styled("path ", Style::default().fg(Color::DarkGray)),
-            Span::raw(app.context.path.as_deref().unwrap_or("-")),
+            Span::styled("path ", overview_label_style()),
+            Span::styled(
+                app.context.path.as_deref().unwrap_or("-"),
+                overview_value_style(),
+            ),
         ])
     };
 
@@ -468,16 +483,16 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("mode ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&app.context.mode_label, Style::default().fg(Color::White)),
+            Span::styled("mode ", overview_label_style()),
+            Span::styled(&app.context.mode_label, overview_value_style()),
             Span::raw("    "),
-            Span::styled("uptime ", Style::default().fg(Color::DarkGray)),
+            Span::styled("uptime ", overview_label_style()),
             Span::styled(
                 format_uptime(app.started_at.elapsed()),
-                Style::default().fg(Color::White),
+                overview_value_style(),
             ),
             Span::raw("    "),
-            Span::styled("status ", Style::default().fg(Color::DarkGray)),
+            Span::styled("status ", overview_label_style()),
             Span::styled(
                 status_label,
                 Style::default()
@@ -486,21 +501,25 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("pid ", Style::default().fg(Color::DarkGray)),
-            Span::raw(app.pid.to_string()),
+            Span::styled("pid ", overview_label_style()),
+            Span::styled(app.pid.to_string(), overview_value_style()),
             Span::raw("    "),
-            Span::styled("memory ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format_bytes(app.process_stats.memory_bytes)),
+            Span::styled("memory ", overview_label_style()),
+            Span::styled(
+                format_bytes(app.process_stats.memory_bytes),
+                overview_value_style(),
+            ),
             Span::raw("    "),
-            Span::styled("threads ", Style::default().fg(Color::DarkGray)),
-            Span::raw(
+            Span::styled("threads ", overview_label_style()),
+            Span::styled(
                 app.process_stats
                     .threads
                     .map(|threads| threads.to_string())
                     .unwrap_or_else(|| "-".to_owned()),
+                overview_value_style(),
             ),
             Span::raw("    "),
-            Span::styled("log ", Style::default().fg(Color::DarkGray)),
+            Span::styled("log ", overview_label_style()),
             Span::styled(
                 app.context.log_file.display().to_string(),
                 Style::default().fg(Color::Green),
@@ -630,10 +649,10 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" quit  "),
-        Span::styled("logs", Style::default().fg(Color::DarkGray)),
+        Span::styled("logs", overview_label_style()),
         Span::raw(format!(" -> {}", app.context.log_file.display())),
         Span::raw("  "),
-        Span::styled("filter", Style::default().fg(Color::DarkGray)),
+        Span::styled("filter", overview_label_style()),
         Span::raw(format!(" -> {}", app.context.log_filter)),
     ]))
     .block(Block::default().borders(Borders::ALL).title("Controls"));
@@ -646,10 +665,7 @@ fn stat_block(title: &'static str, value: String, color: Color) -> Paragraph<'st
             value,
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )),
-        Line::from(Span::styled(
-            title.to_owned(),
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled(title.to_owned(), overview_label_style())),
     ])
     .block(
         Block::default()
@@ -657,6 +673,16 @@ fn stat_block(title: &'static str, value: String, color: Color) -> Paragraph<'st
             .title(title)
             .border_style(Style::default().fg(color)),
     )
+}
+
+fn overview_label_style() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
+}
+
+fn overview_value_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn render_wave(
@@ -671,7 +697,7 @@ fn render_wave(
         .title(wave_title(title, history))
         .border_style(Style::default().fg(color));
     let width = usize::from(block.inner(area).width);
-    let data = align_wave_data(history, width);
+    let data = fit_wave_data_to_width(history, width);
 
     frame.render_widget(
         Sparkline::default()
@@ -712,18 +738,31 @@ fn map_mpsc_try_recv(error: mpsc::error::TryRecvError) -> broadcast::error::TryR
     }
 }
 
-fn align_wave_data(history: &[u64], width: usize) -> Vec<u64> {
+fn fit_wave_data_to_width(history: &[u64], width: usize) -> Vec<u64> {
     if width == 0 {
         return Vec::new();
     }
 
-    if history.len() >= width {
-        return history[history.len() - width..].to_vec();
+    if history.is_empty() {
+        return vec![0; width];
     }
 
-    let mut aligned = vec![0; width - history.len()];
-    aligned.extend_from_slice(history);
-    aligned
+    if width >= history.len() {
+        return (0..width)
+            .map(|column| {
+                let index = column * history.len() / width;
+                history[index.min(history.len() - 1)]
+            })
+            .collect();
+    }
+
+    (0..width)
+        .map(|column| {
+            let start = column * history.len() / width;
+            let end = ((column + 1) * history.len() / width).max(start + 1);
+            history[start..end].iter().copied().max().unwrap_or(0)
+        })
+        .collect()
 }
 
 fn parse_u64(value: Option<&String>) -> u64 {
@@ -871,16 +910,24 @@ fn split_target(target: &str) -> (String, Option<u16>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{align_wave_data, link_from_target, split_target};
+    use super::{fit_wave_data_to_width, link_from_target, split_target};
 
     #[test]
-    fn wave_data_is_right_aligned_when_panel_is_wider() {
-        assert_eq!(align_wave_data(&[1, 2, 3], 6), vec![0, 0, 0, 1, 2, 3]);
+    fn wave_data_uses_full_width_when_panel_is_wider() {
+        assert_eq!(
+            fit_wave_data_to_width(&[1, 2, 3], 6),
+            vec![1, 1, 2, 2, 3, 3]
+        );
     }
 
     #[test]
-    fn wave_data_keeps_latest_values_when_panel_is_narrower() {
-        assert_eq!(align_wave_data(&[1, 2, 3, 4], 2), vec![3, 4]);
+    fn wave_data_compresses_history_when_panel_is_narrower() {
+        assert_eq!(fit_wave_data_to_width(&[1, 2, 3, 4], 2), vec![2, 4]);
+    }
+
+    #[test]
+    fn wave_data_handles_empty_history() {
+        assert_eq!(fit_wave_data_to_width(&[], 4), vec![0, 0, 0, 0]);
     }
 
     #[test]

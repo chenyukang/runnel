@@ -268,6 +268,12 @@ pub fn subscribe() -> Option<broadcast::Receiver<TraceEvent>> {
     TELEMETRY.get().map(|hub| hub.sender.subscribe())
 }
 
+pub fn has_live_subscribers() -> bool {
+    TELEMETRY
+        .get()
+        .is_some_and(|hub| hub.sender.receiver_count() > 0)
+}
+
 pub fn emit(
     level: impl Into<String>,
     message: impl Into<String>,

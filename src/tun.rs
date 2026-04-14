@@ -128,7 +128,7 @@ impl TunHelperConfig {
     fn describe(&self, context: &CommandContext) -> String {
         match self {
             Self::EmbeddedTun2Proxy => format!(
-                "embedded tun2proxy crate --tun {} --proxy socks5://{} --dns direct --verbosity info --exit-on-fatal-error",
+                "embedded tun2proxy crate --tun {} --proxy socks5://{} --dns direct --verbosity warn --exit-on-fatal-error",
                 context.device, context.socks_listen
             ),
             Self::ExternalCommand(template) => context.expand(template),
@@ -140,7 +140,7 @@ impl TunHelperBinary {
     fn default_command(&self, context: &CommandContext) -> String {
         match self.flavor {
             TunHelperFlavor::Tun2Proxy => format!(
-                "{} --tun {{device}} --proxy socks5://{{socks}} --dns direct --verbosity info --exit-on-fatal-error",
+                "{} --tun {{device}} --proxy socks5://{{socks}} --dns direct --verbosity warn --exit-on-fatal-error",
                 shell_quote_path(&self.path)
             ),
             TunHelperFlavor::Tun2Socks => {
@@ -708,8 +708,7 @@ async fn terminate_process_group(pgid: u32, label: &str) {
 }
 
 #[cfg(not(unix))]
-async fn terminate_process_group(_pgid: u32, _label: &str) {
-}
+async fn terminate_process_group(_pgid: u32, _label: &str) {}
 
 fn is_auto_device(device: &str) -> bool {
     let requested = device.trim();
@@ -972,7 +971,7 @@ async fn run_embedded_tun2proxy(
     args.proxy(proxy)
         .tun(context.device.clone())
         .dns(tun2proxy::ArgDns::Direct)
-        .verbosity(tun2proxy::ArgVerbosity::Info)
+        .verbosity(tun2proxy::ArgVerbosity::Warn)
         .setup(false);
     args.exit_on_fatal_error = true;
     tun2proxy::general_run_async(
@@ -1364,7 +1363,7 @@ mod tests {
         };
         assert_eq!(
             helper.default_command(&context),
-            "'/usr/local/bin/tun2proxy-bin' --tun {device} --proxy socks5://{socks} --dns direct --verbosity info --exit-on-fatal-error"
+            "'/usr/local/bin/tun2proxy-bin' --tun {device} --proxy socks5://{socks} --dns direct --verbosity warn --exit-on-fatal-error"
         );
     }
 
@@ -1406,7 +1405,7 @@ mod tests {
         };
         assert_eq!(
             TunHelperConfig::EmbeddedTun2Proxy.describe(&context),
-            "embedded tun2proxy crate --tun utun233 --proxy socks5://127.0.0.1:1080 --dns direct --verbosity info --exit-on-fatal-error"
+            "embedded tun2proxy crate --tun utun233 --proxy socks5://127.0.0.1:1080 --dns direct --verbosity warn --exit-on-fatal-error"
         );
     }
 

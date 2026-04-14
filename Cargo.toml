@@ -32,3 +32,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 ratatui = "0.29"
 crossterm = "0.28"
 sysinfo = "0.33"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

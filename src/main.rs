@@ -266,6 +266,7 @@ fn init_tracing(
 
     let filter_directives =
         std::env::var(EnvFilter::DEFAULT_ENV).unwrap_or_else(|_| default_filter.to_owned());
+    let filter_for_telemetry = EnvFilter::new(filter_directives.clone());
     let filter_for_file = EnvFilter::new(filter_directives.clone());
     let filter_for_stderr = EnvFilter::new(filter_directives);
 
@@ -295,7 +296,7 @@ fn init_tracing(
     });
 
     tracing_subscriber::registry()
-        .with(telemetry::layer())
+        .with(telemetry::layer().with_filter(filter_for_telemetry))
         .with(file_layer)
         .with(stderr_layer)
         .try_init()
