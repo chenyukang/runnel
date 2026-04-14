@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
-use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use pipit::{cert, client, config, server, telemetry, tui, tun};
 use std::{
+    fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Duration,
 };
+use tokio::time::sleep;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 const DAEMON_ENV: &str = "PIPIT_DAEMONIZED";
@@ -23,6 +26,8 @@ struct Cli {
     #[arg(long, global = true)]
     telemetry_sock: Option<PathBuf>,
     #[arg(long, global = true)]
+    pid_file: Option<PathBuf>,
+    #[arg(long, global = true)]
     tui: bool,
     #[arg(long, global = true)]
     daemon: bool,
@@ -39,12 +44,38 @@ enum Commands {
     Tun(tun::TunArgs),
     Cert(cert::CertArgs),
     Tui(TuiArgs),
+    Stop(StopArgs),
 }
 
 #[derive(Debug, Clone, Args)]
 struct TuiArgs {
     #[arg(long)]
     attach: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ServiceRole {
+    Client,
+    Server,
+    Tun,
+}
+
+impl ServiceRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Server => "server",
+            Self::Tun => "tun",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+struct StopArgs {
+    #[arg(value_enum)]
+    role: Option<ServiceRole>,
+    #[arg(long, default_value_t = 10)]
+    wait_secs: u64,
 }
 
 #[tokio::main]
@@ -58,6 +89,7 @@ async fn main() -> Result<()> {
             &mut cli.log,
             &mut cli.log_file,
             &mut cli.telemetry_sock,
+            &mut cli.pid_file,
             &mut cli.tui,
             &mut cli.daemon,
             &file_config,
@@ -83,6 +115,7 @@ async fn main() -> Result<()> {
                         args.attach = cli.telemetry_sock.clone();
                     }
                 }
+                (Commands::Stop(_), "stop") => {}
                 _ => {}
             }
         }
@@ -90,7 +123,11 @@ async fn main() -> Result<()> {
     normalize_cli_modes(&mut cli);
     validate_daemon_mode(&cli)?;
     if should_spawn_daemon(&cli) {
-        spawn_daemon_process()?;
+        spawn_daemon_process(&cli)?;
+        return Ok(());
+    }
+    if let Commands::Stop(args) = &cli.command {
+        stop_daemon_process(&cli.log_file, cli.pid_file.clone(), args.clone()).await?;
         return Ok(());
     }
     if let Commands::Tui(args) = cli.command {
@@ -99,6 +136,8 @@ async fn main() -> Result<()> {
     }
     telemetry::init_channel(2048);
     let observability = init_tracing(&cli.log, &cli.log_file, !cli.tui && !cli.daemon)?;
+    tun::set_embedded_tui(cli.tui);
+    let _pid_file = maybe_create_pid_file(&cli, &observability.log_file)?;
     if let Some(context) = monitor_context(&cli, observability.log_file.clone()) {
         telemetry::set_context(context);
         if cli.daemon || cli.telemetry_sock.is_some() {
@@ -115,6 +154,7 @@ async fn main() -> Result<()> {
             Commands::Tun(args) => tun::run(args).await,
             Commands::Cert(args) => cert::run(args),
             Commands::Tui(_) => Ok(()),
+            Commands::Stop(_) => Ok(()),
         }
     };
 
@@ -134,7 +174,7 @@ async fn main() -> Result<()> {
 }
 
 fn normalize_cli_modes(cli: &mut Cli) {
-    if matches!(cli.command, Commands::Tui(_)) {
+    if matches!(cli.command, Commands::Tui(_) | Commands::Stop(_)) {
         cli.tui = false;
         cli.daemon = false;
         return;
@@ -153,7 +193,7 @@ fn validate_daemon_mode(cli: &Cli) -> Result<()> {
 
     match cli.command {
         Commands::Client(_) | Commands::Server(_) | Commands::Tun(_) => Ok(()),
-        Commands::Cert(_) | Commands::Tui(_) => {
+        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) => {
             anyhow::bail!("--daemon is only supported for client, server, and tun")
         }
     }
@@ -163,7 +203,7 @@ fn should_spawn_daemon(cli: &Cli) -> bool {
     cli.daemon && std::env::var_os(DAEMON_ENV).is_none()
 }
 
-fn spawn_daemon_process() -> Result<()> {
+fn spawn_daemon_process(cli: &Cli) -> Result<()> {
     let executable = std::env::current_exe().context("failed to locate current executable")?;
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     let mut command = Command::new(executable);
@@ -191,7 +231,20 @@ fn spawn_daemon_process() -> Result<()> {
     let child = command
         .spawn()
         .context("failed to start daemon process in background")?;
-    println!("pipit daemon started pid={}", child.id());
+    if let Some(role) = command_role(&cli.command) {
+        let pid_file = resolve_pid_file_for_role(&cli.log_file, cli.pid_file.clone(), role).ok();
+        if let Some(pid_file) = pid_file {
+            println!(
+                "pipit daemon started pid={} pid_file={}",
+                child.id(),
+                pid_file.display()
+            );
+        } else {
+            println!("pipit daemon started pid={}", child.id());
+        }
+    } else {
+        println!("pipit daemon started pid={}", child.id());
+    }
     Ok(())
 }
 
@@ -305,8 +358,7 @@ fn dashboard_context(cli: &Cli, log_file: PathBuf) -> Option<tui::DashboardConte
             log_file,
             log_filter: cli.log.clone(),
         },
-        Commands::Cert(_) => return None,
-        Commands::Tui(_) => return None,
+        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) => return None,
     };
 
     Some(context)
@@ -363,7 +415,7 @@ fn monitor_context(cli: &Cli, log_file: PathBuf) -> Option<telemetry::MonitorCon
             log_filter: cli.log.clone(),
             pid,
         },
-        Commands::Cert(_) | Commands::Tui(_) => return None,
+        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) => return None,
     };
 
     Some(context)
@@ -374,12 +426,7 @@ fn resolve_socket_for_service(cli: &Cli, log_file: &Path) -> Result<PathBuf> {
         return absolute_path(path);
     }
 
-    let role = match cli.command {
-        Commands::Client(_) => "client",
-        Commands::Server(_) => "server",
-        Commands::Tun(_) => "tun",
-        Commands::Cert(_) | Commands::Tui(_) => anyhow::bail!("telemetry socket is not supported"),
-    };
+    let role = command_role(&cli.command).context("telemetry socket is not supported")?;
     default_socket_path(log_file, role)
 }
 
@@ -415,6 +462,14 @@ fn resolve_attach_socket(
 }
 
 fn default_socket_path(log_file: &Path, role: &str) -> Result<PathBuf> {
+    default_sidecar_path(log_file, role, "sock")
+}
+
+fn default_pid_path(log_file: &Path, role: &str) -> Result<PathBuf> {
+    default_sidecar_path(log_file, role, "pid")
+}
+
+fn default_sidecar_path(log_file: &Path, role: &str, ext: &str) -> Result<PathBuf> {
     let log_file = absolute_path(log_file)?;
     let parent = log_file
         .parent()
@@ -424,7 +479,7 @@ fn default_socket_path(log_file: &Path, role: &str) -> Result<PathBuf> {
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("pipit");
-    Ok(parent.join(format!("{stem}.{role}.sock")))
+    Ok(parent.join(format!("{stem}.{role}.{ext}")))
 }
 
 fn should_override(matches: &clap::ArgMatches, id: &str) -> bool {
@@ -444,4 +499,187 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     Ok(std::env::current_dir()
         .context("failed to read current directory")?
         .join(path))
+}
+
+fn command_role(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::Client(_) => Some("client"),
+        Commands::Server(_) => Some("server"),
+        Commands::Tun(_) => Some("tun"),
+        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) => None,
+    }
+}
+
+fn resolve_pid_file_for_role(
+    log_file: &Path,
+    configured_pid_file: Option<PathBuf>,
+    role: &str,
+) -> Result<PathBuf> {
+    if let Some(path) = configured_pid_file {
+        return absolute_path(&path);
+    }
+    default_pid_path(log_file, role)
+}
+
+fn maybe_create_pid_file(cli: &Cli, log_file: &Path) -> Result<Option<PidFileGuard>> {
+    let Some(role) = command_role(&cli.command) else {
+        return Ok(None);
+    };
+    if !cli.daemon && cli.pid_file.is_none() {
+        return Ok(None);
+    }
+
+    let path = resolve_pid_file_for_role(log_file, cli.pid_file.clone(), role)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    if path.exists() {
+        match read_pid_file(&path) {
+            Ok(pid) if process_exists(pid)? => {
+                anyhow::bail!(
+                    "another {} daemon is already running with pid {} (pid file: {})",
+                    role,
+                    pid,
+                    path.display()
+                );
+            }
+            Ok(_) | Err(_) => {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+
+    fs::write(&path, format!("{}\n", std::process::id()))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(Some(PidFileGuard { path }))
+}
+
+async fn stop_daemon_process(
+    log_file: &Path,
+    configured_pid_file: Option<PathBuf>,
+    args: StopArgs,
+) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (log_file, configured_pid_file, args);
+        anyhow::bail!("pipit stop is only supported on unix platforms");
+    }
+
+    #[cfg(unix)]
+    {
+        let pid_file = resolve_stop_pid_file(log_file, configured_pid_file, args.role)?;
+        let pid = read_pid_file(&pid_file)?;
+        if !process_exists(pid)? {
+            let _ = fs::remove_file(&pid_file);
+            println!(
+                "pipit daemon is not running (removed stale pid file {})",
+                pid_file.display()
+            );
+            return Ok(());
+        }
+
+        send_sigterm(pid)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(args.wait_secs);
+        loop {
+            if !process_exists(pid)? {
+                let _ = fs::remove_file(&pid_file);
+                println!(
+                    "pipit daemon stopped pid={} pid_file={}",
+                    pid,
+                    pid_file.display()
+                );
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting {}s for pid {} to exit; try again or stop it manually",
+                    args.wait_secs,
+                    pid
+                );
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+fn resolve_stop_pid_file(
+    log_file: &Path,
+    configured_pid_file: Option<PathBuf>,
+    role: Option<ServiceRole>,
+) -> Result<PathBuf> {
+    if let Some(path) = configured_pid_file {
+        return absolute_path(&path);
+    }
+    if let Some(role) = role {
+        return default_pid_path(log_file, role.as_str());
+    }
+
+    let client = default_pid_path(log_file, "client")?;
+    let server = default_pid_path(log_file, "server")?;
+    let tun = default_pid_path(log_file, "tun")?;
+    let mut found = Vec::new();
+    if client.exists() {
+        found.push(client);
+    }
+    if server.exists() {
+        found.push(server);
+    }
+    if tun.exists() {
+        found.push(tun);
+    }
+
+    match found.len() {
+        0 => anyhow::bail!(
+            "no pid file found; pass `stop client`, `stop server`, `stop tun`, or `--pid-file`"
+        ),
+        1 => Ok(found.remove(0)),
+        _ => anyhow::bail!(
+            "multiple pid files exist; pass `stop client`, `stop server`, `stop tun`, or `--pid-file`"
+        ),
+    }
+}
+
+fn read_pid_file(path: &Path) -> Result<u32> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read pid file {}", path.display()))?;
+    raw.trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid pid in {}", path.display()))
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> Result<bool> {
+    let pid = pid as i32;
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(code) if code == libc::ESRCH => Ok(false),
+        Some(code) if code == libc::EPERM => Ok(true),
+        _ => Err(err).with_context(|| format!("failed to inspect process {}", pid)),
+    }
+}
+
+#[cfg(unix)]
+fn send_sigterm(pid: u32) -> Result<()> {
+    let pid = pid as i32;
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if rc == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error())
+        .with_context(|| format!("failed to send SIGTERM to {}", pid))
+}
+
+struct PidFileGuard {
+    path: PathBuf,
+}
+
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }

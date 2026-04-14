@@ -4,6 +4,7 @@ use pipit::{
     mode::ProxyMode,
     route::FilterMode,
     server::{self, ServerArgs},
+    socks5,
 };
 use rcgen::generate_simple_self_signed;
 use std::{
@@ -16,7 +17,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::Mutex,
     task::JoinHandle,
     time::{sleep, timeout},
@@ -29,9 +30,11 @@ static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct TestEnv {
     _target_handle: JoinHandle<()>,
+    _udp_target_handle: JoinHandle<()>,
     _server_handle: JoinHandle<()>,
     _client_handle: JoinHandle<()>,
     target_port: u16,
+    udp_target_port: u16,
     socks_port: u16,
     cert_path: Option<PathBuf>,
     key_path: Option<PathBuf>,
@@ -55,6 +58,21 @@ impl Drop for TestEnv {
 async fn native_http_mode_round_trip_works() {
     let _guard = test_lock().lock().await;
     assert_mode_round_trip(ProxyMode::NativeHttp).await.unwrap();
+}
+
+#[tokio::test]
+async fn native_http_mode_udp_associate_round_trip_works() {
+    let _guard = test_lock().lock().await;
+    let env = start_env(ProxyMode::NativeHttp).await.unwrap();
+    let response = timeout(
+        Duration::from_secs(5),
+        exchange_udp_via_socks(env.socks_port, env.udp_target_port, b"hello over udp"),
+    )
+    .await
+    .context("timed out waiting for SOCKS UDP round trip")
+    .unwrap()
+    .unwrap();
+    assert_eq!(response, b"hello over udp");
 }
 
 #[tokio::test]
@@ -131,11 +149,13 @@ async fn start_env(mode: ProxyMode) -> Result<TestEnv> {
     init_test_tracing();
     let _ = rustls::crypto::ring::default_provider().install_default();
     let target_port = free_port()?;
+    let udp_target_port = free_port()?;
     let server_port = free_port()?;
     let socks_port = free_port()?;
     let fallback_port = free_port()?;
 
     let target_handle = tokio::spawn(run_http_target(target_port));
+    let udp_target_handle = tokio::spawn(run_udp_target(udp_target_port));
     let fallback_url = format!("http://127.0.0.1:{fallback_port}");
 
     let (cert_path, key_path) = if matches!(mode, ProxyMode::NativeHttp | ProxyMode::NativeMux) {
@@ -197,9 +217,11 @@ async fn start_env(mode: ProxyMode) -> Result<TestEnv> {
 
     Ok(TestEnv {
         _target_handle: target_handle,
+        _udp_target_handle: udp_target_handle,
         _server_handle: server_handle,
         _client_handle: client_handle,
         target_port,
+        udp_target_port,
         socks_port,
         cert_path,
         key_path,
@@ -254,6 +276,16 @@ async fn run_http_target(port: u16) {
     }
 }
 
+async fn run_udp_target(port: u16) {
+    let socket = UdpSocket::bind(("127.0.0.1", port)).await.unwrap();
+    let mut buf = vec![0_u8; 64 * 1024];
+
+    loop {
+        let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+        let _ = socket.send_to(&buf[..n], peer).await;
+    }
+}
+
 async fn fetch_via_socks_path(socks_port: u16, target_port: u16, path: &str) -> Result<Vec<u8>> {
     let mut stream = TcpStream::connect(("127.0.0.1", socks_port))
         .await
@@ -279,6 +311,77 @@ async fn fetch_via_socks_path(socks_port: u16, target_port: u16, path: &str) -> 
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await?;
     Ok(response)
+}
+
+async fn exchange_udp_via_socks(
+    socks_port: u16,
+    target_port: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let mut control = TcpStream::connect(("127.0.0.1", socks_port))
+        .await
+        .context("failed to connect to local SOCKS listener")?;
+
+    control.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut method_reply = [0_u8; 2];
+    control.read_exact(&mut method_reply).await?;
+    anyhow::ensure!(method_reply == [0x05, 0x00], "unexpected SOCKS auth reply");
+
+    let udp_associate = [0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+    control.write_all(&udp_associate).await?;
+
+    let relay_addr = read_socks_reply_addr(&mut control).await?;
+    let relay = UdpSocket::bind(("127.0.0.1", 0))
+        .await
+        .context("failed to bind local UDP client socket")?;
+    let packet = socks5::build_udp_packet(
+        &socks5::TargetAddr::Ip(Ipv4Addr::LOCALHOST.into(), target_port),
+        payload,
+    );
+    relay
+        .send_to(&packet, relay_addr)
+        .await
+        .context("failed to send UDP packet to SOCKS relay")?;
+
+    let mut buf = vec![0_u8; 64 * 1024];
+    let (n, _) = relay
+        .recv_from(&mut buf)
+        .await
+        .context("failed to receive UDP packet from SOCKS relay")?;
+    let response = socks5::parse_udp_packet(&buf[..n]).context("invalid SOCKS UDP response")?;
+    anyhow::ensure!(
+        response.target == socks5::TargetAddr::Ip(Ipv4Addr::LOCALHOST.into(), target_port),
+        "unexpected UDP response target: {}",
+        response.target
+    );
+    Ok(response.payload)
+}
+
+async fn read_socks_reply_addr(stream: &mut TcpStream) -> Result<SocketAddr> {
+    let mut head = [0_u8; 4];
+    stream.read_exact(&mut head).await?;
+    anyhow::ensure!(head[0] == 0x05, "unexpected SOCKS reply version");
+    anyhow::ensure!(head[1] == 0x00, "unexpected SOCKS reply code {}", head[1]);
+
+    let addr = match head[3] {
+        0x01 => {
+            let mut ip = [0_u8; 4];
+            let mut port = [0_u8; 2];
+            stream.read_exact(&mut ip).await?;
+            stream.read_exact(&mut port).await?;
+            SocketAddr::from((ip, u16::from_be_bytes(port)))
+        }
+        0x04 => {
+            let mut ip = [0_u8; 16];
+            let mut port = [0_u8; 2];
+            stream.read_exact(&mut ip).await?;
+            stream.read_exact(&mut port).await?;
+            SocketAddr::new(ip.into(), u16::from_be_bytes(port))
+        }
+        atyp => anyhow::bail!("unexpected SOCKS reply address type {atyp}"),
+    };
+
+    Ok(addr)
 }
 
 fn extract_path(request_buf: &[u8]) -> &str {

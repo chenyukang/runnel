@@ -210,6 +210,7 @@ impl MuxClient {
         let proof = AuthProof::sign(&self.password, "POST", &self.mux_path, SESSION_AUTH_TARGET)?;
         let payload = http::TunnelPayload {
             target: SESSION_AUTH_TARGET.to_owned(),
+            transport: http::TunnelTransport::Tcp,
             timestamp: proof.timestamp,
             nonce: proof.nonce,
             signature: proof.signature,

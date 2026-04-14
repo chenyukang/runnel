@@ -17,3 +17,5 @@ pub mod tls;
 pub mod traffic;
 pub mod tui;
 pub mod tun;
+pub mod udp;
+pub mod udp_assoc;

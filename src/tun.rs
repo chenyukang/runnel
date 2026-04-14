@@ -1,19 +1,24 @@
 use std::{
     collections::BTreeMap,
+    fs,
+    io::Write,
     net::IpAddr,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
+use serde::{Deserialize, Serialize};
 use tokio::{
+    io::{AsyncBufReadExt, BufReader},
     net::{TcpStream, lookup_host},
     process::{Child, Command},
     task::JoinHandle,
     time::{sleep, timeout},
 };
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     client::{self, ClientArgs},
@@ -28,6 +33,12 @@ const TEST_SERVER_HOST: &str = "198.51.100.10";
 const TEST_SERVER_IP: &str = "198.51.100.10";
 
 const MACOS_TUN_GATEWAY_V4: &str = "198.18.0.1";
+const AUTO_TUN_DEVICE: &str = "auto";
+static EMBEDDED_TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+const MACOS_AUTO_TUN_START_INDEX: u16 = 233;
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_AUTO_TUN_DEVICE: &str = "tun0";
 const MACOS_TUN_ROUTE_SET: &[&str] = &[
     "1.0.0.0/8",
     "2.0.0.0/7",
@@ -44,7 +55,7 @@ const MACOS_TUN_ROUTE_SET: &[&str] = &[
 pub struct TunArgs {
     #[command(flatten)]
     pub client: ClientArgs,
-    #[arg(long, default_value = "utun233")]
+    #[arg(long, default_value = AUTO_TUN_DEVICE)]
     pub device: String,
     #[arg(long, default_value = "/bin/sh")]
     pub shell: String,
@@ -56,6 +67,120 @@ pub struct TunArgs {
     pub up: Vec<String>,
     #[arg(long)]
     pub down: Vec<String>,
+    #[arg(long)]
+    pub print_hooks: bool,
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct HelperLogLine {
+    level: Option<String>,
+    caller: Option<String>,
+    msg: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TunState {
+    pid: u32,
+    helper_pid: Option<u32>,
+    shell: String,
+    down_hooks: Vec<String>,
+}
+
+struct TunStateGuard {
+    path: PathBuf,
+    state: TunState,
+}
+
+pub fn set_embedded_tui(active: bool) {
+    EMBEDDED_TUI_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+impl TunStateGuard {
+    async fn acquire(shell: &str, context: &CommandContext, down_hooks: &[String]) -> Result<Self> {
+        let path = resolve_tun_state_path(context)?;
+        let guard = Self {
+            path,
+            state: TunState {
+                pid: std::process::id(),
+                helper_pid: None,
+                shell: shell.to_owned(),
+                down_hooks: down_hooks.iter().map(|hook| context.expand(hook)).collect(),
+            },
+        };
+
+        for _ in 0..2 {
+            match guard.persist(true) {
+                Ok(()) => return Ok(guard),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    match load_tun_state(&guard.path)? {
+                        Some(existing) if process_alive(existing.pid) => {
+                            bail!(
+                                "another pipit tun is already running (pid {}); stop it before starting a new tun session",
+                                existing.pid
+                            );
+                        }
+                        Some(existing) => {
+                            cleanup_stale_tun_state(&guard.path, &existing).await?;
+                        }
+                        None => {
+                            warn!(
+                                path = %guard.path.display(),
+                                "found an unreadable tun state file; removing it before retrying"
+                            );
+                        }
+                    }
+                    let _ = fs::remove_file(&guard.path);
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to create tun state {}", guard.path.display())
+                    });
+                }
+            }
+        }
+
+        guard
+            .persist(true)
+            .with_context(|| format!("failed to create tun state {}", guard.path.display()))?;
+        Ok(guard)
+    }
+
+    fn update_helper_pid(&mut self, helper_pid: Option<u32>) -> Result<()> {
+        self.state.helper_pid = helper_pid;
+        self.persist(false)
+            .with_context(|| format!("failed to update tun state {}", self.path.display()))?;
+        Ok(())
+    }
+
+    fn clear(&self) {
+        let _ = fs::remove_file(&self.path);
+    }
+
+    fn persist(&self, create_new: bool) -> std::io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut options = fs::OpenOptions::new();
+        options.write(true).truncate(true);
+        if create_new {
+            options.create_new(true);
+        } else {
+            options.create(true);
+        }
+        let mut file = options.open(&self.path)?;
+        serde_json::to_writer_pretty(&mut file, &self.state).map_err(std::io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        Ok(())
+    }
+}
+
+impl Drop for TunStateGuard {
+    fn drop(&mut self) {
+        self.clear();
+    }
 }
 
 pub async fn run(args: TunArgs) -> Result<()> {
@@ -64,12 +189,27 @@ pub async fn run(args: TunArgs) -> Result<()> {
     let helper_cmd = effective_helper_cmd(&args, &context)?;
     let up_hooks = effective_up_hooks(&args, &context)?;
     let down_hooks = effective_down_hooks(&args, &context)?;
-    let mut client_task = tokio::spawn(client::run(args.client.clone()));
+    if args.print_hooks || args.dry_run {
+        let plan_lines = plan_lines(&args, &context, &helper_cmd, &up_hooks, &down_hooks);
+        if EMBEDDED_TUI_ACTIVE.load(Ordering::Relaxed) {
+            log_plan_lines(&plan_lines);
+        } else {
+            print_plan(&plan_lines);
+        }
+    }
+    if args.dry_run {
+        info!("tun dry-run completed without changing network settings");
+        return Ok(());
+    }
+    let mut tun_state = TunStateGuard::acquire(&args.shell, &context, &down_hooks).await?;
+    let mut client_task = tokio::spawn(client::run_embedded(args.client.clone()));
     wait_for_listener(&args.client.listen, Duration::from_secs(5)).await?;
+    ensure_device_available(&context.device).await?;
 
     let mut helper = spawn_shell_command("tun helper", &args.shell, &helper_cmd, &context, false)?;
+    tun_state.update_helper_pid(helper.id())?;
     info!(
-        device = %args.device,
+        device = %context.device,
         socks = %args.client.listen,
         server = %args.client.server,
         server_ip = %context.server_ip,
@@ -79,6 +219,11 @@ pub async fn run(args: TunArgs) -> Result<()> {
     );
 
     sleep(Duration::from_millis(args.helper_ready_delay_ms)).await;
+    if let Err(err) = ensure_helper_alive(&mut helper, &context.device, "before up hooks") {
+        abort_client_task(&mut client_task).await;
+        tun_state.clear();
+        return Err(err);
+    }
     if let Err(err) = run_hooks("up hook", &args.shell, &up_hooks, &context).await {
         shutdown(
             &args.shell,
@@ -88,6 +233,19 @@ pub async fn run(args: TunArgs) -> Result<()> {
             &mut client_task,
         )
         .await;
+        tun_state.clear();
+        return Err(err);
+    }
+    if let Err(err) = ensure_helper_alive(&mut helper, &context.device, "after up hooks") {
+        shutdown(
+            &args.shell,
+            &down_hooks,
+            &context,
+            &mut helper,
+            &mut client_task,
+        )
+        .await;
+        tun_state.clear();
         return Err(err);
     }
 
@@ -101,7 +259,7 @@ pub async fn run(args: TunArgs) -> Result<()> {
                 bail!("tun helper exited with status {status}")
             }
         }
-        signal = tokio::signal::ctrl_c() => {
+        signal = wait_for_shutdown_signal() => {
             signal?;
             Ok(())
         }
@@ -115,6 +273,7 @@ pub async fn run(args: TunArgs) -> Result<()> {
         &mut client_task,
     )
     .await;
+    tun_state.clear();
     result
 }
 
@@ -141,6 +300,7 @@ struct CommandContext {
 impl CommandContext {
     async fn from_args(args: &TunArgs) -> Result<Self> {
         let (server_host, server_port) = tls::split_host_port(&args.client.server)?;
+        let device = resolve_device_name(&args.device).await?;
         let server_ip = resolve_server_ip(&server_host, server_port).await?;
         let needs_egress_metadata = needs_egress_metadata(args);
         let (egress_interface, egress_gateway) = if needs_egress_metadata {
@@ -150,7 +310,7 @@ impl CommandContext {
         };
 
         Ok(Self {
-            device: args.device.clone(),
+            device,
             socks_listen: args.client.listen.clone(),
             server: args.client.server.clone(),
             server_host,
@@ -272,7 +432,11 @@ fn default_up_hooks(context: &CommandContext) -> Result<Vec<String>> {
         hooks.extend(
             MACOS_TUN_ROUTE_SET
                 .iter()
-                .map(|cidr| format!("route -q -n add -net {cidr} {MACOS_TUN_GATEWAY_V4}")),
+                .map(|cidr| {
+                    format!(
+                        "route -q -n add -net {cidr} {MACOS_TUN_GATEWAY_V4} >/dev/null 2>&1 || route -q -n change -net {cidr} {MACOS_TUN_GATEWAY_V4}"
+                    )
+                }),
         );
         return Ok(hooks);
     }
@@ -362,6 +526,172 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
     None
 }
 
+fn resolve_tun_state_path(context: &CommandContext) -> Result<PathBuf> {
+    let log_file = context.log_file.as_deref().unwrap_or("proxy.log");
+    let log_path = PathBuf::from(log_file);
+    let absolute = if log_path.is_absolute() {
+        log_path
+    } else {
+        std::env::current_dir()
+            .context("failed to read current directory for tun state path")?
+            .join(log_path)
+    };
+    let parent = absolute
+        .parent()
+        .context("log file path did not have a parent directory")?;
+    let stem = absolute
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .context("log file path did not have a valid stem")?;
+    Ok(parent.join(format!("{stem}.tun.state.json")))
+}
+
+fn load_tun_state(path: &Path) -> Result<Option<TunState>> {
+    match fs::read_to_string(path) {
+        Ok(contents) => serde_json::from_str(&contents)
+            .map(Some)
+            .with_context(|| format!("failed to parse tun state {}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to read tun state {}", path.display()))
+        }
+    }
+}
+
+async fn cleanup_stale_tun_state(path: &Path, state: &TunState) -> Result<()> {
+    info!(
+        path = %path.display(),
+        pid = state.pid,
+        helper_pid = state.helper_pid.unwrap_or_default(),
+        "detected stale tun state; attempting cleanup before startup"
+    );
+    if let Some(helper_pid) = state.helper_pid {
+        terminate_process(helper_pid, "stale tun helper").await;
+    }
+    run_expanded_hooks("stale down hook", &state.shell, &state.down_hooks).await?;
+    Ok(())
+}
+
+async fn run_expanded_hooks(label: &str, shell: &str, hooks: &[String]) -> Result<()> {
+    for hook in hooks {
+        info!(hook = %hook, "{label} starting");
+        let status = Command::new(shell)
+            .arg("-lc")
+            .arg(hook)
+            .status()
+            .await
+            .with_context(|| format!("failed to run {label}: {hook}"))?;
+        if !status.success() {
+            bail!("{label} failed with status {status}: {hook}");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as i32, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+async fn terminate_process(pid: u32, label: &str) {
+    if !process_alive(pid) {
+        return;
+    }
+    info!(pid, "{label} stopping");
+    let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    sleep(Duration::from_millis(300)).await;
+    if process_alive(pid) {
+        warn!(pid, "{label} did not exit after SIGTERM; sending SIGKILL");
+        let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        sleep(Duration::from_millis(150)).await;
+    }
+}
+
+#[cfg(not(unix))]
+async fn terminate_process(_pid: u32, _label: &str) {}
+
+fn is_auto_device(device: &str) -> bool {
+    let requested = device.trim();
+    requested.is_empty() || requested.eq_ignore_ascii_case(AUTO_TUN_DEVICE)
+}
+
+async fn resolve_device_name(requested: &str) -> Result<String> {
+    if !is_auto_device(requested) {
+        return Ok(requested.trim().to_owned());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return pick_available_macos_utun().await;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(DEFAULT_AUTO_TUN_DEVICE.to_owned())
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn pick_available_macos_utun() -> Result<String> {
+    let output = Command::new("ifconfig")
+        .arg("-l")
+        .output()
+        .await
+        .context("failed to list network interfaces for automatic TUN selection")?;
+    if !output.status.success() {
+        bail!(
+            "failed to list network interfaces for automatic TUN selection: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let interfaces = String::from_utf8_lossy(&output.stdout);
+    let in_use: std::collections::HashSet<&str> = interfaces.split_whitespace().collect();
+    for index in MACOS_AUTO_TUN_START_INDEX..u16::MAX {
+        let candidate = format!("utun{index}");
+        if !in_use.contains(candidate.as_str()) {
+            return Ok(candidate);
+        }
+    }
+
+    bail!(
+        "failed to find a free utun device starting at utun{}",
+        MACOS_AUTO_TUN_START_INDEX
+    );
+}
+
+async fn ensure_device_available(device: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let status = Command::new("ifconfig")
+            .arg(device)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .with_context(|| format!("failed to inspect TUN device {device}"))?;
+        if status.success() {
+            bail!(
+                "TUN device {device} is already in use; choose a different --device or stop the other VPN/tun helper first"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = device;
+    }
+
+    Ok(())
+}
+
 fn shell_quote_path(path: &Path) -> String {
     shell_quote(&path.to_string_lossy())
 }
@@ -390,21 +720,26 @@ async fn resolve_server_ip(host: &str, port: u16) -> Result<String> {
 async fn detect_egress_route(server_ip: &str) -> Result<(Option<String>, Option<String>)> {
     #[cfg(target_os = "macos")]
     {
-        let output = Command::new("route")
-            .arg("-n")
-            .arg("get")
-            .arg(server_ip)
-            .output()
-            .await
-            .with_context(|| format!("failed to inspect route to {server_ip}"))?;
-        if !output.status.success() {
-            bail!(
-                "failed to inspect route to {server_ip}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+        let route = detect_macos_route(server_ip).await?;
+        if should_fallback_to_default_egress(&route) {
+            let default_route = detect_macos_route("default").await?;
+            if default_route
+                .0
+                .as_deref()
+                .is_some_and(|interface| !interface.starts_with("utun"))
+            {
+                warn!(
+                    server_ip,
+                    route_interface = route.0.as_deref().unwrap_or("-"),
+                    route_gateway = route.1.as_deref().unwrap_or("-"),
+                    default_interface = default_route.0.as_deref().unwrap_or("-"),
+                    default_gateway = default_route.1.as_deref().unwrap_or("-"),
+                    "route to upstream currently points at a utun interface; falling back to the default egress route",
+                );
+                return Ok(default_route);
+            }
         }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return parse_macos_route_get(&stdout);
+        return Ok(route);
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -412,6 +747,34 @@ async fn detect_egress_route(server_ip: &str) -> Result<(Option<String>, Option<
         let _ = server_ip;
         Ok((None, None))
     }
+}
+
+#[cfg(target_os = "macos")]
+async fn detect_macos_route(target: &str) -> Result<(Option<String>, Option<String>)> {
+    let output = Command::new("route")
+        .arg("-n")
+        .arg("get")
+        .arg(target)
+        .output()
+        .await
+        .with_context(|| format!("failed to inspect route to {target}"))?;
+    if !output.status.success() {
+        bail!(
+            "failed to inspect route to {target}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_macos_route_get(&stdout)
+}
+
+#[cfg(target_os = "macos")]
+fn should_fallback_to_default_egress(route: &(Option<String>, Option<String>)) -> bool {
+    route
+        .0
+        .as_deref()
+        .is_some_and(|interface| interface.starts_with("utun"))
+        || route.1.as_deref() == Some(MACOS_TUN_GATEWAY_V4)
 }
 
 #[cfg(target_os = "macos")]
@@ -453,11 +816,75 @@ fn spawn_shell_command(
     if quiet {
         command.stdout(std::process::Stdio::null());
         command.stderr(std::process::Stdio::null());
+    } else {
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
     }
-    let child = command
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to start {label}: {expanded}"))?;
+    if !quiet {
+        attach_child_logs(label, &mut child);
+    }
     Ok(child)
+}
+
+fn attach_child_logs(label: &str, child: &mut Child) {
+    if let Some(stdout) = child.stdout.take() {
+        let label = label.to_owned();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                log_child_line(&label, false, &line);
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        let label = label.to_owned();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                log_child_line(&label, true, &line);
+            }
+        });
+    }
+}
+
+fn log_child_line(label: &str, stderr: bool, line: &str) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    if let Ok(parsed) = serde_json::from_str::<HelperLogLine>(trimmed) {
+        let message = parsed.msg.unwrap_or_else(|| trimmed.to_owned());
+        let caller = parsed.caller.unwrap_or_default();
+        match parsed
+            .level
+            .as_deref()
+            .map(|value| value.to_ascii_lowercase())
+        {
+            Some(level) if level == "debug" => {
+                debug!(caller = %caller, "{} {}", label, message);
+            }
+            Some(level) if level == "warn" || level == "warning" => {
+                warn!(caller = %caller, "{} {}", label, message);
+            }
+            Some(level) if level == "error" || level == "fatal" => {
+                error!(caller = %caller, "{} {}", label, message);
+            }
+            _ => {
+                info!(caller = %caller, "{} {}", label, message);
+            }
+        }
+        return;
+    }
+
+    if stderr {
+        warn!("{} {}", label, trimmed);
+    } else {
+        info!("{} {}", label, trimmed);
+    }
 }
 
 async fn run_hooks(
@@ -503,6 +930,23 @@ async fn shutdown(
     let _ = client_task.await;
 }
 
+async fn abort_client_task(client_task: &mut JoinHandle<Result<()>>) {
+    client_task.abort();
+    let _ = client_task.await;
+}
+
+fn ensure_helper_alive(helper: &mut Child, device: &str, stage: &str) -> Result<()> {
+    if let Some(status) = helper
+        .try_wait()
+        .with_context(|| format!("failed to inspect tun helper status {stage}"))?
+    {
+        bail!(
+            "tun helper exited {stage} with status {status}; if the helper logged `create tun: resource busy`, `{device}` was already in use"
+        );
+    }
+    Ok(())
+}
+
 async fn wait_for_listener(listen: &str, timeout_window: Duration) -> Result<()> {
     let started = tokio::time::Instant::now();
     loop {
@@ -521,6 +965,31 @@ fn join_client(result: Result<Result<()>, tokio::task::JoinError>) -> Result<()>
         Ok(inner) => inner.context("embedded client exited"),
         Err(err) if err.is_cancelled() => Ok(()),
         Err(err) => Err(err).context("embedded client task failed"),
+    }
+}
+
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut terminate =
+            signal(SignalKind::terminate()).context("failed to register SIGTERM handler")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.context("failed to wait for Ctrl-C")?;
+            }
+            _ = terminate.recv() => {}
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to wait for Ctrl-C")?;
+        Ok(())
     }
 }
 
@@ -544,13 +1013,73 @@ fn shell_envs(context: &CommandContext) -> BTreeMap<&'static str, String> {
     envs
 }
 
+fn plan_lines(
+    args: &TunArgs,
+    context: &CommandContext,
+    helper_cmd: &str,
+    up_hooks: &[String],
+    down_hooks: &[String],
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push("pipit tun plan".to_owned());
+    if is_auto_device(&args.device) {
+        lines.push(format!("  device: {} (auto)", context.device));
+    } else {
+        lines.push(format!("  device: {}", context.device));
+    }
+    lines.push(format!("  socks: {}", args.client.listen));
+    lines.push(format!("  server: {}", args.client.server));
+    lines.push(format!("  server_ip: {}", context.server_ip));
+    lines.push(format!(
+        "  egress_interface: {}",
+        context.egress_interface.as_deref().unwrap_or("-")
+    ));
+    lines.push(format!(
+        "  egress_gateway: {}",
+        context.egress_gateway.as_deref().unwrap_or("-")
+    ));
+    lines.push(format!("  helper: {}", context.expand(helper_cmd)));
+    lines.push("  up hooks:".to_owned());
+    if up_hooks.is_empty() {
+        lines.push("    - (none)".to_owned());
+    } else {
+        for hook in up_hooks {
+            lines.push(format!("    - {}", context.expand(hook)));
+        }
+    }
+    lines.push("  down hooks:".to_owned());
+    if down_hooks.is_empty() {
+        lines.push("    - (none)".to_owned());
+    } else {
+        for hook in down_hooks {
+            lines.push(format!("    - {}", context.expand(hook)));
+        }
+    }
+    lines
+}
+
+fn print_plan(lines: &[String]) {
+    for line in lines {
+        println!("{line}");
+    }
+}
+
+fn log_plan_lines(lines: &[String]) {
+    for line in lines {
+        info!("{}", line);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandContext, MACOS_TUN_GATEWAY_V4, TEST_SERVER_ENDPOINT, TEST_SERVER_HOST,
-        TEST_SERVER_IP, default_down_hooks, default_server_bypass_route, default_up_hooks,
-        parse_macos_route_get, shell_envs,
+        AUTO_TUN_DEVICE, CommandContext, MACOS_TUN_GATEWAY_V4, TEST_SERVER_ENDPOINT,
+        TEST_SERVER_HOST, TEST_SERVER_IP, TunArgs, default_down_hooks, default_server_bypass_route,
+        default_up_hooks, is_auto_device, parse_macos_route_get, plan_lines, print_plan,
+        shell_envs,
     };
+    use crate::{client::ClientArgs, mode::ProxyMode, route::FilterMode};
+    use std::path::PathBuf;
 
     #[test]
     fn placeholders_expand_into_shell_commands() {
@@ -606,6 +1135,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn auto_device_flag_is_detected() {
+        assert!(is_auto_device(AUTO_TUN_DEVICE));
+        assert!(is_auto_device("AUTO"));
+        assert!(is_auto_device(""));
+        assert!(!is_auto_device("utun233"));
+    }
+
+    #[test]
+    fn tun_state_path_follows_log_stem() {
+        let context = CommandContext {
+            device: "utun233".to_owned(),
+            socks_listen: "127.0.0.1:1080".to_owned(),
+            server: TEST_SERVER_ENDPOINT.to_owned(),
+            server_host: TEST_SERVER_HOST.to_owned(),
+            server_port: 1443,
+            server_ip: TEST_SERVER_IP.to_owned(),
+            egress_interface: Some("en0".to_owned()),
+            egress_gateway: Some("192.168.3.1".to_owned()),
+            log_file: Some("/tmp/proxy.log".to_owned()),
+        };
+        let path = super::resolve_tun_state_path(&context).expect("state path resolves");
+        assert_eq!(path, PathBuf::from("/tmp/proxy.tun.state.json"));
+    }
+
+    #[test]
+    fn print_plan_expands_helper_and_hooks() {
+        let args = TunArgs {
+            client: ClientArgs {
+                listen: "127.0.0.1:1080".to_owned(),
+                server: TEST_SERVER_ENDPOINT.to_owned(),
+                server_name: Some("example.com".to_owned()),
+                ca_cert: None,
+                mode: ProxyMode::NativeHttp,
+                password: "hello-world".to_owned(),
+                path: "/connect".to_owned(),
+                mux_path: "/mux".to_owned(),
+                mux: false,
+                filter: FilterMode::Proxy,
+                rule_file: None,
+                cidr_file: None,
+                user_agent: "pipit-test".to_owned(),
+                handshake_timeout_secs: 10,
+                connect_timeout_secs: 10,
+                max_header_size: 8192,
+                system_proxy: false,
+                system_proxy_services: Vec::new(),
+            },
+            device: "utun233".to_owned(),
+            shell: "/bin/sh".to_owned(),
+            helper_cmd: String::new(),
+            helper_ready_delay_ms: 800,
+            up: Vec::new(),
+            down: Vec::new(),
+            print_hooks: true,
+            dry_run: false,
+        };
+        let context = CommandContext {
+            device: "utun233".to_owned(),
+            socks_listen: "127.0.0.1:1080".to_owned(),
+            server: TEST_SERVER_ENDPOINT.to_owned(),
+            server_host: TEST_SERVER_HOST.to_owned(),
+            server_port: 1443,
+            server_ip: TEST_SERVER_IP.to_owned(),
+            egress_interface: Some("en0".to_owned()),
+            egress_gateway: Some("192.168.3.1".to_owned()),
+            log_file: Some("proxy.log".to_owned()),
+        };
+        let lines = plan_lines(
+            &args,
+            &context,
+            "tun2socks -device {device} -proxy socks5://{socks}",
+            &["ifconfig {device} inet 198.18.0.1 198.18.0.1 up".to_owned()],
+            &["ifconfig {device} down >/dev/null 2>&1 || true".to_owned()],
+        );
+        print_plan(&lines);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_route_output_is_parsed() {
@@ -618,6 +1225,23 @@ destination: 198.51.100.10
         let (interface, gateway) = parse_macos_route_get(output).expect("route output parses");
         assert_eq!(interface.as_deref(), Some("en0"));
         assert_eq!(gateway.as_deref(), Some("192.168.3.1"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn utun_routes_trigger_default_egress_fallback() {
+        assert!(super::should_fallback_to_default_egress(&(
+            Some("utun4".to_owned()),
+            Some("198.18.0.1".to_owned())
+        )));
+        assert!(super::should_fallback_to_default_egress(&(
+            Some("utun4".to_owned()),
+            Some("192.168.3.1".to_owned())
+        )));
+        assert!(!super::should_fallback_to_default_egress(&(
+            Some("en0".to_owned()),
+            Some("192.168.3.1".to_owned())
+        )));
     }
 
     #[cfg(target_os = "macos")]
@@ -642,12 +1266,12 @@ destination: 198.51.100.10
         assert!(
             hooks
                 .iter()
-                .any(|hook| hook == "route -q -n add -net 1.0.0.0/8 198.18.0.1")
+                .any(|hook| hook == "route -q -n add -net 1.0.0.0/8 198.18.0.1 >/dev/null 2>&1 || route -q -n change -net 1.0.0.0/8 198.18.0.1")
         );
         assert!(
             hooks
                 .iter()
-                .any(|hook| hook == "route -q -n add -net 128.0.0.0/1 198.18.0.1")
+                .any(|hook| hook == "route -q -n add -net 128.0.0.0/1 198.18.0.1 >/dev/null 2>&1 || route -q -n change -net 128.0.0.0/1 198.18.0.1")
         );
         assert!(
             hooks

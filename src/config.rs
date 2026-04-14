@@ -14,6 +14,7 @@ pub struct FileConfig {
     pub log: Option<String>,
     pub log_file: Option<PathBuf>,
     pub telemetry_sock: Option<PathBuf>,
+    pub pid_file: Option<PathBuf>,
     pub tui: Option<bool>,
     pub daemon: Option<bool>,
     pub client: Option<ClientConfig>,
@@ -79,6 +80,8 @@ pub struct TunConfig {
     pub helper_ready_delay_ms: Option<u64>,
     pub up: Option<Vec<String>>,
     pub down: Option<Vec<String>>,
+    pub print_hooks: Option<bool>,
+    pub dry_run: Option<bool>,
 }
 
 pub fn load(path: &Path) -> Result<(FileConfig, PathBuf)> {
@@ -104,6 +107,7 @@ pub fn apply_globals(
     log: &mut String,
     log_file: &mut PathBuf,
     telemetry_sock: &mut Option<PathBuf>,
+    pid_file: &mut Option<PathBuf>,
     tui: &mut bool,
     daemon: &mut bool,
     config: &FileConfig,
@@ -119,6 +123,11 @@ pub fn apply_globals(
     if should_override(matches, "telemetry_sock") {
         if let Some(path) = &config.telemetry_sock {
             *telemetry_sock = Some(resolve_path(base_dir, path));
+        }
+    }
+    if should_override(matches, "pid_file") {
+        if let Some(path) = &config.pid_file {
+            *pid_file = Some(resolve_path(base_dir, path));
         }
     }
     maybe_assign(tui, &config.tui, should_override(matches, "tui"));
@@ -349,6 +358,16 @@ pub fn apply_tun(args: &mut TunArgs, config: &FileConfig, matches: &ArgMatches, 
     );
     maybe_assign(&mut args.up, &tun.up, should_override(matches, "up"));
     maybe_assign(&mut args.down, &tun.down, should_override(matches, "down"));
+    maybe_assign(
+        &mut args.print_hooks,
+        &tun.print_hooks,
+        should_override(matches, "print_hooks"),
+    );
+    maybe_assign(
+        &mut args.dry_run,
+        &tun.dry_run,
+        should_override(matches, "dry_run"),
+    );
 }
 
 pub fn apply_cert(args: &mut CertArgs, config: &FileConfig, matches: &ArgMatches, base_dir: &Path) {
@@ -426,6 +445,7 @@ mod tests {
         let raw = r#"
 log: debug
 telemetry_sock: run/pipit.sock
+pid_file: run/pipit.pid
 tui: true
 daemon: true
 client:
@@ -436,8 +456,10 @@ client:
   system_proxy_services:
     - Wi-Fi
 tun:
-  device: utun233
+  device: auto
   helper_cmd: tun2socks --device {device} --proxy socks5://{socks}
+  print_hooks: true
+  dry_run: true
 server:
   listen: 0.0.0.0:1443
 "#;
@@ -447,6 +469,7 @@ server:
             parsed.telemetry_sock.as_deref(),
             Some(Path::new("run/pipit.sock"))
         );
+        assert_eq!(parsed.pid_file.as_deref(), Some(Path::new("run/pipit.pid")));
         assert_eq!(parsed.tui, Some(true));
         assert_eq!(parsed.daemon, Some(true));
         assert_eq!(
@@ -471,8 +494,13 @@ server:
         );
         assert_eq!(
             parsed.tun.as_ref().and_then(|cfg| cfg.device.as_deref()),
-            Some("utun233")
+            Some("auto")
         );
+        assert_eq!(
+            parsed.tun.as_ref().and_then(|cfg| cfg.print_hooks),
+            Some(true)
+        );
+        assert_eq!(parsed.tun.as_ref().and_then(|cfg| cfg.dry_run), Some(true));
     }
 
     #[test]

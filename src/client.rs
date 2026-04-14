@@ -1,6 +1,6 @@
 use crate::{
     auth::AuthProof, http, mode::ProxyMode, netlog, route, route::FilterMode, route::RouteDecision,
-    socks5, system_proxy, tls, traffic,
+    socks5, system_proxy, tls, traffic, udp_assoc,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -56,23 +56,37 @@ pub struct ClientArgs {
 }
 
 pub async fn run(args: ClientArgs) -> Result<()> {
+    run_with_signal_handling(args, true).await
+}
+
+pub async fn run_embedded(args: ClientArgs) -> Result<()> {
+    run_with_signal_handling(args, false).await
+}
+
+async fn run_with_signal_handling(args: ClientArgs, handle_signals: bool) -> Result<()> {
     args.validate_required()?;
     let _system_proxy = system_proxy::maybe_activate(&args)?;
 
-    tokio::select! {
-        result = async move {
-            match args.effective_mode()? {
-                ProxyMode::NativeHttp => run_native_http(args).await,
-                ProxyMode::NativeMux => crate::mux::run_client(args).await,
-                ProxyMode::DazeAshe | ProxyMode::DazeBaboon => crate::daze::run_client(args).await,
-                ProxyMode::DazeCzar => crate::czar::run_client(args).await,
-            }
-        } => result,
-        signal = wait_for_shutdown_signal() => {
-            signal?;
-            info!("client shutting down");
-            Ok(())
+    let run_client = async move {
+        match args.effective_mode()? {
+            ProxyMode::NativeHttp => run_native_http(args).await,
+            ProxyMode::NativeMux => crate::mux::run_client(args).await,
+            ProxyMode::DazeAshe | ProxyMode::DazeBaboon => crate::daze::run_client(args).await,
+            ProxyMode::DazeCzar => crate::czar::run_client(args).await,
         }
+    };
+
+    if handle_signals {
+        tokio::select! {
+            result = run_client => result,
+            signal = wait_for_shutdown_signal() => {
+                signal?;
+                info!("client shutting down");
+                Ok(())
+            }
+        }
+    } else {
+        run_client.await
     }
 }
 
@@ -161,12 +175,31 @@ async fn handle_connection(
 ) -> Result<()> {
     inbound.set_nodelay(true)?;
 
-    let target = timeout(
+    let request = timeout(
         Duration::from_secs(args.handshake_timeout_secs),
-        socks5::accept(&mut inbound),
+        socks5::accept_request(&mut inbound),
     )
     .await
     .context("SOCKS handshake timed out")??;
+    let target = match request {
+        socks5::Request::Connect(target) => target,
+        socks5::Request::UdpAssociate(_bind) => {
+            if !matches!(args.effective_mode()?, ProxyMode::NativeHttp) {
+                let _ = socks5::send_failure(&mut inbound, socks5::REP_COMMAND_NOT_SUPPORTED).await;
+                bail!("UDP ASSOCIATE is only supported in native-http mode");
+            }
+            return udp_assoc::handle_native_http_udp_associate(
+                inbound,
+                peer,
+                args,
+                router,
+                connector,
+                host_header,
+                server_name,
+            )
+            .await;
+        }
+    };
     let target_string = target.to_string();
 
     match router.decide(&target).await? {
@@ -214,6 +247,7 @@ async fn handle_connection(
     let proof = AuthProof::sign(&args.password, "POST", &args.path, &target_string)?;
     let payload = http::TunnelPayload {
         target: target_string.clone(),
+        transport: http::TunnelTransport::Tcp,
         timestamp: proof.timestamp,
         nonce: proof.nonce,
         signature: proof.signature,

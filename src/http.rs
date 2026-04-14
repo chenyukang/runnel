@@ -17,9 +17,19 @@ pub struct TunnelRequestHead {
     pub chunked: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TunnelTransport {
+    #[default]
+    Tcp,
+    Udp,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TunnelPayload {
     pub target: String,
+    #[serde(default)]
+    pub transport: TunnelTransport,
     pub timestamp: i64,
     pub nonce: String,
     pub signature: String,
@@ -338,6 +348,7 @@ mod tests {
 
         let payload = TunnelPayload {
             target: "example.com:443".to_owned(),
+            transport: TunnelTransport::Tcp,
             timestamp: proof.timestamp,
             nonce: proof.nonce.clone(),
             signature: proof.signature.clone(),
@@ -358,6 +369,7 @@ mod tests {
 
         let parsed_payload = parse_tunnel_payload(&req[header_end + 4..]).unwrap();
         assert_eq!(parsed_payload.target, "example.com:443");
+        assert_eq!(parsed_payload.transport, TunnelTransport::Tcp);
     }
 
     #[test]
@@ -369,6 +381,7 @@ mod tests {
         };
         let payload = TunnelPayload {
             target: "example.com:443".to_owned(),
+            transport: TunnelTransport::Tcp,
             timestamp: proof.timestamp,
             nonce: proof.nonce,
             signature: proof.signature,
@@ -385,6 +398,15 @@ mod tests {
             .unwrap();
         assert_eq!(parsed.content_length, Some(req.len() - (header_end + 4)));
         assert!(!parsed.chunked);
+    }
+
+    #[test]
+    fn missing_transport_defaults_to_tcp() {
+        let payload = parse_tunnel_payload(
+            br#"{"target":"example.com:53","timestamp":1,"nonce":"n","signature":"s"}"#,
+        )
+        .unwrap();
+        assert_eq!(payload.transport, TunnelTransport::Tcp);
     }
 
     #[tokio::test]

@@ -128,6 +128,12 @@ daemon: true
 
 `daemon: true` is supported for `client`, `server`, and `tun`. If `tui: true` is also set, daemon mode automatically disables TUI.
 
+You can also pin the daemon pid file in YAML:
+
+```yaml
+pid_file: ./proxy.client.pid
+```
+
 You can also pin the local telemetry socket path in YAML:
 
 ```yaml
@@ -160,6 +166,28 @@ Notes:
 - `--daemon` is supported for `client`, `server`, and `tun`
 - if `tui: true` or `--tui` is also set, daemon mode automatically disables TUI
 - logs still go to `--log-file`, which defaults to `proxy.log`
+- daemon mode writes a pid file; by default it lives next to the log file as `proxy.<role>.pid`
+- you can override that path with `--pid-file` or `pid_file:` in YAML
+
+## Stop Daemon
+
+Once a daemon is running, you can stop it cleanly with:
+
+```bash
+cargo run -- stop client
+```
+
+or with an explicit pid file:
+
+```bash
+cargo run -- --pid-file ./proxy.client.pid stop
+```
+
+Notes:
+
+- `stop` sends `SIGTERM`, so `tun` mode still gets a chance to run its cleanup hooks
+- if the pid file is stale, `pipit stop` removes it and exits cleanly
+- if more than one default pid file exists, pass `stop client`, `stop server`, `stop tun`, or `--pid-file`
 
 ## Attach TUI
 
@@ -194,12 +222,26 @@ Example:
 sudo PIPIT_PASSWORD='replace-me' cargo run -- --config ./pipit.tun.yaml tun
 ```
 
+Before you touch the network, you can preview the exact helper and route commands with:
+
+```bash
+cargo run -- --config ./pipit.tun.yaml tun --dry-run
+```
+
+If you want to print the expanded helper and hook commands but still continue to run, use:
+
+```bash
+cargo run -- --config ./pipit.tun.yaml tun --print-hooks
+```
+
 The repository includes a starter template at [`pipit.tun.yaml`](./pipit.tun.yaml).
 
 Important notes:
 
 - `pipit` only uses standalone helpers now; if `tun.helper_cmd` is omitted, it looks for `PIPIT_TUN_HELPER`, then `tun2socks` from `PATH`
 - on macOS, the simplest path is usually to install a standalone `tun2socks` binary and let `pipit` discover it from `PATH`
+- if `tun.device` or `--device` is omitted, `pipit` now auto-picks the first free TUN device; on macOS it scans upward from `utun233` to avoid colliding with lower-numbered VPN interfaces such as `utun5`
+- `pipit tun` keeps a small state file next to the log file so it can reject a second live tun instance and attempt stale cleanup on the next startup if the previous run crashed
 - on macOS, if `tun.up` / `tun.down` are omitted and the upstream server resolves to IPv4, `pipit` configures the TUN device as `198.18.0.1`, pins the upstream server IP to the original egress path, and installs the same split route family commonly used by tun2socks (`1.0.0.0/8`, `2.0.0.0/7`, ..., `128.0.0.0/1`, plus `198.18.0.0/15`)
 - the default route hooks need elevated privileges, so `sudo` is usually required
 - you can still override `tun.helper_cmd`, `tun.up`, and `tun.down` if you want a different helper or route policy

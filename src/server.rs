@@ -2,7 +2,7 @@ use crate::{
     auth::{AuthProof, ReplayProtector},
     http,
     mode::ProxyMode,
-    netlog, tls, traffic,
+    netlog, tls, traffic, udp,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -13,14 +13,15 @@ use reqwest::{
     },
 };
 use std::{
+    io::Cursor,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::PathBuf,
     sync::Arc,
     time::Duration,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpStream, UdpSocket},
     time::timeout,
 };
 use tokio_rustls::TlsAcceptor;
@@ -167,10 +168,10 @@ async fn handle_connection(
     if matches!(args.mode, ProxyMode::NativeHttp)
         && let Some(tunnel_head) = http::parse_tunnel_request_head(&head, &args.path)?
     {
-        if let Some(target) =
+        if let Some(tunnel) =
             authorize_tunnel_request(&mut stream, tunnel_head, &body_prefix, &args, &replay).await?
         {
-            if !args.allow_private_targets && is_private_literal_target(&target) {
+            if !args.allow_private_targets && is_private_literal_target(&tunnel.target) {
                 let response = http::build_error_response(
                     403,
                     "Forbidden",
@@ -180,51 +181,58 @@ async fn handle_connection(
                 return Ok(());
             }
 
-            let outbound = match timeout(
-                Duration::from_secs(args.connect_timeout_secs),
-                TcpStream::connect(&target),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(err)) => {
-                    let response =
-                        http::build_error_response(502, "Bad Gateway", &format!("{err}\n"));
-                    stream.write_all(&response).await?;
-                    return Ok(());
-                }
-                Err(_) => {
-                    let response = http::build_error_response(
-                        504,
-                        "Gateway Timeout",
-                        "upstream connect timed out\n",
+            match tunnel.transport {
+                http::TunnelTransport::Tcp => {
+                    let outbound = match timeout(
+                        Duration::from_secs(args.connect_timeout_secs),
+                        TcpStream::connect(&tunnel.target),
+                    )
+                    .await
+                    {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(err)) => {
+                            let response =
+                                http::build_error_response(502, "Bad Gateway", &format!("{err}\n"));
+                            stream.write_all(&response).await?;
+                            return Ok(());
+                        }
+                        Err(_) => {
+                            let response = http::build_error_response(
+                                504,
+                                "Gateway Timeout",
+                                "upstream connect timed out\n",
+                            );
+                            stream.write_all(&response).await?;
+                            return Ok(());
+                        }
+                    };
+                    outbound.set_nodelay(true)?;
+
+                    stream.write_all(&http::build_tunnel_established()).await?;
+                    let stats = traffic::relay_with_telemetry(
+                        stream,
+                        outbound,
+                        traffic::RelayLabels {
+                            target: tunnel.target.clone(),
+                            route: Some("remote".to_owned()),
+                            mode: Some("native-http".to_owned()),
+                        },
+                    )
+                    .await?;
+
+                    info!(
+                        peer = %peer,
+                        target = %tunnel.target,
+                        uploaded = stats.uploaded,
+                        downloaded = stats.downloaded,
+                        sampled = stats.sampled,
+                        "relay completed"
                     );
-                    stream.write_all(&response).await?;
-                    return Ok(());
                 }
-            };
-            outbound.set_nodelay(true)?;
-
-            stream.write_all(&http::build_tunnel_established()).await?;
-            let stats = traffic::relay_with_telemetry(
-                stream,
-                outbound,
-                traffic::RelayLabels {
-                    target: target.clone(),
-                    route: Some("remote".to_owned()),
-                    mode: Some("native-http".to_owned()),
-                },
-            )
-            .await?;
-
-            info!(
-                peer = %peer,
-                target = %target,
-                uploaded = stats.uploaded,
-                downloaded = stats.downloaded,
-                sampled = stats.sampled,
-                "relay completed"
-            );
+                http::TunnelTransport::Udp => {
+                    handle_udp_tunnel(stream, peer, &args, &tunnel.target).await?;
+                }
+            }
 
             return Ok(());
         }
@@ -284,7 +292,7 @@ async fn authorize_tunnel_request<S>(
     body_prefix: &[u8],
     args: &ServerArgs,
     replay: &ReplayProtector,
-) -> Result<Option<String>>
+) -> Result<Option<AuthorizedTunnel>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -315,7 +323,106 @@ where
         return Ok(None);
     }
 
-    Ok(Some(target))
+    Ok(Some(AuthorizedTunnel {
+        target,
+        transport: payload.transport,
+    }))
+}
+
+#[derive(Clone, Debug)]
+struct AuthorizedTunnel {
+    target: String,
+    transport: http::TunnelTransport,
+}
+
+async fn handle_udp_tunnel<S>(
+    mut stream: S,
+    peer: SocketAddr,
+    args: &ServerArgs,
+    target: &str,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let outbound = bind_udp_socket_for_target(target)
+        .await
+        .with_context(|| format!("failed to bind UDP socket for {target}"))?;
+    match timeout(
+        Duration::from_secs(args.connect_timeout_secs),
+        outbound.connect(target),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            let response = http::build_error_response(502, "Bad Gateway", &format!("{err}\n"));
+            stream.write_all(&response).await?;
+            return Ok(());
+        }
+        Err(_) => {
+            let response = http::build_error_response(
+                504,
+                "Gateway Timeout",
+                "upstream UDP connect timed out\n",
+            );
+            stream.write_all(&response).await?;
+            return Ok(());
+        }
+    }
+
+    stream.write_all(&http::build_tunnel_established()).await?;
+
+    let (reader, writer) = tokio::io::split(stream);
+    let mut reader = Cursor::new(Vec::new()).chain(reader);
+    let mut writer = writer;
+    let mut recv_buf = vec![0_u8; udp::MAX_UDP_FRAME_SIZE];
+
+    let client_to_upstream = async {
+        loop {
+            match udp::read_frame(&mut reader, udp::MAX_UDP_FRAME_SIZE).await {
+                Ok(payload) => {
+                    outbound
+                        .send(&payload)
+                        .await
+                        .with_context(|| format!("failed to send UDP payload to {target}"))?;
+                }
+                Err(err) if udp::is_eof(&err) => return Ok::<(), anyhow::Error>(()),
+                Err(err) => return Err(err.context("failed to read UDP tunnel frame")),
+            }
+        }
+    };
+
+    let upstream_to_client = async {
+        loop {
+            let n = outbound
+                .recv(&mut recv_buf)
+                .await
+                .with_context(|| format!("failed to receive UDP payload from {target}"))?;
+            udp::write_frame(&mut writer, &recv_buf[..n]).await?;
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), anyhow::Error>(())
+    };
+
+    tokio::select! {
+        result = client_to_upstream => result?,
+        result = upstream_to_client => result?,
+    }
+
+    info!(peer = %peer, target = %target, "UDP relay completed");
+    Ok(())
+}
+
+async fn bind_udp_socket_for_target(target: &str) -> Result<UdpSocket> {
+    let (host, _port) = tls::split_host_port(target)?;
+    let bind_addr = if host.parse::<Ipv6Addr>().is_ok() {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    };
+    UdpSocket::bind(bind_addr)
+        .await
+        .with_context(|| format!("failed to bind UDP socket for {target}"))
 }
 
 #[derive(Clone)]

@@ -5,6 +5,8 @@ const NOISY_PATTERNS: &[&str] = &[
     "Broken pipe (os error 32)",
     "Connection reset by peer (os error 54)",
     "Connection reset by peer (os error 104)",
+    "early eof",
+    "UDP ASSOCIATE is not supported yet",
 ];
 
 pub fn is_noisy_disconnect(err: &Error) -> bool {
@@ -36,5 +38,17 @@ mod tests {
     fn timeouts_stay_actionable() {
         let err = anyhow::anyhow!("direct connect timed out");
         assert!(!is_noisy_disconnect(&err));
+    }
+
+    #[test]
+    fn early_eof_is_treated_as_noise() {
+        let err = anyhow::anyhow!("early eof");
+        assert!(is_noisy_disconnect(&err));
+    }
+
+    #[test]
+    fn udp_associate_noise_is_downgraded() {
+        let err = anyhow::anyhow!("UDP ASSOCIATE is not supported yet");
+        assert!(is_noisy_disconnect(&err));
     }
 }
