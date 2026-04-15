@@ -266,7 +266,7 @@ async fn handle_connection(
     )
     .await
     {
-        Ok(Ok((head, _body_prefix))) => head,
+        Ok(Ok((head, body_prefix))) => (head, body_prefix),
         Ok(Err(err)) => {
             let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
             return Err(err).context("failed to read server response");
@@ -277,15 +277,34 @@ async fn handle_connection(
         }
     };
 
-    let (is_http1, status, reason) =
-        http::parse_tunnel_response(&response_head).context("invalid server response")?;
-    if !is_http1 {
+    let response =
+        http::parse_response_head(&response_head.0).context("invalid server response")?;
+    if !response.is_http1 {
         let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
         bail!("server returned an unsupported HTTP version");
     }
-    if status != 200 {
+    if response.status != 200 {
         let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
-        bail!("server refused tunnel with status {} {}", status, reason);
+        let detail = http::read_response_body_text(
+            &mut tunnel,
+            &response_head.1,
+            response.content_length,
+            args.max_header_size,
+        )
+        .await;
+        if let Some(detail) = detail {
+            bail!(
+                "server refused tunnel with status {} {}: {}",
+                response.status,
+                response.reason,
+                detail
+            );
+        }
+        bail!(
+            "server refused tunnel with status {} {}",
+            response.status,
+            response.reason
+        );
     }
 
     socks5::send_success(&mut inbound).await?;

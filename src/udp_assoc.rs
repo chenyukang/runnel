@@ -279,16 +279,31 @@ async fn create_remote_udp_session(
         Err(_) => bail!("server response timed out for UDP session"),
     };
 
-    let (is_http1, status, reason) = http::parse_tunnel_response(&response_head.0)
+    let response = http::parse_response_head(&response_head.0)
         .context("invalid server response for UDP session")?;
-    if !is_http1 {
+    if !response.is_http1 {
         bail!("server returned an unsupported HTTP version for UDP session");
     }
-    if status != 200 {
+    if response.status != 200 {
+        let detail = http::read_response_body_text(
+            &mut tunnel,
+            &response_head.1,
+            response.content_length,
+            args.max_header_size,
+        )
+        .await;
+        if let Some(detail) = detail {
+            bail!(
+                "server refused UDP tunnel with status {} {}: {}",
+                response.status,
+                response.reason,
+                detail
+            );
+        }
         bail!(
             "server refused UDP tunnel with status {} {}",
-            status,
-            reason
+            response.status,
+            response.reason
         );
     }
 

@@ -22,6 +22,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     client::{self, ClientArgs},
+    mode::ProxyMode,
     route::FilterMode,
     tls,
 };
@@ -240,7 +241,7 @@ impl Drop for TunStateGuard {
 }
 
 pub async fn run(mut args: TunArgs) -> Result<()> {
-    normalize_client_args_for_tun(&mut args.client);
+    normalize_client_args_for_tun(&mut args.client)?;
     args.validate_required()?;
     let context = CommandContext::from_args(&args).await?;
     let helper = effective_helper(&args, &context)?;
@@ -337,7 +338,24 @@ pub async fn run(mut args: TunArgs) -> Result<()> {
     result
 }
 
-fn normalize_client_args_for_tun(args: &mut ClientArgs) {
+fn normalize_client_args_for_tun(args: &mut ClientArgs) -> Result<()> {
+    let effective_mode = args.effective_mode()?;
+    if !matches!(effective_mode, ProxyMode::NativeHttp) {
+        bail!(
+            "tun mode currently requires client mode=native-http because DNS and other UDP traffic rely on SOCKS UDP ASSOCIATE; resolved mode was {effective_mode}. Use a tun-specific config such as ./pipit.tun.yaml or set client.mode: native-http"
+        );
+    }
+
+    if args.system_proxy || !args.system_proxy_services.is_empty() {
+        warn!(
+            requested_system_proxy = args.system_proxy,
+            requested_services = ?args.system_proxy_services,
+            "tun mode ignores client system proxy settings because traffic already flows through the TUN device"
+        );
+        args.system_proxy = false;
+        args.system_proxy_services.clear();
+    }
+
     if !matches!(args.filter, FilterMode::Proxy) {
         warn!(
             requested_filter = ?args.filter,
@@ -347,6 +365,8 @@ fn normalize_client_args_for_tun(args: &mut ClientArgs) {
         args.rule_file = None;
         args.cidr_file = None;
     }
+
+    Ok(())
 }
 
 impl TunArgs {
@@ -1394,11 +1414,100 @@ mod tests {
             system_proxy_services: Vec::new(),
         };
 
-        super::normalize_client_args_for_tun(&mut args);
+        super::normalize_client_args_for_tun(&mut args).expect("tun normalization succeeds");
 
         assert_eq!(args.filter, FilterMode::Proxy);
         assert!(args.rule_file.is_none());
         assert!(args.cidr_file.is_none());
+    }
+
+    #[test]
+    fn tun_mode_disables_system_proxy_settings() {
+        let mut args = ClientArgs {
+            listen: "127.0.0.1:1080".to_owned(),
+            server: TEST_SERVER_ENDPOINT.to_owned(),
+            server_name: Some("example.com".to_owned()),
+            ca_cert: None,
+            mode: ProxyMode::NativeHttp,
+            password: "secret".to_owned(),
+            path: "/connect".to_owned(),
+            mux_path: "/mux".to_owned(),
+            mux: false,
+            filter: FilterMode::Proxy,
+            rule_file: None,
+            cidr_file: None,
+            user_agent: "Mozilla/5.0".to_owned(),
+            handshake_timeout_secs: 10,
+            connect_timeout_secs: 10,
+            max_header_size: 8 * 1024,
+            system_proxy: true,
+            system_proxy_services: vec!["Wi-Fi".to_owned()],
+        };
+
+        super::normalize_client_args_for_tun(&mut args).expect("tun normalization succeeds");
+
+        assert!(!args.system_proxy);
+        assert!(args.system_proxy_services.is_empty());
+    }
+
+    #[test]
+    fn tun_mode_rejects_non_native_http_modes() {
+        let mut args = ClientArgs {
+            listen: "127.0.0.1:1080".to_owned(),
+            server: TEST_SERVER_ENDPOINT.to_owned(),
+            server_name: None,
+            ca_cert: None,
+            mode: ProxyMode::DazeAshe,
+            password: "secret".to_owned(),
+            path: "/connect".to_owned(),
+            mux_path: "/mux".to_owned(),
+            mux: false,
+            filter: FilterMode::Proxy,
+            rule_file: None,
+            cidr_file: None,
+            user_agent: "Mozilla/5.0".to_owned(),
+            handshake_timeout_secs: 10,
+            connect_timeout_secs: 10,
+            max_header_size: 8 * 1024,
+            system_proxy: false,
+            system_proxy_services: Vec::new(),
+        };
+
+        let err =
+            super::normalize_client_args_for_tun(&mut args).expect_err("tun should reject daze");
+        let message = err.to_string();
+        assert!(message.contains("client mode=native-http"), "{message}");
+        assert!(message.contains("daze-ashe"), "{message}");
+    }
+
+    #[test]
+    fn tun_mode_rejects_legacy_mux_flag() {
+        let mut args = ClientArgs {
+            listen: "127.0.0.1:1080".to_owned(),
+            server: TEST_SERVER_ENDPOINT.to_owned(),
+            server_name: Some("example.com".to_owned()),
+            ca_cert: None,
+            mode: ProxyMode::NativeHttp,
+            password: "secret".to_owned(),
+            path: "/connect".to_owned(),
+            mux_path: "/mux".to_owned(),
+            mux: true,
+            filter: FilterMode::Proxy,
+            rule_file: None,
+            cidr_file: None,
+            user_agent: "Mozilla/5.0".to_owned(),
+            handshake_timeout_secs: 10,
+            connect_timeout_secs: 10,
+            max_header_size: 8 * 1024,
+            system_proxy: false,
+            system_proxy_services: Vec::new(),
+        };
+
+        let err = super::normalize_client_args_for_tun(&mut args)
+            .expect_err("tun should reject native-mux via --mux");
+        let message = err.to_string();
+        assert!(message.contains("client mode=native-http"), "{message}");
+        assert!(message.contains("native-mux"), "{message}");
     }
 
     #[test]

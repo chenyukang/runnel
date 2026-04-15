@@ -17,6 +17,14 @@ pub struct TunnelRequestHead {
     pub chunked: bool,
 }
 
+#[derive(Debug)]
+pub struct HttpResponseHead {
+    pub is_http1: bool,
+    pub status: u16,
+    pub reason: String,
+    pub content_length: Option<usize>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TunnelTransport {
@@ -109,11 +117,14 @@ pub fn parse_request(bytes: &[u8]) -> Result<HttpRequest> {
 }
 
 pub fn parse_tunnel_response(bytes: &[u8]) -> Result<(bool, u16, String)> {
+    let head = parse_response_head(bytes)?;
+    Ok((head.is_http1, head.status, head.reason))
+}
+
+pub fn parse_response_head(bytes: &[u8]) -> Result<HttpResponseHead> {
     let text = std::str::from_utf8(bytes).context("response is not valid UTF-8")?;
-    let start = text
-        .split_once("\r\n")
-        .map(|(line, _)| line)
-        .unwrap_or(text);
+    let mut lines = text.split("\r\n");
+    let start = lines.next().context("missing response status line")?;
     let mut parts = start.split_whitespace();
 
     let version = parts.next().context("missing response version")?;
@@ -123,7 +134,41 @@ pub fn parse_tunnel_response(bytes: &[u8]) -> Result<(bool, u16, String)> {
         .parse::<u16>()
         .context("invalid response status")?;
     let reason = parts.collect::<Vec<_>>().join(" ");
-    Ok((version.starts_with("HTTP/1."), status, reason))
+    let headers = parse_headers(lines)?;
+    let content_length = headers
+        .get("content-length")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .context("invalid content-length header")
+        })
+        .transpose()?;
+
+    Ok(HttpResponseHead {
+        is_http1: version.starts_with("HTTP/1."),
+        status,
+        reason,
+        content_length,
+    })
+}
+
+pub async fn read_response_body_text<R>(
+    reader: &mut R,
+    prefix: &[u8],
+    content_length: Option<usize>,
+    max_bytes: usize,
+) -> Option<String>
+where
+    R: AsyncRead + Unpin,
+{
+    let length = content_length?;
+    if length == 0 || length > max_bytes {
+        return None;
+    }
+
+    let body = read_body(reader, prefix, length, max_bytes).await.ok()?;
+    let text = String::from_utf8_lossy(&body).trim().to_owned();
+    if text.is_empty() { None } else { Some(text) }
 }
 
 pub fn parse_tunnel_request_head(bytes: &[u8], path: &str) -> Result<Option<TunnelRequestHead>> {
@@ -401,6 +446,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_head_reads_status_and_content_length() {
+        let response =
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 16\r\nConnection: close\r\n\r\n";
+        let parsed = parse_response_head(response).unwrap();
+        assert!(parsed.is_http1);
+        assert_eq!(parsed.status, 502);
+        assert_eq!(parsed.reason, "Bad Gateway");
+        assert_eq!(parsed.content_length, Some(16));
+    }
+
+    #[test]
     fn missing_transport_defaults_to_tcp() {
         let payload = parse_tunnel_payload(
             br#"{"target":"example.com:53","timestamp":1,"nonce":"n","signature":"s"}"#,
@@ -425,5 +481,19 @@ mod tests {
         assert_eq!(prefix, b"hello");
         let body = read_body(&mut reader, &prefix, 5, 16).await.unwrap();
         assert_eq!(body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn read_response_body_text_trims_text_payload() {
+        let (mut writer, mut reader) = duplex(128);
+        let frame = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 14\r\n\r\nno route host\n";
+
+        writer.write_all(frame).await.unwrap();
+        drop(writer);
+
+        let (head, prefix) = read_head(&mut reader, 64).await.unwrap();
+        let parsed = parse_response_head(&head).unwrap();
+        let body = read_response_body_text(&mut reader, &prefix, parsed.content_length, 64).await;
+        assert_eq!(body.as_deref(), Some("no route host"));
     }
 }

@@ -194,6 +194,8 @@ By default, `pipit tui` looks for an existing `client`, `server`, or `tun` socke
 
 `pipit tun` is the VPN-style entry point. It runs the normal `pipit client` internally, feeds TUN traffic through embedded `tun2proxy`, and keeps route setup, logging, daemon mode, and TUI attach inside the same `pipit` process.
 
+Use a tun-specific config such as [`pipit.tun.yaml`](./pipit.tun.yaml). `tun` currently requires `client.mode: native-http`; it does not support inheriting `native-mux`, `daze-*`, or `system_proxy` settings from a standalone SOCKS client config.
+
 Example:
 
 ```bash
@@ -229,6 +231,8 @@ Notes:
 - `pipit tun` keeps a small state file next to the log file so it can reject a second live tun instance and attempt stale cleanup after crashes
 - on macOS, if `tun.up` / `tun.down` are omitted and the upstream server resolves to IPv4, `pipit` configures the TUN device as `198.18.0.1`, pins the upstream server IP to the original egress path, and installs the standard split-route set (`1.0.0.0/8`, `2.0.0.0/7`, ..., `128.0.0.0/1`, plus `198.18.0.0/15`)
 - `tun` forces the embedded client to use `filter: proxy`; `direct` or `rule` decisions can recurse traffic back into the TUN split routes unless you build explicit bypass routes
+- `tun` currently requires `client.mode: native-http` because embedded DNS and other UDP traffic depend on SOCKS `UDP ASSOCIATE`; `native-mux` and `daze-*` modes are rejected at startup
+- `tun` ignores `client.system_proxy` and `client.system_proxy_services`; the TUN device already captures traffic without flipping the OS SOCKS proxy
 - the default route hooks usually need elevated privileges, so `sudo` is typical
 - if you want tun2proxy-managed features such as custom DNS, `--setup`, or `--bypass`, override `tun.helper_cmd`
 - `tun.helper_cmd`, `tun.up`, and `tun.down` are still fully overrideable
