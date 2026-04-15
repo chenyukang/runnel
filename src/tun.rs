@@ -307,6 +307,7 @@ pub async fn run(mut args: TunArgs) -> Result<()> {
     normalize_client_args_for_tun(&mut args.client)?;
     args.validate_required()?;
     let context = CommandContext::from_args(&args).await?;
+    apply_client_tun_dns_override(&mut args.client, &context);
     let helper = effective_helper(&args, &context)?;
     let up_hooks = effective_up_hooks(&args, &context)?;
     let down_hooks = effective_down_hooks(&args, &context)?;
@@ -415,6 +416,14 @@ pub async fn run(mut args: TunArgs) -> Result<()> {
     .await;
     tun_state.clear();
     result
+}
+
+fn apply_client_tun_dns_override(args: &mut ClientArgs, context: &CommandContext) {
+    args.tun_dns_upstream = context
+        .dns_upstream
+        .as_ref()
+        .map(|dns| SocketAddr::new(dns.upstream_ip, dns.upstream_port));
+    args.tun_dns_redirect_ip = context.dns_redirect_ip().and_then(|ip| ip.parse().ok());
 }
 
 fn normalize_client_args_for_tun(args: &mut ClientArgs) -> Result<()> {
@@ -1623,6 +1632,8 @@ mod tests {
             max_header_size: 8 * 1024,
             system_proxy: false,
             system_proxy_services: Vec::new(),
+            tun_dns_redirect_ip: None,
+            tun_dns_upstream: None,
         };
 
         super::normalize_client_args_for_tun(&mut args).expect("tun normalization succeeds");
@@ -1653,6 +1664,8 @@ mod tests {
             max_header_size: 8 * 1024,
             system_proxy: true,
             system_proxy_services: vec!["Wi-Fi".to_owned()],
+            tun_dns_redirect_ip: None,
+            tun_dns_upstream: None,
         };
 
         super::normalize_client_args_for_tun(&mut args).expect("tun normalization succeeds");
@@ -1682,6 +1695,8 @@ mod tests {
             max_header_size: 8 * 1024,
             system_proxy: false,
             system_proxy_services: Vec::new(),
+            tun_dns_redirect_ip: None,
+            tun_dns_upstream: None,
         };
 
         let err =
@@ -1712,6 +1727,8 @@ mod tests {
             max_header_size: 8 * 1024,
             system_proxy: false,
             system_proxy_services: Vec::new(),
+            tun_dns_redirect_ip: None,
+            tun_dns_upstream: None,
         };
 
         let err = super::normalize_client_args_for_tun(&mut args)
@@ -1743,6 +1760,8 @@ mod tests {
                 max_header_size: 8192,
                 system_proxy: false,
                 system_proxy_services: Vec::new(),
+                tun_dns_redirect_ip: None,
+                tun_dns_upstream: None,
             },
             device: "utun233".to_owned(),
             shell: "/bin/sh".to_owned(),

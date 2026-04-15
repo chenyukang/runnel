@@ -152,6 +152,8 @@ async fn start_client(
         max_header_size: 16 * 1024,
         system_proxy: false,
         system_proxy_services: Vec::new(),
+        tun_dns_redirect_ip: None,
+        tun_dns_upstream: None,
     };
 
     let client_handle = tokio::spawn(async move {

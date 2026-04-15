@@ -40,6 +40,11 @@ struct TestEnv {
     key_path: Option<PathBuf>,
 }
 
+struct LocalClientEnv {
+    _echo_handle: JoinHandle<()>,
+    _client_handle: JoinHandle<()>,
+}
+
 impl Drop for TestEnv {
     fn drop(&mut self) {
         self._target_handle.abort();
@@ -51,6 +56,13 @@ impl Drop for TestEnv {
         if let Some(path) = &self.key_path {
             let _ = fs::remove_file(path);
         }
+    }
+}
+
+impl Drop for LocalClientEnv {
+    fn drop(&mut self) {
+        self._echo_handle.abort();
+        self._client_handle.abort();
     }
 }
 
@@ -73,6 +85,66 @@ async fn native_http_mode_udp_associate_round_trip_works() {
     .unwrap()
     .unwrap();
     assert_eq!(response, b"hello over udp");
+}
+
+#[tokio::test]
+async fn native_http_mode_tun_dns_tcp_override_relays_locally() {
+    let _guard = test_lock().lock().await;
+    init_test_tracing();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let upstream_port = free_port().unwrap();
+    let socks_port = free_port().unwrap();
+    let server_port = free_port().unwrap();
+
+    let echo_handle = tokio::spawn(run_tcp_echo_target(upstream_port));
+    let client_args = ClientArgs {
+        listen: format!("127.0.0.1:{socks_port}"),
+        server: format!("127.0.0.1:{server_port}"),
+        server_name: None,
+        ca_cert: None,
+        mode: ProxyMode::NativeHttp,
+        password: "hello-world".to_owned(),
+        path: "/connect".to_owned(),
+        mux_path: "/mux".to_owned(),
+        mux: false,
+        filter: FilterMode::Proxy,
+        rule_file: None,
+        cidr_file: None,
+        user_agent: "pipit-test".to_owned(),
+        handshake_timeout_secs: 10,
+        connect_timeout_secs: 1,
+        max_header_size: 16 * 1024,
+        system_proxy: false,
+        system_proxy_services: Vec::new(),
+        tun_dns_redirect_ip: Some(Ipv4Addr::new(198, 18, 0, 1).into()),
+        tun_dns_upstream: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, upstream_port))),
+    };
+
+    let client_handle = tokio::spawn(async move {
+        let _ = client::run(client_args).await;
+    });
+    let _env = LocalClientEnv {
+        _echo_handle: echo_handle,
+        _client_handle: client_handle,
+    };
+    wait_for_tcp_listener(socks_port).await.unwrap();
+
+    let payload = b"\x00\x05hello";
+    let response = timeout(
+        Duration::from_secs(5),
+        exchange_tcp_via_socks_target(
+            socks_port,
+            socks5::TargetAddr::Ip(Ipv4Addr::new(198, 18, 0, 1).into(), 53),
+            payload,
+        ),
+    )
+    .await
+    .context("timed out waiting for tun DNS TCP override round trip")
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(response, payload);
 }
 
 #[tokio::test]
@@ -203,6 +275,8 @@ async fn start_env(mode: ProxyMode) -> Result<TestEnv> {
         max_header_size: 16 * 1024,
         system_proxy: false,
         system_proxy_services: Vec::new(),
+        tun_dns_redirect_ip: None,
+        tun_dns_upstream: None,
     };
 
     let server_handle = tokio::spawn(async move {
@@ -286,6 +360,30 @@ async fn run_udp_target(port: u16) {
     }
 }
 
+async fn run_tcp_echo_target(port: u16) {
+    let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+    loop {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0_u8; 4096];
+            loop {
+                match socket.read(&mut buf).await {
+                    Ok(0) => {
+                        let _ = socket.shutdown().await;
+                        return;
+                    }
+                    Ok(n) => {
+                        if socket.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+    }
+}
+
 async fn fetch_via_socks_path(socks_port: u16, target_port: u16, path: &str) -> Result<Vec<u8>> {
     let mut stream = TcpStream::connect(("127.0.0.1", socks_port))
         .await
@@ -310,6 +408,48 @@ async fn fetch_via_socks_path(socks_port: u16, target_port: u16, path: &str) -> 
 
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await?;
+    Ok(response)
+}
+
+async fn exchange_tcp_via_socks_target(
+    socks_port: u16,
+    target: socks5::TargetAddr,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let mut stream = TcpStream::connect(("127.0.0.1", socks_port))
+        .await
+        .context("failed to connect to local SOCKS listener")?;
+
+    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut method_reply = [0_u8; 2];
+    stream.read_exact(&mut method_reply).await?;
+    anyhow::ensure!(method_reply == [0x05, 0x00], "unexpected SOCKS auth reply");
+
+    let mut connect = vec![0x05, 0x01, 0x00];
+    match &target {
+        socks5::TargetAddr::Ip(std::net::IpAddr::V4(addr), port) => {
+            connect.push(0x01);
+            connect.extend_from_slice(&addr.octets());
+            connect.extend_from_slice(&port.to_be_bytes());
+        }
+        socks5::TargetAddr::Domain(host, port) => {
+            connect.push(0x03);
+            connect.push(host.len() as u8);
+            connect.extend_from_slice(host.as_bytes());
+            connect.extend_from_slice(&port.to_be_bytes());
+        }
+        socks5::TargetAddr::Ip(std::net::IpAddr::V6(addr), port) => {
+            connect.push(0x04);
+            connect.extend_from_slice(&addr.octets());
+            connect.extend_from_slice(&port.to_be_bytes());
+        }
+    }
+    stream.write_all(&connect).await?;
+    let _ = read_socks_reply_addr(&mut stream).await?;
+
+    stream.write_all(payload).await?;
+    let mut response = vec![0_u8; payload.len()];
+    stream.read_exact(&mut response).await?;
     Ok(response)
 }
 

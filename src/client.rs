@@ -4,7 +4,12 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
@@ -12,6 +17,8 @@ use tokio::{
 };
 use tokio_rustls::TlsConnector;
 use tracing::{info, warn};
+
+const TUN_DNS_PORT: u16 = 53;
 
 #[derive(Clone, Debug, Args)]
 pub struct ClientArgs {
@@ -53,6 +60,10 @@ pub struct ClientArgs {
     pub system_proxy: bool,
     #[arg(long = "system-proxy-service")]
     pub system_proxy_services: Vec<String>,
+    #[arg(skip)]
+    pub tun_dns_redirect_ip: Option<IpAddr>,
+    #[arg(skip)]
+    pub tun_dns_upstream: Option<SocketAddr>,
 }
 
 pub async fn run(args: ClientArgs) -> Result<()> {
@@ -162,6 +173,17 @@ impl ClientArgs {
         }
         Ok(())
     }
+
+    fn tun_dns_tcp_upstream(&self, target: &socks5::TargetAddr) -> Option<SocketAddr> {
+        let redirect_ip = self.tun_dns_redirect_ip?;
+        let upstream = self.tun_dns_upstream?;
+        match target {
+            socks5::TargetAddr::Ip(ip, port) if *ip == redirect_ip && *port == TUN_DNS_PORT => {
+                Some(upstream)
+            }
+            _ => None,
+        }
+    }
 }
 
 async fn handle_connection(
@@ -201,6 +223,45 @@ async fn handle_connection(
         }
     };
     let target_string = target.to_string();
+    if let Some(dns_upstream) = args.tun_dns_tcp_upstream(&target) {
+        let outbound = match timeout(
+            Duration::from_secs(args.connect_timeout_secs),
+            TcpStream::connect(dns_upstream),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) => {
+                let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
+                return Err(err).with_context(|| {
+                    format!("failed to connect tun DNS upstream {}", dns_upstream)
+                });
+            }
+            Err(_) => {
+                let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
+                bail!("tun DNS upstream {} connect timed out", dns_upstream);
+            }
+        };
+        let stats = relay_preconnected_socks(
+            inbound,
+            outbound,
+            target_string.clone(),
+            "direct",
+            Some("native-http"),
+        )
+        .await
+        .context("tun DNS direct relay failed")?;
+        info!(
+            peer = %peer,
+            target = %stats.display_target,
+            upstream = %dns_upstream,
+            uploaded = stats.uploaded,
+            downloaded = stats.downloaded,
+            sampled = stats.sampled,
+            "client tun DNS relay completed"
+        );
+        return Ok(());
+    }
 
     match router.decide(&target).await? {
         RouteDecision::Direct => {
@@ -329,6 +390,30 @@ async fn handle_connection(
     );
 
     Ok(())
+}
+
+async fn relay_preconnected_socks(
+    mut inbound: TcpStream,
+    outbound: TcpStream,
+    target: String,
+    route: &str,
+    mode: Option<&str>,
+) -> Result<traffic::RelayStats> {
+    outbound.set_nodelay(true)?;
+    socks5::send_success(&mut inbound)
+        .await
+        .context("failed to send SOCKS success reply")?;
+    traffic::relay_with_telemetry(
+        inbound,
+        outbound,
+        traffic::RelayLabels {
+            target,
+            route: Some(route.to_owned()),
+            mode: mode.map(str::to_owned),
+        },
+    )
+    .await
+    .with_context(|| format!("{route} relay failed"))
 }
 
 async fn wait_for_shutdown_signal() -> Result<()> {

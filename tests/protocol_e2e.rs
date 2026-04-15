@@ -182,6 +182,8 @@ async fn native_http_mode_rejects_private_literal_targets_by_default() -> Result
         max_header_size: 16 * 1024,
         system_proxy: false,
         system_proxy_services: Vec::new(),
+        tun_dns_redirect_ip: None,
+        tun_dns_upstream: None,
     };
 
     let _env = start_server(
