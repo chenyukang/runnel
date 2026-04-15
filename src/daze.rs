@@ -1,6 +1,6 @@
 use crate::{
     client::ClientArgs, http, mode::ProxyMode, netlog, route, route::RouteDecision,
-    server::ServerArgs, socks5,
+    server::ServerArgs, socks5, telemetry, traffic,
 };
 use anyhow::{Context, Result, bail};
 use md5::Context as Md5Context;
@@ -12,14 +12,18 @@ use reqwest::{
 };
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::watch,
     time::timeout,
+    time::{MissedTickBehavior, interval},
 };
 use tracing::{info, warn};
 
@@ -142,9 +146,28 @@ async fn handle_client_connection(
         client_establish_ashe(&mut upstream, &args.password, &target_string).await?;
 
     socks5::send_success(&mut inbound).await?;
-    relay_rc4(inbound, upstream, upload, download).await?;
+    let stats = relay_rc4(
+        inbound,
+        upstream,
+        upload,
+        download,
+        traffic::RelayLabels {
+            target: target_string.clone(),
+            route: Some("remote".to_owned()),
+            mode: Some("daze-ashe".to_owned()),
+        },
+    )
+    .await?;
 
-    info!(peer = %peer, target = %target_string, mode = "daze-ashe", "relay completed");
+    info!(
+        peer = %peer,
+        target = %stats.display_target,
+        uploaded = stats.uploaded,
+        downloaded = stats.downloaded,
+        sampled = stats.sampled,
+        mode = "daze-ashe",
+        "relay completed"
+    );
     Ok(())
 }
 
@@ -170,9 +193,28 @@ async fn handle_server_connection(
     upload.apply_keystream(&mut code);
     inbound.write_all(&code).await?;
 
-    relay_rc4(inbound, outbound, download, upload).await?;
+    let stats = relay_rc4(
+        inbound,
+        outbound,
+        download,
+        upload,
+        traffic::RelayLabels {
+            target: target.clone(),
+            route: Some("remote".to_owned()),
+            mode: Some("daze-ashe".to_owned()),
+        },
+    )
+    .await?;
 
-    info!(peer = %peer, target = %target, mode = "daze-ashe", "relay completed");
+    info!(
+        peer = %peer,
+        target = %stats.display_target,
+        uploaded = stats.uploaded,
+        downloaded = stats.downloaded,
+        sampled = stats.sampled,
+        mode = "daze-ashe",
+        "relay completed"
+    );
     Ok(())
 }
 
@@ -306,9 +348,28 @@ async fn handle_baboon_client_connection(
         client_establish_ashe(&mut upstream, &args.password, &target_string).await?;
 
     socks5::send_success(&mut inbound).await?;
-    relay_rc4(inbound, upstream, upload, download).await?;
+    let stats = relay_rc4(
+        inbound,
+        upstream,
+        upload,
+        download,
+        traffic::RelayLabels {
+            target: target_string.clone(),
+            route: Some("remote".to_owned()),
+            mode: Some("daze-baboon".to_owned()),
+        },
+    )
+    .await?;
 
-    info!(peer = %peer, target = %target_string, mode = "daze-baboon", "relay completed");
+    info!(
+        peer = %peer,
+        target = %stats.display_target,
+        uploaded = stats.uploaded,
+        downloaded = stats.downloaded,
+        sampled = stats.sampled,
+        mode = "daze-baboon",
+        "relay completed"
+    );
     Ok(())
 }
 
@@ -360,8 +421,27 @@ async fn handle_baboon_server_connection(
         upload.apply_keystream(&mut code);
         inbound.write_all(&code).await?;
 
-        relay_rc4(inbound, outbound, download, upload).await?;
-        info!(peer = %peer, target = %target, mode = "daze-baboon", "relay completed");
+        let stats = relay_rc4(
+            inbound,
+            outbound,
+            download,
+            upload,
+            traffic::RelayLabels {
+                target: target.clone(),
+                route: Some("remote".to_owned()),
+                mode: Some("daze-baboon".to_owned()),
+            },
+        )
+        .await?;
+        info!(
+            peer = %peer,
+            target = %stats.display_target,
+            uploaded = stats.uploaded,
+            downloaded = stats.downloaded,
+            sampled = stats.sampled,
+            mode = "daze-baboon",
+            "relay completed"
+        );
         return Ok(());
     }
 
@@ -643,13 +723,30 @@ pub(crate) async fn relay_rc4<A, B>(
     outbound: B,
     mut upload_cipher: Rc4State,
     mut download_cipher: Rc4State,
-) -> Result<()>
+    labels: traffic::RelayLabels,
+) -> Result<traffic::RelayStats>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut inbound_reader, mut inbound_writer) = tokio::io::split(inbound);
     let (mut outbound_reader, mut outbound_writer) = tokio::io::split(outbound);
+    let uploaded = Arc::new(AtomicU64::new(0));
+    let downloaded = Arc::new(AtomicU64::new(0));
+    let sampled = Arc::new(AtomicBool::new(false));
+    let sampler = if telemetry::has_live_subscribers() {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(sample_rc4_traffic(
+            labels.clone(),
+            uploaded.clone(),
+            downloaded.clone(),
+            sampled.clone(),
+            stop_rx,
+        ));
+        Some((stop_tx, task))
+    } else {
+        None
+    };
 
     let uplink = async {
         let mut buf = vec![0_u8; 32 * 1024];
@@ -663,6 +760,7 @@ where
             let mut chunk = buf[..n].to_vec();
             upload_cipher.apply_keystream(&mut chunk);
             outbound_writer.write_all(&chunk).await?;
+            uploaded.fetch_add(n as u64, Ordering::Relaxed);
         }
     };
 
@@ -678,13 +776,103 @@ where
             let mut chunk = buf[..n].to_vec();
             download_cipher.apply_keystream(&mut chunk);
             inbound_writer.write_all(&chunk).await?;
+            downloaded.fetch_add(n as u64, Ordering::Relaxed);
         }
     };
 
-    tokio::select! {
+    let relay = tokio::select! {
         res = uplink => res,
         res = downlink => res,
+    };
+
+    if let Some((stop_tx, task)) = sampler {
+        let _ = stop_tx.send(true);
+        let _ = task.await;
     }
+
+    relay?;
+
+    Ok(traffic::RelayStats {
+        uploaded: uploaded.load(Ordering::Relaxed),
+        downloaded: downloaded.load(Ordering::Relaxed),
+        sampled: sampled.load(Ordering::Relaxed),
+        display_target: labels.target,
+    })
+}
+
+async fn sample_rc4_traffic(
+    labels: traffic::RelayLabels,
+    uploaded: Arc<AtomicU64>,
+    downloaded: Arc<AtomicU64>,
+    sampled: Arc<AtomicBool>,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    let mut last_uploaded = 0_u64;
+    let mut last_downloaded = 0_u64;
+    let mut ticker = interval(Duration::from_secs(1));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                emit_rc4_delta(
+                    &labels,
+                    &uploaded,
+                    &downloaded,
+                    &sampled,
+                    &mut last_uploaded,
+                    &mut last_downloaded,
+                );
+            }
+            changed = stop_rx.changed() => {
+                if changed.is_ok() && *stop_rx.borrow() {
+                    emit_rc4_delta(
+                        &labels,
+                        &uploaded,
+                        &downloaded,
+                        &sampled,
+                        &mut last_uploaded,
+                        &mut last_downloaded,
+                    );
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn emit_rc4_delta(
+    labels: &traffic::RelayLabels,
+    uploaded: &AtomicU64,
+    downloaded: &AtomicU64,
+    sampled: &AtomicBool,
+    last_uploaded: &mut u64,
+    last_downloaded: &mut u64,
+) {
+    let current_uploaded = uploaded.load(Ordering::Relaxed);
+    let current_downloaded = downloaded.load(Ordering::Relaxed);
+    let delta_uploaded = current_uploaded.saturating_sub(*last_uploaded);
+    let delta_downloaded = current_downloaded.saturating_sub(*last_downloaded);
+
+    *last_uploaded = current_uploaded;
+    *last_downloaded = current_downloaded;
+
+    if (delta_uploaded == 0 && delta_downloaded == 0) || !telemetry::has_live_subscribers() {
+        return;
+    }
+
+    sampled.store(true, Ordering::Relaxed);
+    let mut fields = BTreeMap::new();
+    fields.insert("target".to_owned(), labels.target.clone());
+    fields.insert("uploaded".to_owned(), delta_uploaded.to_string());
+    fields.insert("downloaded".to_owned(), delta_downloaded.to_string());
+    if let Some(route) = &labels.route {
+        fields.insert("route".to_owned(), route.clone());
+    }
+    if let Some(mode) = &labels.mode {
+        fields.insert("mode".to_owned(), mode.clone());
+    }
+    telemetry::emit("INFO", "traffic sample", fields);
 }
 
 fn salt(password: &str) -> [u8; 32] {

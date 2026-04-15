@@ -4,7 +4,7 @@ use crate::{
     netlog, route,
     route::RouteDecision,
     server::ServerArgs,
-    socks5,
+    socks5, traffic,
 };
 use anyhow::{Context, Result, bail};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
@@ -257,9 +257,28 @@ async fn handle_client_connection(
         client_establish_ashe(&mut upstream, &client.password, &target_string).await?;
 
     socks5::send_success(&mut inbound).await?;
-    relay_rc4(inbound, upstream, upload, download).await?;
+    let stats = relay_rc4(
+        inbound,
+        upstream,
+        upload,
+        download,
+        traffic::RelayLabels {
+            target: target_string.clone(),
+            route: Some("remote".to_owned()),
+            mode: Some("daze-czar".to_owned()),
+        },
+    )
+    .await?;
 
-    info!(peer = %peer, target = %target_string, mode = "daze-czar", "relay completed");
+    info!(
+        peer = %peer,
+        target = %stats.display_target,
+        uploaded = stats.uploaded,
+        downloaded = stats.downloaded,
+        sampled = stats.sampled,
+        mode = "daze-czar",
+        "relay completed"
+    );
     Ok(())
 }
 
@@ -317,9 +336,27 @@ async fn handle_server_stream(mut inbound: DuplexStream, args: ServerArgs) -> Re
     upload.apply_keystream(&mut code);
     inbound.write_all(&code).await?;
 
-    relay_rc4(inbound, outbound, download, upload).await?;
+    let stats = relay_rc4(
+        inbound,
+        outbound,
+        download,
+        upload,
+        traffic::RelayLabels {
+            target: target.clone(),
+            route: Some("remote".to_owned()),
+            mode: Some("daze-czar".to_owned()),
+        },
+    )
+    .await?;
 
-    info!(target = %target, mode = "daze-czar", "relay completed");
+    info!(
+        target = %stats.display_target,
+        uploaded = stats.uploaded,
+        downloaded = stats.downloaded,
+        sampled = stats.sampled,
+        mode = "daze-czar",
+        "relay completed"
+    );
     Ok(())
 }
 

@@ -1,38 +1,23 @@
 # Pipit
 
-Pipit is a compact Rust proxy built around a simple idea:
+Pipit is a compact Rust proxy that keeps the moving parts small:
 
 - local `SOCKS5` on the client side
-- selectable transport modes
-- a TLS tunnel to the server for native modes
-- an HTTP-like handshake inside TLS for native modes
-- a shared-secret HMAC proof to avoid exposing an unauthenticated open proxy
+- selectable native TLS or daze-style transport modes
+- HTTP-looking handshakes for the native modes
+- shared-secret HMAC authentication so the server is not an unauthenticated open proxy
+- optional config, daemon, TUI, and TUN workflows in the same binary
 
-The design is inspired by lightweight remote proxies such as [daze](https://github.com/libraries/daze), but this first version intentionally keeps the protocol small and the defaults conservative.
+The design is inspired by lightweight remote proxies such as [daze](https://github.com/libraries/daze), but the scope stays intentionally conservative: TCP only, SOCKS5 `CONNECT` only, no traffic shaping, and no full userspace IP stack.
 
-## Goals
-
-- simple enough to audit
-- stable enough to run as a small personal tunnel
-- harder to fingerprint than a naked custom binary protocol
-- safe by default
-
-## What It Does Today
+## Feature Snapshot
 
 - `pipit client` exposes a local SOCKS5 proxy
-- `pipit server` accepts either TLS-native or daze-style connections depending on `--mode`
-- the tunnel request looks like normal HTTP over TLS instead of a bespoke plaintext protocol
-- the hidden tunnel handshake looks like a small JSON API call instead of custom proxy headers
-- an optional multiplexed mode can reuse one TLS session for many local SOCKS connections
-- optional client-side proxy control can decide per target whether to connect directly, proxy remotely, or block it
-- an optional `daze-ashe` mode speaks a daze-style RC4 stream protocol over raw TCP
-- an optional `daze-baboon` mode wraps the daze handshake in an HTTP-looking `/sync` exchange
-- an optional `daze-czar` mode multiplexes many daze-ashe streams over one raw TCP session
-- the server rejects replayed authentication proofs
-- the server denies literal private IP targets by default
-- the server can proxy unmatched requests to a real upstream website
-- unmatched requests default to `https://www.qq.com`
+- `pipit server` accepts `native-http`, `native-mux`, `daze-ashe`, `daze-baboon`, or `daze-czar`
+- `pipit tun` routes TUN traffic through the normal client path with embedded `tun2proxy`
 - `pipit cert` generates a self-signed certificate for quick setup
+- proxy control can decide per target whether to connect directly, proxy remotely, or block it
+- replay protection and private-target blocking are enabled by default
 
 ## Quick Start
 
@@ -205,16 +190,9 @@ cargo run -- --config ./pipit.client.yaml tui
 
 By default, `pipit tui` looks for an existing `client`, `server`, or `tun` socket derived from `--log-file`.
 
-## Experimental Tun Mode
+## Tun Mode
 
-`pipit tun` is the first step toward a VPN-style setup that does not rely on the system SOCKS proxy.
-
-This mode does not yet embed a full userspace IP stack. Instead, it:
-
-- runs the normal `pipit client` internally as a local SOCKS endpoint
-- starts an external TUN helper command
-- runs optional `up` and `down` shell hooks so you can add or remove routes
-- keeps everything under one `pipit` process, so daemon mode, logging, and TUI attach still work
+`pipit tun` is the VPN-style entry point. It runs the normal `pipit client` internally, feeds TUN traffic through embedded `tun2proxy`, and keeps route setup, logging, daemon mode, and TUI attach inside the same `pipit` process.
 
 Example:
 
@@ -244,17 +222,16 @@ sudo ./scripts/pipit-tun.sh reset
 sudo ./scripts/pipit-tun.sh reset --dry-run
 ```
 
-Important notes:
+Notes:
 
-- `pipit tun` now embeds `tun2proxy` by default, so the normal path no longer needs a separate helper binary in `PATH`
-- if you still want an external helper process, set `tun.helper_cmd` explicitly or point `PIPIT_TUN_HELPER` at a standalone helper binary
-- if `tun.device` or `--device` is omitted, `pipit` now auto-picks the first free TUN device; on macOS it scans upward from `utun233` to avoid colliding with lower-numbered VPN interfaces such as `utun5`
-- `pipit tun` keeps a small state file next to the log file so it can reject a second live tun instance and attempt stale cleanup on the next startup if the previous run crashed
-- on macOS, if `tun.up` / `tun.down` are omitted and the upstream server resolves to IPv4, `pipit` configures the TUN device as `198.18.0.1`, pins the upstream server IP to the original egress path, and installs the same split route family commonly used by tun2proxy/tun2socks (`1.0.0.0/8`, `2.0.0.0/7`, ..., `128.0.0.0/1`, plus `198.18.0.0/15`)
-- `tun` currently forces the embedded client to use `filter: proxy`; `direct` or `rule` decisions can recurse traffic back into the TUN split routes unless you build explicit bypass routes yourself
-- the default route hooks need elevated privileges, so `sudo` is usually required
-- the built-in default still keeps route setup inside `pipit`; if you want tun2proxy-managed features such as `--setup`, `--bypass`, or a different DNS strategy, override `tun.helper_cmd`
-- you can still override `tun.helper_cmd`, `tun.up`, and `tun.down` if you want a different helper or route policy
+- the default path is fully in-process; an external helper is only used when `tun.helper_cmd` or `PIPIT_TUN_HELPER` is set
+- if `tun.device` or `--device` is omitted, `pipit` auto-picks the first free TUN device; on macOS it scans upward from `utun233` to avoid lower-numbered VPN interfaces
+- `pipit tun` keeps a small state file next to the log file so it can reject a second live tun instance and attempt stale cleanup after crashes
+- on macOS, if `tun.up` / `tun.down` are omitted and the upstream server resolves to IPv4, `pipit` configures the TUN device as `198.18.0.1`, pins the upstream server IP to the original egress path, and installs the standard split-route set (`1.0.0.0/8`, `2.0.0.0/7`, ..., `128.0.0.0/1`, plus `198.18.0.0/15`)
+- `tun` forces the embedded client to use `filter: proxy`; `direct` or `rule` decisions can recurse traffic back into the TUN split routes unless you build explicit bypass routes
+- the default route hooks usually need elevated privileges, so `sudo` is typical
+- if you want tun2proxy-managed features such as custom DNS, `--setup`, or `--bypass`, override `tun.helper_cmd`
+- `tun.helper_cmd`, `tun.up`, and `tun.down` are still fully overrideable
 - placeholders available in commands and hooks are:
   - `{device}`
   - `{socks}` or `{socks_listen}`
@@ -435,20 +412,6 @@ When `daze-ashe` is enabled, the client and server speak a daze-style raw TCP ha
 When `daze-baboon` is enabled, the client first sends a signed `POST /sync HTTP/1.1` request. After the server returns `200 OK`, both sides immediately switch into the daze-ashe handshake on that same socket.
 
 When `daze-czar` is enabled, the client keeps one raw TCP session open and exchanges 4-byte `open/data/close/probe` frames. Each logical stream then runs the daze-ashe handshake inside that multiplexed channel.
-
-## Current Scope
-
-This first implementation is deliberately narrow:
-
-- TCP only
-- SOCKS5 `CONNECT` only
-- one upstream tunnel per local connection
-- no UDP relay
-- optional multiplexing via `--mode native-mux`
-- optional daze-style raw TCP transports via `--mode daze-ashe`, `--mode daze-baboon`, and `--mode daze-czar`
-- no traffic shaping yet
-
-That keeps the code smaller and makes reliability easier to reason about before we add more protocol surface.
 
 ## Development
 

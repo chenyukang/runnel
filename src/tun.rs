@@ -35,6 +35,7 @@ const TEST_SERVER_IP: &str = "198.51.100.10";
 
 const MACOS_TUN_GATEWAY_V4: &str = "198.18.0.1";
 const AUTO_TUN_DEVICE: &str = "auto";
+const TUN2PROXY_DEFAULT_SWITCHES: &str = "--dns direct --verbosity warn --exit-on-fatal-error";
 static EMBEDDED_TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 const MACOS_AUTO_TUN_START_INDEX: u16 = 233;
@@ -124,12 +125,17 @@ pub fn set_embedded_tui(active: bool) {
     EMBEDDED_TUI_ACTIVE.store(active, Ordering::Relaxed);
 }
 
+fn format_tun2proxy_command(program: &str, device: &str, socks: &str) -> String {
+    format!("{program} --tun {device} --proxy socks5://{socks} {TUN2PROXY_DEFAULT_SWITCHES}")
+}
+
 impl TunHelperConfig {
     fn describe(&self, context: &CommandContext) -> String {
         match self {
-            Self::EmbeddedTun2Proxy => format!(
-                "embedded tun2proxy crate --tun {} --proxy socks5://{} --dns direct --verbosity warn --exit-on-fatal-error",
-                context.device, context.socks_listen
+            Self::EmbeddedTun2Proxy => format_tun2proxy_command(
+                "embedded tun2proxy crate",
+                &context.device,
+                &context.socks_listen,
             ),
             Self::ExternalCommand(template) => context.expand(template),
         }
@@ -139,10 +145,10 @@ impl TunHelperConfig {
 impl TunHelperBinary {
     fn default_command(&self, context: &CommandContext) -> String {
         match self.flavor {
-            TunHelperFlavor::Tun2Proxy => format!(
-                "{} --tun {{device}} --proxy socks5://{{socks}} --dns direct --verbosity warn --exit-on-fatal-error",
-                shell_quote_path(&self.path)
-            ),
+            TunHelperFlavor::Tun2Proxy => {
+                let program = shell_quote_path(&self.path);
+                format_tun2proxy_command(&program, "{device}", "{socks}")
+            }
             TunHelperFlavor::Tun2Socks => {
                 let mut command = format!(
                     "{} -device {{device}} -proxy socks5://{{socks}} -loglevel info -tcp-auto-tuning",
