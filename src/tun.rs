@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     io::{self, Write},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -24,7 +24,7 @@ use crate::{
     client::{self, ClientArgs},
     mode::ProxyMode,
     route::FilterMode,
-    tls,
+    system_proxy, tls,
 };
 
 #[cfg(test)]
@@ -37,7 +37,7 @@ const TEST_SERVER_IP: &str = "198.51.100.10";
 #[cfg(any(target_os = "macos", test))]
 const MACOS_TUN_GATEWAY_V4: &str = "198.18.0.1";
 const AUTO_TUN_DEVICE: &str = "auto";
-const TUN2PROXY_DEFAULT_SWITCHES: &str = "--dns direct --verbosity warn --exit-on-fatal-error";
+const TUN_DNS_PORT: u16 = 53;
 static EMBEDDED_TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 const MACOS_AUTO_TUN_START_INDEX: u16 = 233;
@@ -66,6 +66,8 @@ pub struct TunArgs {
     pub shell: String,
     #[arg(long, default_value = "")]
     pub helper_cmd: String,
+    #[arg(long)]
+    pub dns_upstream: Option<String>,
     #[arg(long, default_value_t = 800)]
     pub helper_ready_delay_ms: u64,
     #[arg(long)]
@@ -117,31 +119,92 @@ enum RunningTunHelper {
     External(Child),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TunDnsConfig {
+    upstream_ip: IpAddr,
+    upstream_port: u16,
+}
+
 pub fn set_embedded_tui(active: bool) {
     EMBEDDED_TUI_ACTIVE.store(active, Ordering::Relaxed);
 }
 
-fn format_tun2proxy_command(program: &str, device: &str, socks: &str) -> String {
-    format!("{program} --tun {device} --proxy socks5://{socks} {TUN2PROXY_DEFAULT_SWITCHES}")
+impl TunDnsConfig {
+    fn display(&self) -> String {
+        format_socket_addr(self.upstream_ip, self.upstream_port)
+    }
+}
+
+fn format_socket_addr(ip: IpAddr, port: u16) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("{ip}:{port}"),
+        IpAddr::V6(ip) => format!("[{ip}]:{port}"),
+    }
+}
+
+fn parse_tun_dns_upstream(value: &str) -> Result<TunDnsConfig> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("tun.dns_upstream cannot be empty");
+    }
+
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return Ok(TunDnsConfig {
+            upstream_ip: ip,
+            upstream_port: TUN_DNS_PORT,
+        });
+    }
+
+    let address = trimmed.parse::<SocketAddr>().with_context(|| {
+        format!("tun.dns_upstream must be an IP address or IP:port literal, got {trimmed}")
+    })?;
+    if address.port() != TUN_DNS_PORT {
+        bail!(
+            "tun.dns_upstream currently only supports port {TUN_DNS_PORT}, got {}",
+            address.port()
+        );
+    }
+
+    Ok(TunDnsConfig {
+        upstream_ip: address.ip(),
+        upstream_port: address.port(),
+    })
+}
+
+fn tun2proxy_default_switches(context: &CommandContext) -> String {
+    let mut switches = vec!["--dns direct".to_owned()];
+    if let Some(dns) = &context.dns_upstream {
+        switches.push(format!("--dns-addr {}", dns.upstream_ip));
+    }
+    switches.push("--verbosity warn".to_owned());
+    switches.push("--exit-on-fatal-error".to_owned());
+    switches.join(" ")
+}
+
+fn format_tun2proxy_command(program: &str, context: &CommandContext) -> String {
+    format!(
+        "{program} --tun {} --proxy socks5://{} {}",
+        context.device,
+        context.socks_listen,
+        tun2proxy_default_switches(context)
+    )
 }
 
 impl TunHelperConfig {
     fn describe(&self, context: &CommandContext) -> String {
         match self {
-            Self::EmbeddedTun2Proxy => format_tun2proxy_command(
-                "embedded tun2proxy crate",
-                &context.device,
-                &context.socks_listen,
-            ),
+            Self::EmbeddedTun2Proxy => {
+                format_tun2proxy_command("embedded tun2proxy crate", context)
+            }
             Self::ExternalCommand(template) => context.expand(template),
         }
     }
 }
 
 impl TunHelperBinary {
-    fn default_command(&self) -> String {
+    fn default_command(&self, context: &CommandContext) -> String {
         let program = shell_quote_path(&self.path);
-        format_tun2proxy_command(&program, "{device}", "{socks}")
+        format_tun2proxy_command(&program, context)
     }
 }
 
@@ -311,6 +374,21 @@ pub async fn run(mut args: TunArgs) -> Result<()> {
         tun_state.clear();
         return Err(err);
     }
+    let dns_guard = match activate_tun_dns_override(&context) {
+        Ok(guard) => guard,
+        Err(err) => {
+            shutdown(
+                &args.shell,
+                &down_hooks,
+                &context,
+                &mut helper_handle,
+                &mut client_task,
+            )
+            .await;
+            tun_state.clear();
+            return Err(err);
+        }
+    };
 
     let result = tokio::select! {
         result = &mut client_task => join_client(result),
@@ -326,6 +404,7 @@ pub async fn run(mut args: TunArgs) -> Result<()> {
         Err(err) => warn!(error = %err, "tun session ending with error"),
     }
 
+    drop(dns_guard);
     shutdown(
         &args.shell,
         &down_hooks,
@@ -372,6 +451,9 @@ fn normalize_client_args_for_tun(args: &mut ClientArgs) -> Result<()> {
 impl TunArgs {
     pub fn validate_required(&self) -> Result<()> {
         self.client.validate_required()?;
+        if let Some(value) = self.dns_upstream.as_deref() {
+            let _ = parse_tun_dns_upstream(value)?;
+        }
         Ok(())
     }
 }
@@ -387,6 +469,7 @@ struct CommandContext {
     egress_interface: Option<String>,
     egress_gateway: Option<String>,
     log_file: Option<String>,
+    dns_upstream: Option<TunDnsConfig>,
 }
 
 impl CommandContext {
@@ -394,6 +477,11 @@ impl CommandContext {
         let (server_host, server_port) = tls::split_host_port(&args.client.server)?;
         let device = resolve_device_name(&args.device).await?;
         let server_ip = resolve_server_ip(&server_host, server_port).await?;
+        let dns_upstream = args
+            .dns_upstream
+            .as_deref()
+            .map(parse_tun_dns_upstream)
+            .transpose()?;
         let needs_egress_metadata = needs_egress_metadata(args);
         let (egress_interface, egress_gateway) = if needs_egress_metadata {
             detect_egress_route(&server_ip).await?
@@ -411,10 +499,26 @@ impl CommandContext {
             egress_interface,
             egress_gateway,
             log_file: std::env::var("PIPIT_LOG_FILE").ok(),
+            dns_upstream,
         })
     }
 
     fn expand(&self, template: &str) -> String {
+        let dns_upstream = self
+            .dns_upstream
+            .as_ref()
+            .map(TunDnsConfig::display)
+            .unwrap_or_default();
+        let dns_upstream_ip = self
+            .dns_upstream
+            .as_ref()
+            .map(|config| config.upstream_ip.to_string())
+            .unwrap_or_default();
+        let dns_upstream_port = self
+            .dns_upstream
+            .as_ref()
+            .map(|config| config.upstream_port.to_string())
+            .unwrap_or_default();
         template
             .replace("{device}", &self.device)
             .replace("{socks}", &self.socks_listen)
@@ -423,6 +527,10 @@ impl CommandContext {
             .replace("{server_host}", &self.server_host)
             .replace("{server_port}", &self.server_port.to_string())
             .replace("{server_ip}", &self.server_ip)
+            .replace("{dns_upstream}", &dns_upstream)
+            .replace("{dns_upstream_ip}", &dns_upstream_ip)
+            .replace("{dns_upstream_port}", &dns_upstream_port)
+            .replace("{dns_redirect_ip}", self.dns_redirect_ip().unwrap_or(""))
             .replace(
                 "{egress_interface}",
                 self.egress_interface.as_deref().unwrap_or(""),
@@ -437,6 +545,17 @@ impl CommandContext {
             )
     }
 
+    fn dns_redirect_ip(&self) -> Option<&'static str> {
+        #[cfg(any(target_os = "macos", test))]
+        {
+            if self.dns_upstream.is_some() {
+                return Some(MACOS_TUN_GATEWAY_V4);
+            }
+        }
+
+        None
+    }
+
     fn apply_envs(&self, command: &mut Command) {
         command.env("PIPIT_TUN_DEVICE", &self.device);
         command.env("PIPIT_SOCKS_LISTEN", &self.socks_listen);
@@ -444,6 +563,14 @@ impl CommandContext {
         command.env("PIPIT_SERVER_HOST", &self.server_host);
         command.env("PIPIT_SERVER_PORT", self.server_port.to_string());
         command.env("PIPIT_SERVER_IP", &self.server_ip);
+        if let Some(dns) = &self.dns_upstream {
+            command.env("PIPIT_DNS_UPSTREAM", dns.display());
+            command.env("PIPIT_DNS_UPSTREAM_IP", dns.upstream_ip.to_string());
+            command.env("PIPIT_DNS_UPSTREAM_PORT", dns.upstream_port.to_string());
+        }
+        if let Some(dns_redirect_ip) = self.dns_redirect_ip() {
+            command.env("PIPIT_TUN_DNS_REDIRECT_IP", dns_redirect_ip);
+        }
         if let Some(interface) = &self.egress_interface {
             command.env("PIPIT_EGRESS_INTERFACE", interface);
         }
@@ -475,11 +602,19 @@ fn needs_placeholder(template: &str, prefix: &str) -> bool {
 
 fn effective_helper(args: &TunArgs, context: &CommandContext) -> Result<TunHelperConfig> {
     if !args.helper_cmd.trim().is_empty() {
+        if context.dns_upstream.is_some()
+            && !args.helper_cmd.contains("--dns-addr")
+            && !args.helper_cmd.contains("{dns_upstream_ip}")
+        {
+            warn!(
+                helper_cmd = %args.helper_cmd,
+                "tun.dns_upstream is set but helper_cmd does not mention --dns-addr or the dns_upstream_ip placeholder; the custom helper may keep its own DNS upstream"
+            );
+        }
         return Ok(TunHelperConfig::ExternalCommand(args.helper_cmd.clone()));
     }
 
-    let _ = context;
-    default_helper()
+    default_helper(context)
 }
 
 fn effective_up_hooks(args: &TunArgs, context: &CommandContext) -> Result<Vec<String>> {
@@ -498,9 +633,11 @@ fn effective_down_hooks(args: &TunArgs, context: &CommandContext) -> Result<Vec<
     default_down_hooks(context)
 }
 
-fn default_helper() -> Result<TunHelperConfig> {
+fn default_helper(context: &CommandContext) -> Result<TunHelperConfig> {
     if let Some(helper) = detect_helper_override() {
-        return Ok(TunHelperConfig::ExternalCommand(helper.default_command()));
+        return Ok(TunHelperConfig::ExternalCommand(
+            helper.default_command(context),
+        ));
     }
 
     Ok(TunHelperConfig::EmbeddedTun2Proxy)
@@ -872,6 +1009,35 @@ fn parse_macos_route_get(output: &str) -> Result<(Option<String>, Option<String>
     Ok((interface, gateway))
 }
 
+fn activate_tun_dns_override(
+    context: &CommandContext,
+) -> Result<Option<system_proxy::SystemDnsGuard>> {
+    #[cfg(target_os = "macos")]
+    {
+        let Some(dns) = &context.dns_upstream else {
+            return Ok(None);
+        };
+        let redirect = context.dns_redirect_ip().context(
+            "tun DNS override requested, but no macOS DNS redirect address is available",
+        )?;
+        let guard = system_proxy::maybe_activate_tun_dns(&[redirect.to_owned()])?;
+        if guard.is_some() {
+            info!(
+                dns_upstream = %dns.display(),
+                dns_redirect = %redirect,
+                "redirected macOS system DNS into the tun session"
+            );
+        }
+        return Ok(guard);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = context;
+        Ok(None)
+    }
+}
+
 fn spawn_shell_command(
     label: &str,
     shell: &str,
@@ -950,6 +1116,9 @@ async fn run_embedded_tun2proxy(
         .dns(tun2proxy::ArgDns::Direct)
         .verbosity(tun2proxy::ArgVerbosity::Warn)
         .setup(false);
+    if let Some(dns) = &context.dns_upstream {
+        args.dns_addr(dns.upstream_ip);
+    }
     args.exit_on_fatal_error = true;
     tun2proxy::general_run_async(
         args,
@@ -1202,6 +1371,14 @@ fn shell_envs(context: &CommandContext) -> BTreeMap<&'static str, String> {
     envs.insert("PIPIT_SERVER_HOST", context.server_host.clone());
     envs.insert("PIPIT_SERVER_PORT", context.server_port.to_string());
     envs.insert("PIPIT_SERVER_IP", context.server_ip.clone());
+    if let Some(dns) = &context.dns_upstream {
+        envs.insert("PIPIT_DNS_UPSTREAM", dns.display());
+        envs.insert("PIPIT_DNS_UPSTREAM_IP", dns.upstream_ip.to_string());
+        envs.insert("PIPIT_DNS_UPSTREAM_PORT", dns.upstream_port.to_string());
+    }
+    if let Some(dns_redirect_ip) = context.dns_redirect_ip() {
+        envs.insert("PIPIT_TUN_DNS_REDIRECT_IP", dns_redirect_ip.to_owned());
+    }
     if let Some(interface) = &context.egress_interface {
         envs.insert("PIPIT_EGRESS_INTERFACE", interface.clone());
     }
@@ -1239,6 +1416,16 @@ fn plan_lines(
         "  egress_gateway: {}",
         context.egress_gateway.as_deref().unwrap_or("-")
     ));
+    if let Some(dns) = &context.dns_upstream {
+        match context.dns_redirect_ip() {
+            Some(redirect) => lines.push(format!(
+                "  dns_upstream: {} (system DNS -> {})",
+                dns.display(),
+                redirect
+            )),
+            None => lines.push(format!("  dns_upstream: {}", dns.display())),
+        }
+    }
     lines.push(format!("  helper: {}", helper.describe(context)));
     lines.push("  up hooks:".to_owned());
     if up_hooks.is_empty() {
@@ -1277,7 +1464,7 @@ mod tests {
         AUTO_TUN_DEVICE, CommandContext, MACOS_TUN_GATEWAY_V4, TEST_SERVER_ENDPOINT,
         TEST_SERVER_HOST, TEST_SERVER_IP, TunArgs, TunHelperBinary, TunHelperConfig,
         default_down_hooks, default_server_bypass_route, default_up_hooks, is_auto_device,
-        parse_macos_route_get, plan_lines, print_plan, shell_envs,
+        parse_macos_route_get, parse_tun_dns_upstream, plan_lines, print_plan, shell_envs,
     };
     use crate::{client::ClientArgs, mode::ProxyMode, route::FilterMode};
     use std::path::PathBuf;
@@ -1294,13 +1481,14 @@ mod tests {
             egress_interface: Some("en0".to_owned()),
             egress_gateway: Some("192.168.3.1".to_owned()),
             log_file: Some("proxy.log".to_owned()),
+            dns_upstream: Some(parse_tun_dns_upstream("1.1.1.1:53").unwrap()),
         };
         let expanded = context.expand(
-            "tun2proxy-bin --tun {device} --proxy socks5://{socks} --server {server} --iface {egress_interface} --host {server_host} --ip {server_ip}",
+            "tun2proxy-bin --tun {device} --proxy socks5://{socks} --server {server} --iface {egress_interface} --host {server_host} --ip {server_ip} --dns {dns_upstream} --dns-ip {dns_upstream_ip} --dns-port {dns_upstream_port} --dns-redirect {dns_redirect_ip}",
         );
         assert_eq!(
             expanded,
-            "tun2proxy-bin --tun utun233 --proxy socks5://127.0.0.1:1080 --server 198.51.100.10:1443 --iface en0 --host 198.51.100.10 --ip 198.51.100.10"
+            "tun2proxy-bin --tun utun233 --proxy socks5://127.0.0.1:1080 --server 198.51.100.10:1443 --iface en0 --host 198.51.100.10 --ip 198.51.100.10 --dns 1.1.1.1:53 --dns-ip 1.1.1.1 --dns-port 53 --dns-redirect 198.18.0.1"
         );
     }
 
@@ -1309,9 +1497,21 @@ mod tests {
         let helper = TunHelperBinary {
             path: PathBuf::from("/usr/local/bin/tun2proxy-bin"),
         };
+        let context = CommandContext {
+            device: "utun233".to_owned(),
+            socks_listen: "127.0.0.1:1080".to_owned(),
+            server: TEST_SERVER_ENDPOINT.to_owned(),
+            server_host: TEST_SERVER_HOST.to_owned(),
+            server_port: 1443,
+            server_ip: TEST_SERVER_IP.to_owned(),
+            egress_interface: Some("en0".to_owned()),
+            egress_gateway: Some("192.168.3.1".to_owned()),
+            log_file: Some("proxy.log".to_owned()),
+            dns_upstream: Some(parse_tun_dns_upstream("1.1.1.1:53").unwrap()),
+        };
         assert_eq!(
-            helper.default_command(),
-            "'/usr/local/bin/tun2proxy-bin' --tun {device} --proxy socks5://{socks} --dns direct --verbosity warn --exit-on-fatal-error"
+            helper.default_command(&context),
+            "'/usr/local/bin/tun2proxy-bin' --tun utun233 --proxy socks5://127.0.0.1:1080 --dns direct --dns-addr 1.1.1.1 --verbosity warn --exit-on-fatal-error"
         );
     }
 
@@ -1327,10 +1527,11 @@ mod tests {
             egress_interface: Some("en0".to_owned()),
             egress_gateway: Some("192.168.3.1".to_owned()),
             log_file: Some("proxy.log".to_owned()),
+            dns_upstream: Some(parse_tun_dns_upstream("1.1.1.1:53").unwrap()),
         };
         assert_eq!(
             TunHelperConfig::EmbeddedTun2Proxy.describe(&context),
-            "embedded tun2proxy crate --tun utun233 --proxy socks5://127.0.0.1:1080 --dns direct --verbosity warn --exit-on-fatal-error"
+            "embedded tun2proxy crate --tun utun233 --proxy socks5://127.0.0.1:1080 --dns direct --dns-addr 1.1.1.1 --verbosity warn --exit-on-fatal-error"
         );
     }
 
@@ -1346,6 +1547,7 @@ mod tests {
             egress_interface: Some("en0".to_owned()),
             egress_gateway: Some("192.168.3.1".to_owned()),
             log_file: Some("proxy.log".to_owned()),
+            dns_upstream: Some(parse_tun_dns_upstream("1.1.1.1").unwrap()),
         };
         let envs = shell_envs(&context);
         assert_eq!(
@@ -1363,6 +1565,14 @@ mod tests {
         assert_eq!(
             envs.get("PIPIT_EGRESS_INTERFACE").map(String::as_str),
             Some("en0")
+        );
+        assert_eq!(
+            envs.get("PIPIT_DNS_UPSTREAM_IP").map(String::as_str),
+            Some("1.1.1.1")
+        );
+        assert_eq!(
+            envs.get("PIPIT_TUN_DNS_REDIRECT_IP").map(String::as_str),
+            Some("198.18.0.1")
         );
     }
 
@@ -1386,6 +1596,7 @@ mod tests {
             egress_interface: Some("en0".to_owned()),
             egress_gateway: Some("192.168.3.1".to_owned()),
             log_file: Some("/tmp/proxy.log".to_owned()),
+            dns_upstream: None,
         };
         let path = super::resolve_tun_state_path(&context).expect("state path resolves");
         assert_eq!(path, PathBuf::from("/tmp/proxy.tun.state.json"));
@@ -1536,6 +1747,7 @@ mod tests {
             device: "utun233".to_owned(),
             shell: "/bin/sh".to_owned(),
             helper_cmd: String::new(),
+            dns_upstream: Some("1.1.1.1:53".to_owned()),
             helper_ready_delay_ms: 800,
             up: Vec::new(),
             down: Vec::new(),
@@ -1552,6 +1764,7 @@ mod tests {
             egress_interface: Some("en0".to_owned()),
             egress_gateway: Some("192.168.3.1".to_owned()),
             log_file: Some("proxy.log".to_owned()),
+            dns_upstream: Some(parse_tun_dns_upstream("1.1.1.1:53").unwrap()),
         };
         let lines = plan_lines(
             &args,
@@ -1559,6 +1772,11 @@ mod tests {
             &TunHelperConfig::EmbeddedTun2Proxy,
             &["ifconfig {device} inet 198.18.0.1 198.18.0.1 up".to_owned()],
             &["ifconfig {device} down >/dev/null 2>&1 || true".to_owned()],
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  dns_upstream: 1.1.1.1:53 (system DNS -> 198.18.0.1)")
         );
         print_plan(&lines);
     }
@@ -1607,6 +1825,7 @@ destination: 198.51.100.10
             egress_interface: Some("en0".to_owned()),
             egress_gateway: Some("192.168.3.1".to_owned()),
             log_file: Some("proxy.log".to_owned()),
+            dns_upstream: None,
         };
         let hooks = default_up_hooks(&context).expect("macOS hooks are generated");
         assert_eq!(
@@ -1643,6 +1862,7 @@ destination: 198.51.100.10
             egress_interface: Some("en0".to_owned()),
             egress_gateway: Some("192.168.3.1".to_owned()),
             log_file: Some("proxy.log".to_owned()),
+            dns_upstream: None,
         };
         let route = default_server_bypass_route(&context);
         assert!(route.contains("192.168.3.1"));

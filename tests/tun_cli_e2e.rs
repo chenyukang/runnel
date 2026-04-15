@@ -159,6 +159,53 @@ tun:
 }
 
 #[test]
+fn tun_dry_run_prints_dns_upstream_plan_and_helper_flags() -> Result<()> {
+    let temp_dir = TempDir::new("pipit-tun-dns-upstream")?;
+    let config_path = temp_dir.join("pipit.yaml");
+    let log_path = temp_dir.join("proxy.log");
+    fs::write(
+        &config_path,
+        r#"
+client:
+  server: 127.0.0.1:9
+  password: hello-world
+tun:
+  device: testtun3
+  dns_upstream: 1.1.1.1:53
+  dry_run: true
+"#,
+    )?;
+
+    let output = Command::new(pipit_bin()?)
+        .current_dir(temp_dir.path())
+        .args([
+            "--log-file",
+            log_path.to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
+            "tun",
+        ])
+        .output()
+        .context("failed to run pipit tun with dns upstream")?;
+    assert!(
+        output.status.success(),
+        "tun dry-run with dns upstream failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("dns_upstream: 1.1.1.1:53"),
+        "unexpected stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("--dns-addr 1.1.1.1"),
+        "missing tun2proxy dns override: {stdout}"
+    );
+    Ok(())
+}
+
+#[test]
 fn tun_dry_run_rejects_inherited_daze_mode_from_client_config() -> Result<()> {
     let temp_dir = TempDir::new("pipit-tun-mode-reject")?;
     let config_path = temp_dir.join("pipit.client.yaml");

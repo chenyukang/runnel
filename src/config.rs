@@ -77,6 +77,7 @@ pub struct TunConfig {
     pub device: Option<String>,
     pub shell: Option<String>,
     pub helper_cmd: Option<String>,
+    pub dns_upstream: Option<String>,
     pub helper_ready_delay_ms: Option<u64>,
     pub up: Option<Vec<String>>,
     pub down: Option<Vec<String>>,
@@ -351,6 +352,11 @@ pub fn apply_tun(args: &mut TunArgs, config: &FileConfig, matches: &ArgMatches, 
         &tun.helper_cmd,
         should_override(matches, "helper_cmd"),
     );
+    maybe_assign_optional(
+        &mut args.dns_upstream,
+        &tun.dns_upstream,
+        should_override(matches, "dns_upstream"),
+    );
     maybe_assign(
         &mut args.helper_ready_delay_ms,
         &tun.helper_ready_delay_ms,
@@ -458,6 +464,7 @@ client:
 tun:
   device: auto
   helper_cmd: tun2proxy-bin --tun {device} --proxy socks5://{socks}
+  dns_upstream: 1.1.1.1:53
   print_hooks: true
   dry_run: true
 server:
@@ -499,6 +506,13 @@ server:
         assert_eq!(
             parsed.tun.as_ref().and_then(|cfg| cfg.print_hooks),
             Some(true)
+        );
+        assert_eq!(
+            parsed
+                .tun
+                .as_ref()
+                .and_then(|cfg| cfg.dns_upstream.as_deref()),
+            Some("1.1.1.1:53")
         );
         assert_eq!(parsed.tun.as_ref().and_then(|cfg| cfg.dry_run), Some(true));
     }

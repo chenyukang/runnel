@@ -29,6 +29,7 @@ use tokio::{
 
 use crate::telemetry::{
     DashboardSnapshot, MonitorContext, RecentTargetSnapshot, TraceEvent, attach_socket,
+    event_impacts_health,
 };
 
 const HISTORY_LEN: usize = 48;
@@ -270,12 +271,15 @@ impl DashboardApp {
     fn ingest(&mut self, event: TraceEvent) {
         self.last_event_at = Some(Instant::now());
         let level = event.level.as_str();
+        let impacts_health =
+            event_impacts_health(Some(self.context.command_label.as_str()), &event);
         if level == "WARN" {
             self.total_warnings += 1;
-            self.last_warning_at = Some(Instant::now());
         }
         if level == "ERROR" || event.message.contains("with error") {
             self.total_errors += 1;
+        }
+        if impacts_health {
             self.last_warning_at = Some(Instant::now());
         }
 

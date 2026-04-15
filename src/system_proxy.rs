@@ -18,6 +18,13 @@ struct ServiceProxySnapshot {
     authenticated: bool,
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ServiceDnsSnapshot {
+    name: String,
+    servers: Vec<String>,
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Debug)]
 pub struct SystemProxyGuard {
@@ -27,6 +34,16 @@ pub struct SystemProxyGuard {
 #[cfg(not(target_os = "macos"))]
 #[derive(Debug)]
 pub struct SystemProxyGuard;
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+pub struct SystemDnsGuard {
+    snapshots: Vec<ServiceDnsSnapshot>,
+}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug)]
+pub struct SystemDnsGuard;
 
 pub fn maybe_activate(args: &ClientArgs) -> Result<Option<SystemProxyGuard>> {
     if !args.system_proxy {
@@ -42,6 +59,23 @@ pub fn maybe_activate(args: &ClientArgs) -> Result<Option<SystemProxyGuard>> {
     {
         let _ = args;
         bail!("--system-proxy is only supported on macOS");
+    }
+}
+
+pub fn maybe_activate_tun_dns(servers: &[String]) -> Result<Option<SystemDnsGuard>> {
+    if servers.is_empty() {
+        return Ok(None);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return SystemDnsGuard::activate(servers).map(Some);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = servers;
+        Ok(None)
     }
 }
 
@@ -94,9 +128,47 @@ impl SystemProxyGuard {
 }
 
 #[cfg(target_os = "macos")]
+impl SystemDnsGuard {
+    fn activate(servers: &[String]) -> Result<Self> {
+        let services = determine_services(&[])?;
+        if services.is_empty() {
+            bail!("no macOS network services are available for tun DNS override");
+        }
+
+        let snapshots = services
+            .iter()
+            .map(|service| read_service_dns_snapshot(service))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut applied = Vec::with_capacity(snapshots.len());
+        for snapshot in &snapshots {
+            if let Err(err) = set_service_dns_servers(&snapshot.name, servers) {
+                restore_dns_many(applied.iter().rev());
+                return Err(err);
+            }
+            info!(
+                service = %snapshot.name,
+                servers = ?servers,
+                "overrode macOS DNS servers for tun session"
+            );
+            applied.push(snapshot.clone());
+        }
+
+        Ok(Self { snapshots })
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl Drop for SystemProxyGuard {
     fn drop(&mut self) {
         restore_many(self.snapshots.iter().rev());
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for SystemDnsGuard {
+    fn drop(&mut self) {
+        restore_dns_many(self.snapshots.iter().rev());
     }
 }
 
@@ -112,6 +184,24 @@ fn restore_many<'a>(snapshots: impl IntoIterator<Item = &'a ServiceProxySnapshot
                     service = %snapshot.name,
                     error = %err,
                     "failed to restore macOS SOCKS system proxy"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn restore_dns_many<'a>(snapshots: impl IntoIterator<Item = &'a ServiceDnsSnapshot>) {
+    for snapshot in snapshots {
+        match restore_service_dns(snapshot) {
+            Ok(()) => {
+                info!(service = %snapshot.name, "restored macOS DNS servers");
+            }
+            Err(err) => {
+                warn!(
+                    service = %snapshot.name,
+                    error = %err,
+                    "failed to restore macOS DNS servers"
                 );
             }
         }
@@ -164,10 +254,32 @@ fn read_service_snapshot(service: &str) -> Result<ServiceProxySnapshot> {
 }
 
 #[cfg(target_os = "macos")]
+fn read_service_dns_snapshot(service: &str) -> Result<ServiceDnsSnapshot> {
+    let output = run_networksetup(["-getdnsservers", service])?;
+    Ok(ServiceDnsSnapshot {
+        name: service.to_owned(),
+        servers: parse_dns_servers(&output),
+    })
+}
+
+#[cfg(target_os = "macos")]
 fn set_service_proxy(service: &str, host: &str, port: u16) -> Result<()> {
     let port = port.to_string();
     run_networksetup_no_output(["-setsocksfirewallproxy", service, host, &port])?;
     run_networksetup_no_output(["-setsocksfirewallproxystate", service, "on"])?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn set_service_dns_servers(service: &str, servers: &[String]) -> Result<()> {
+    if servers.is_empty() {
+        bail!("at least one DNS server is required");
+    }
+    let mut args = Vec::with_capacity(2 + servers.len());
+    args.push("-setdnsservers");
+    args.push(service);
+    args.extend(servers.iter().map(String::as_str));
+    run_networksetup_dynamic(&args)?;
     Ok(())
 }
 
@@ -184,7 +296,26 @@ fn restore_service(snapshot: &ServiceProxySnapshot) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
+fn restore_service_dns(snapshot: &ServiceDnsSnapshot) -> Result<()> {
+    if snapshot.servers.is_empty() {
+        run_networksetup_dynamic(&["-setdnsservers", &snapshot.name, "Empty"])?;
+    } else {
+        let mut args = Vec::with_capacity(2 + snapshot.servers.len());
+        args.push("-setdnsservers");
+        args.push(snapshot.name.as_str());
+        args.extend(snapshot.servers.iter().map(String::as_str));
+        run_networksetup_dynamic(&args)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
 fn run_networksetup<const N: usize>(args: [&str; N]) -> Result<String> {
+    run_networksetup_dynamic(&args)
+}
+
+#[cfg(target_os = "macos")]
+fn run_networksetup_dynamic(args: &[&str]) -> Result<String> {
     let output = std::process::Command::new("networksetup")
         .args(args)
         .output()
@@ -224,6 +355,21 @@ fn parse_network_services(output: &str) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .filter(|line| !line.starts_with("An asterisk"))
         .filter(|line| !line.starts_with('*'))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_dns_servers(output: &str) -> Vec<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() || trimmed.starts_with("There aren't any DNS Servers set on ") {
+        return Vec::new();
+    }
+
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
         .map(ToOwned::to_owned)
         .collect()
 }
@@ -302,7 +448,7 @@ fn normalize_proxy_host(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServiceProxySnapshot, normalize_proxy_host, parse_network_services,
+        ServiceProxySnapshot, normalize_proxy_host, parse_dns_servers, parse_network_services,
         parse_service_has_ip_address, parse_socks_proxy,
     };
 
@@ -361,5 +507,22 @@ Authenticated Proxy Enabled: 0\n";
         assert_eq!(normalize_proxy_host("0.0.0.0"), "127.0.0.1");
         assert_eq!(normalize_proxy_host("::"), "::1");
         assert_eq!(normalize_proxy_host("127.0.0.1"), "127.0.0.1");
+    }
+
+    #[test]
+    fn parses_dns_server_list() {
+        let raw = "\
+1.1.1.1\n\
+1.0.0.1\n";
+        assert_eq!(
+            parse_dns_servers(raw),
+            vec!["1.1.1.1".to_owned(), "1.0.0.1".to_owned()]
+        );
+    }
+
+    #[test]
+    fn parses_empty_dns_server_list() {
+        let raw = "There aren't any DNS Servers set on Wi-Fi.\n";
+        assert!(parse_dns_servers(raw).is_empty());
     }
 }

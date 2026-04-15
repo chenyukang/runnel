@@ -230,11 +230,12 @@ Notes:
 - if `tun.device` or `--device` is omitted, `pipit` auto-picks the first free TUN device; on macOS it scans upward from `utun233` to avoid lower-numbered VPN interfaces
 - `pipit tun` keeps a small state file next to the log file so it can reject a second live tun instance and attempt stale cleanup after crashes
 - on macOS, if `tun.up` / `tun.down` are omitted and the upstream server resolves to IPv4, `pipit` configures the TUN device as `198.18.0.1`, pins the upstream server IP to the original egress path, and installs the standard split-route set (`1.0.0.0/8`, `2.0.0.0/7`, ..., `128.0.0.0/1`, plus `198.18.0.0/15`)
+- if you set `tun.dns_upstream: 1.1.1.1:53`, `pipit tun` passes that IP to tun2proxy as `--dns-addr`; on macOS it also temporarily points active network services at `198.18.0.1` so DNS inside the TUN stops leaking to the original system resolver
 - `tun` forces the embedded client to use `filter: proxy`; `direct` or `rule` decisions can recurse traffic back into the TUN split routes unless you build explicit bypass routes
 - `tun` currently requires `client.mode: native-http` because embedded DNS and other UDP traffic depend on SOCKS `UDP ASSOCIATE`; `native-mux` and `daze-*` modes are rejected at startup
 - `tun` ignores `client.system_proxy` and `client.system_proxy_services`; the TUN device already captures traffic without flipping the OS SOCKS proxy
 - the default route hooks usually need elevated privileges, so `sudo` is typical
-- if you want tun2proxy-managed features such as custom DNS, `--setup`, or `--bypass`, override `tun.helper_cmd`
+- if you override `tun.helper_cmd` and still want `tun.dns_upstream` to apply, include `--dns-addr {dns_upstream_ip}` in the helper command
 - `tun.helper_cmd`, `tun.up`, and `tun.down` are still fully overrideable
 - placeholders available in commands and hooks are:
   - `{device}`
@@ -243,6 +244,10 @@ Notes:
   - `{server_host}`
   - `{server_port}`
   - `{server_ip}`
+  - `{dns_upstream}`
+  - `{dns_upstream_ip}`
+  - `{dns_upstream_port}`
+  - `{dns_redirect_ip}`
   - `{egress_interface}`
   - `{egress_gateway}`
   - `{log_file}`

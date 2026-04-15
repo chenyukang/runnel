@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime},
@@ -125,12 +126,17 @@ impl SnapshotState {
         self.rotate_history();
         self.last_event_at = Some(Instant::now());
 
+        let impacts_health = event_impacts_health(
+            self.context.as_ref().map(|ctx| ctx.command_label.as_str()),
+            event,
+        );
         if event.level == "WARN" {
             self.total_warnings += 1;
-            self.last_warning_at = Some(Instant::now());
         }
         if event.level == "ERROR" || event.message.contains("with error") {
             self.total_errors += 1;
+        }
+        if impacts_health {
             self.last_warning_at = Some(Instant::now());
         }
 
@@ -482,6 +488,57 @@ fn parse_bool(value: Option<&String>) -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn event_impacts_health(command_label: Option<&str>, event: &TraceEvent) -> bool {
+    if event.level != "WARN" && event.level != "ERROR" && !event.message.contains("with error") {
+        return false;
+    }
+
+    !is_known_recoverable_tun_dns_failure(command_label, event)
+}
+
+fn is_known_recoverable_tun_dns_failure(command_label: Option<&str>, event: &TraceEvent) -> bool {
+    if command_label != Some("tun") {
+        return false;
+    }
+
+    if event.message == "client session ended with error"
+        && event
+            .fields
+            .get("error")
+            .is_some_and(|error| error == "server response timed out")
+        && event
+            .fields
+            .get("peer")
+            .is_some_and(|peer| is_loopback_peer(peer))
+    {
+        return true;
+    }
+
+    let general_failure = "SOCKS connection failed: Reply::GeneralFailure";
+    let tunneled_dns_target = "198.18.0.1:53";
+    event.level == "ERROR"
+        && ((event.message.contains(tunneled_dns_target)
+            && event.message.contains(general_failure))
+            || event
+                .fields
+                .get("target")
+                .is_some_and(|target| target == tunneled_dns_target)
+                && event
+                    .fields
+                    .get("error")
+                    .is_some_and(|error| error.contains(general_failure)))
+}
+
+fn is_loopback_peer(peer: &str) -> bool {
+    peer.parse::<SocketAddr>()
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or_else(|_| {
+            peer.parse::<IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false)
+        })
+}
+
 fn clock_stamp(at: SystemTime) -> String {
     let elapsed = at
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -569,4 +626,108 @@ async fn write_wire_message(
 
 fn current_snapshot(snapshot: &Arc<Mutex<SnapshotState>>) -> Option<DashboardSnapshot> {
     snapshot.lock().ok()?.snapshot()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MonitorContext, SnapshotState, TraceEvent, event_impacts_health, is_loopback_peer,
+    };
+    use std::{collections::BTreeMap, path::PathBuf, time::SystemTime};
+
+    #[test]
+    fn tun_dns_timeout_does_not_impact_health() {
+        let event = trace_event(
+            "WARN",
+            "client session ended with error",
+            &[
+                ("peer", "127.0.0.1:53000"),
+                ("error", "server response timed out"),
+            ],
+        );
+        assert!(!event_impacts_health(Some("tun"), &event));
+    }
+
+    #[test]
+    fn same_timeout_still_impacts_client_health() {
+        let event = trace_event(
+            "WARN",
+            "client session ended with error",
+            &[
+                ("peer", "127.0.0.1:53000"),
+                ("error", "server response timed out"),
+            ],
+        );
+        assert!(event_impacts_health(Some("client"), &event));
+    }
+
+    #[test]
+    fn unrelated_tun_errors_still_impact_health() {
+        let event = trace_event(
+            "WARN",
+            "client session ended with error",
+            &[
+                ("peer", "127.0.0.1:53000"),
+                ("error", "TLS handshake with server timed out"),
+            ],
+        );
+        assert!(event_impacts_health(Some("tun"), &event));
+    }
+
+    #[test]
+    fn tun_dns_general_failure_does_not_impact_health() {
+        let event = trace_event(
+            "ERROR",
+            "#3080 TCP 198.18.0.1:52190 -> 198.18.0.1:53 error \"SOCKS connection failed: Reply::GeneralFailure\"",
+            &[],
+        );
+        assert!(!event_impacts_health(Some("tun"), &event));
+    }
+
+    #[test]
+    fn suppressed_tun_dns_timeout_keeps_snapshot_ready() {
+        let mut snapshot = SnapshotState::default();
+        snapshot.set_context(MonitorContext {
+            command_label: "tun".to_owned(),
+            mode_label: "native-http".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("proxy.log"),
+            log_filter: "info".to_owned(),
+            pid: 1,
+        });
+        let event = trace_event(
+            "WARN",
+            "client session ended with error",
+            &[
+                ("peer", "127.0.0.1:53000"),
+                ("error", "server response timed out"),
+            ],
+        );
+
+        snapshot.ingest(&event);
+
+        assert_eq!(snapshot.total_warnings, 1);
+        assert!(snapshot.last_warning_at.is_none());
+    }
+
+    #[test]
+    fn loopback_peer_detection_handles_ipv4_and_ipv6() {
+        assert!(is_loopback_peer("127.0.0.1:53000"));
+        assert!(is_loopback_peer("[::1]:53000"));
+        assert!(!is_loopback_peer("192.168.1.2:53000"));
+    }
+
+    fn trace_event(level: &str, message: &str, fields: &[(&str, &str)]) -> TraceEvent {
+        TraceEvent {
+            at: SystemTime::UNIX_EPOCH,
+            level: level.to_owned(),
+            message: message.to_owned(),
+            fields: fields
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect::<BTreeMap<_, _>>(),
+        }
+    }
 }
