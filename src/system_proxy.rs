@@ -1,8 +1,12 @@
 use anyhow::{Context, Result, bail};
+#[cfg(target_os = "macos")]
 use tracing::{info, warn};
 
-use crate::{client::ClientArgs, tls};
+use crate::client::ClientArgs;
+#[cfg(target_os = "macos")]
+use crate::tls;
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ServiceProxySnapshot {
     name: String,
@@ -12,10 +16,15 @@ struct ServiceProxySnapshot {
     authenticated: bool,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
 pub struct SystemProxyGuard {
     snapshots: Vec<ServiceProxySnapshot>,
 }
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Debug)]
+pub struct SystemProxyGuard;
 
 pub fn maybe_activate(args: &ClientArgs) -> Result<Option<SystemProxyGuard>> {
     if !args.system_proxy {
@@ -205,6 +214,7 @@ fn run_networksetup_no_output<const N: usize>(args: [&str; N]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_network_services(output: &str) -> Vec<String> {
     output
         .lines()
@@ -216,6 +226,7 @@ fn parse_network_services(output: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_service_has_ip_address(output: &str) -> bool {
     output.lines().any(|line| {
         let Some(value) = line.trim().strip_prefix("IP address:") else {
@@ -226,6 +237,7 @@ fn parse_service_has_ip_address(output: &str) -> bool {
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_socks_proxy(service: &str, output: &str) -> Result<ServiceProxySnapshot> {
     let mut enabled = None;
     let mut server = None;
@@ -260,6 +272,7 @@ fn parse_socks_proxy(service: &str, output: &str) -> Result<ServiceProxySnapshot
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_yes_no(value: &str) -> Result<bool> {
     match value {
         "Yes" | "yes" | "on" | "On" | "true" | "True" => Ok(true),
@@ -268,12 +281,14 @@ fn parse_yes_no(value: &str) -> Result<bool> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn proxy_target_from_listen(listen: &str) -> Result<(String, u16)> {
     let (host, port) = tls::split_host_port(listen)
         .with_context(|| format!("failed to parse client listen address {listen}"))?;
     Ok((normalize_proxy_host(&host), port))
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn normalize_proxy_host(host: &str) -> String {
     match host {
         "0.0.0.0" => "127.0.0.1".to_owned(),

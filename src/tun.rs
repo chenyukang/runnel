@@ -33,6 +33,7 @@ const TEST_SERVER_HOST: &str = "198.51.100.10";
 #[cfg(test)]
 const TEST_SERVER_IP: &str = "198.51.100.10";
 
+#[cfg(any(target_os = "macos", test))]
 const MACOS_TUN_GATEWAY_V4: &str = "198.18.0.1";
 const AUTO_TUN_DEVICE: &str = "auto";
 const TUN2PROXY_DEFAULT_SWITCHES: &str = "--dns direct --verbosity warn --exit-on-fatal-error";
@@ -41,6 +42,7 @@ static EMBEDDED_TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 const MACOS_AUTO_TUN_START_INDEX: u16 = 233;
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_AUTO_TUN_DEVICE: &str = "tun0";
+#[cfg(any(target_os = "macos", test))]
 const MACOS_TUN_ROUTE_SET: &[&str] = &[
     "1.0.0.0/8",
     "2.0.0.0/7",
@@ -578,7 +580,7 @@ fn ensure_default_macos_server_route(context: &CommandContext) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn default_server_bypass_route(context: &CommandContext) -> String {
     match &context.egress_gateway {
         Some(gateway) if !gateway.is_empty() => format!(
@@ -586,11 +588,6 @@ fn default_server_bypass_route(context: &CommandContext) -> String {
         ),
         _ => "route -q -n add -host {server_ip} -interface {egress_interface} >/dev/null 2>&1 || route -q -n change -host {server_ip} -interface {egress_interface}".to_owned(),
     }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn ensure_default_macos_server_route(_context: &CommandContext) -> Result<()> {
-    Ok(())
 }
 
 fn detect_helper_override() -> Option<TunHelperBinary> {
@@ -876,7 +873,7 @@ fn should_fallback_to_default_egress(route: &(Option<String>, Option<String>)) -
         || route.1.as_deref() == Some(MACOS_TUN_GATEWAY_V4)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn parse_macos_route_get(output: &str) -> Result<(Option<String>, Option<String>)> {
     let mut interface = None;
     let mut gateway = None;
@@ -894,11 +891,6 @@ fn parse_macos_route_get(output: &str) -> Result<(Option<String>, Option<String>
     }
 
     Ok((interface, gateway))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn parse_macos_route_get(_output: &str) -> Result<(Option<String>, Option<String>)> {
-    Ok((None, None))
 }
 
 fn spawn_shell_command(
