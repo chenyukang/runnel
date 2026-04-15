@@ -1,4 +1,6 @@
-use anyhow::{Context, Result, bail};
+#[cfg(any(target_os = "macos", test))]
+use anyhow::Context;
+use anyhow::{Result, bail};
 #[cfg(target_os = "macos")]
 use tracing::{info, warn};
 
