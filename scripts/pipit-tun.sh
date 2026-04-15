@@ -151,7 +151,7 @@ print_split_routes() {
 
 print_active_processes() {
   ps -axo pid,ppid,user,etime,command | awk '
-    /pipit|tun2proxy|tun2socks|AmneziaVPN|wireguard-go/ &&
+    /pipit|tun2proxy|AmneziaVPN|wireguard-go/ &&
     $0 !~ /scripts\/pipit-tun\.sh/ &&
     $0 !~ /awk/ {
       print
@@ -194,8 +194,7 @@ collect_tun_helper_pids_for_ifaces() {
   for iface in "$@"; do
     [[ -n "${iface}" ]] || continue
     ps -axo pid=,command= | awk -v iface="${iface}" '
-      (/tun2proxy/ && $0 ~ ("--tun " iface "($| )")) ||
-      (/tun2socks/ && $0 ~ ("-device " iface "($| )")) {
+      /tun2proxy/ && $0 ~ ("--tun " iface "($| )") {
         print $1
       }
     '

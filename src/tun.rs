@@ -103,16 +103,9 @@ enum TunHelperConfig {
     ExternalCommand(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TunHelperFlavor {
-    Tun2Proxy,
-    Tun2Socks,
-}
-
 #[derive(Clone, Debug)]
 struct TunHelperBinary {
     path: PathBuf,
-    flavor: TunHelperFlavor,
 }
 
 enum RunningTunHelper {
@@ -145,23 +138,9 @@ impl TunHelperConfig {
 }
 
 impl TunHelperBinary {
-    fn default_command(&self, context: &CommandContext) -> String {
-        match self.flavor {
-            TunHelperFlavor::Tun2Proxy => {
-                let program = shell_quote_path(&self.path);
-                format_tun2proxy_command(&program, "{device}", "{socks}")
-            }
-            TunHelperFlavor::Tun2Socks => {
-                let mut command = format!(
-                    "{} -device {{device}} -proxy socks5://{{socks}} -loglevel info -tcp-auto-tuning",
-                    shell_quote_path(&self.path)
-                );
-                if let Some(interface) = &context.egress_interface {
-                    command.push_str(&format!(" -interface {interface}"));
-                }
-                command
-            }
-        }
+    fn default_command(&self) -> String {
+        let program = shell_quote_path(&self.path);
+        format_tun2proxy_command(&program, "{device}", "{socks}")
     }
 }
 
@@ -458,10 +437,7 @@ impl CommandContext {
 }
 
 fn needs_egress_metadata(args: &TunArgs) -> bool {
-    let helper_override =
-        !args.helper_cmd.trim().is_empty() || std::env::var_os("PIPIT_TUN_HELPER").is_some();
-    (helper_override
-        && (args.helper_cmd.trim().is_empty() || needs_placeholder(&args.helper_cmd, "{egress_")))
+    (!args.helper_cmd.trim().is_empty() && needs_placeholder(&args.helper_cmd, "{egress_"))
         || args
             .up
             .iter()
@@ -482,7 +458,8 @@ fn effective_helper(args: &TunArgs, context: &CommandContext) -> Result<TunHelpe
         return Ok(TunHelperConfig::ExternalCommand(args.helper_cmd.clone()));
     }
 
-    default_helper(context)
+    let _ = context;
+    default_helper()
 }
 
 fn effective_up_hooks(args: &TunArgs, context: &CommandContext) -> Result<Vec<String>> {
@@ -501,11 +478,9 @@ fn effective_down_hooks(args: &TunArgs, context: &CommandContext) -> Result<Vec<
     default_down_hooks(context)
 }
 
-fn default_helper(context: &CommandContext) -> Result<TunHelperConfig> {
+fn default_helper() -> Result<TunHelperConfig> {
     if let Some(helper) = detect_helper_override() {
-        return Ok(TunHelperConfig::ExternalCommand(
-            helper.default_command(context),
-        ));
+        return Ok(TunHelperConfig::ExternalCommand(helper.default_command()));
     }
 
     Ok(TunHelperConfig::EmbeddedTun2Proxy)
@@ -594,27 +569,11 @@ fn detect_helper_override() -> Option<TunHelperBinary> {
     if let Some(path) = std::env::var_os("PIPIT_TUN_HELPER") {
         let candidate = PathBuf::from(path);
         if candidate.is_file() {
-            return Some(TunHelperBinary {
-                flavor: detect_tun_helper_flavor(&candidate),
-                path: candidate,
-            });
+            return Some(TunHelperBinary { path: candidate });
         }
     }
 
     None
-}
-
-fn detect_tun_helper_flavor(path: &Path) -> TunHelperFlavor {
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if name.contains("tun2socks") {
-        TunHelperFlavor::Tun2Socks
-    } else {
-        TunHelperFlavor::Tun2Proxy
-    }
 }
 
 fn resolve_tun_state_path(context: &CommandContext) -> Result<PathBuf> {
@@ -1297,9 +1256,8 @@ mod tests {
     use super::{
         AUTO_TUN_DEVICE, CommandContext, MACOS_TUN_GATEWAY_V4, TEST_SERVER_ENDPOINT,
         TEST_SERVER_HOST, TEST_SERVER_IP, TunArgs, TunHelperBinary, TunHelperConfig,
-        TunHelperFlavor, default_down_hooks, default_server_bypass_route, default_up_hooks,
-        detect_tun_helper_flavor, is_auto_device, parse_macos_route_get, plan_lines, print_plan,
-        shell_envs,
+        default_down_hooks, default_server_bypass_route, default_up_hooks, is_auto_device,
+        parse_macos_route_get, plan_lines, print_plan, shell_envs,
     };
     use crate::{client::ClientArgs, mode::ProxyMode, route::FilterMode};
     use std::path::PathBuf;
@@ -1327,64 +1285,13 @@ mod tests {
     }
 
     #[test]
-    fn helper_flavor_detection_prefers_tun2proxy_for_unknown_names() {
-        assert_eq!(
-            detect_tun_helper_flavor(std::path::Path::new("/usr/local/bin/tun2proxy-bin")),
-            TunHelperFlavor::Tun2Proxy
-        );
-        assert_eq!(
-            detect_tun_helper_flavor(std::path::Path::new("/usr/local/bin/custom-helper")),
-            TunHelperFlavor::Tun2Proxy
-        );
-        assert_eq!(
-            detect_tun_helper_flavor(std::path::Path::new("/usr/local/bin/tun2socks")),
-            TunHelperFlavor::Tun2Socks
-        );
-    }
-
-    #[test]
     fn tun2proxy_default_helper_command_uses_new_cli_flags() {
-        let context = CommandContext {
-            device: "utun233".to_owned(),
-            socks_listen: "127.0.0.1:1080".to_owned(),
-            server: TEST_SERVER_ENDPOINT.to_owned(),
-            server_host: TEST_SERVER_HOST.to_owned(),
-            server_port: 1443,
-            server_ip: TEST_SERVER_IP.to_owned(),
-            egress_interface: Some("en0".to_owned()),
-            egress_gateway: Some("192.168.3.1".to_owned()),
-            log_file: Some("proxy.log".to_owned()),
-        };
         let helper = TunHelperBinary {
             path: PathBuf::from("/usr/local/bin/tun2proxy-bin"),
-            flavor: TunHelperFlavor::Tun2Proxy,
         };
         assert_eq!(
-            helper.default_command(&context),
+            helper.default_command(),
             "'/usr/local/bin/tun2proxy-bin' --tun {device} --proxy socks5://{socks} --dns direct --verbosity warn --exit-on-fatal-error"
-        );
-    }
-
-    #[test]
-    fn tun2socks_default_helper_command_keeps_legacy_interface_flag() {
-        let context = CommandContext {
-            device: "utun233".to_owned(),
-            socks_listen: "127.0.0.1:1080".to_owned(),
-            server: TEST_SERVER_ENDPOINT.to_owned(),
-            server_host: TEST_SERVER_HOST.to_owned(),
-            server_port: 1443,
-            server_ip: TEST_SERVER_IP.to_owned(),
-            egress_interface: Some("en0".to_owned()),
-            egress_gateway: Some("192.168.3.1".to_owned()),
-            log_file: Some("proxy.log".to_owned()),
-        };
-        let helper = TunHelperBinary {
-            path: PathBuf::from("/usr/local/bin/tun2socks"),
-            flavor: TunHelperFlavor::Tun2Socks,
-        };
-        assert_eq!(
-            helper.default_command(&context),
-            "'/usr/local/bin/tun2socks' -device {device} -proxy socks5://{socks} -loglevel info -tcp-auto-tuning -interface en0"
         );
     }
 
