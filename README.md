@@ -174,6 +174,23 @@ Notes:
 - if the pid file is stale, `pipit stop` removes it and exits cleanly
 - if more than one default pid file exists, pass `stop client`, `stop server`, `stop tun`, or `--pid-file`
 
+## Daemon Status
+
+You can inspect daemon state with:
+
+```bash
+cargo run -- status
+cargo run -- status client
+cargo run -- --pid-file ./proxy.client.pid status --json
+```
+
+`status` checks both the pid file and the telemetry socket when available, so it can distinguish between:
+
+- a healthy running daemon
+- a live process with degraded telemetry
+- a stale pid file
+- a daemon that is not running
+
 ## Attach TUI
 
 Once a daemon is already running, you can open a separate dashboard process with:

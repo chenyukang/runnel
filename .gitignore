@@ -5,3 +5,4 @@
 *.yaml
 *.state.json
 .cargo
+*.pid

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use pipit::{cert, client, config, server, telemetry, tui, tun};
+use serde::Serialize;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -45,6 +46,7 @@ enum Commands {
     Cert(cert::CertArgs),
     Tui(TuiArgs),
     Stop(StopArgs),
+    Status(StatusArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -76,6 +78,14 @@ struct StopArgs {
     role: Option<ServiceRole>,
     #[arg(long, default_value_t = 10)]
     wait_secs: u64,
+}
+
+#[derive(Debug, Clone, Args)]
+struct StatusArgs {
+    #[arg(value_enum)]
+    role: Option<ServiceRole>,
+    #[arg(long)]
+    json: bool,
 }
 
 #[tokio::main]
@@ -115,7 +125,7 @@ async fn main() -> Result<()> {
                         args.attach = cli.telemetry_sock.clone();
                     }
                 }
-                (Commands::Stop(_), "stop") => {}
+                (Commands::Stop(_), "stop") | (Commands::Status(_), "status") => {}
                 _ => {}
             }
         }
@@ -128,6 +138,16 @@ async fn main() -> Result<()> {
     }
     if let Commands::Stop(args) = &cli.command {
         stop_daemon_process(&cli.log_file, cli.pid_file.clone(), args.clone()).await?;
+        return Ok(());
+    }
+    if let Commands::Status(args) = &cli.command {
+        status_daemon_processes(
+            &cli.log_file,
+            cli.pid_file.clone(),
+            cli.telemetry_sock.clone(),
+            args.clone(),
+        )
+        .await?;
         return Ok(());
     }
     if let Commands::Tui(args) = cli.command {
@@ -155,6 +175,7 @@ async fn main() -> Result<()> {
             Commands::Cert(args) => cert::run(args),
             Commands::Tui(_) => Ok(()),
             Commands::Stop(_) => Ok(()),
+            Commands::Status(_) => Ok(()),
         }
     };
 
@@ -174,7 +195,10 @@ async fn main() -> Result<()> {
 }
 
 fn normalize_cli_modes(cli: &mut Cli) {
-    if matches!(cli.command, Commands::Tui(_) | Commands::Stop(_)) {
+    if matches!(
+        cli.command,
+        Commands::Tui(_) | Commands::Stop(_) | Commands::Status(_)
+    ) {
         cli.tui = false;
         cli.daemon = false;
         return;
@@ -193,7 +217,7 @@ fn validate_daemon_mode(cli: &Cli) -> Result<()> {
 
     match cli.command {
         Commands::Client(_) | Commands::Server(_) | Commands::Tun(_) => Ok(()),
-        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) => {
+        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) | Commands::Status(_) => {
             anyhow::bail!("--daemon is only supported for client, server, and tun")
         }
     }
@@ -359,7 +383,9 @@ fn dashboard_context(cli: &Cli, log_file: PathBuf) -> Option<tui::DashboardConte
             log_file,
             log_filter: cli.log.clone(),
         },
-        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) => return None,
+        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) | Commands::Status(_) => {
+            return None;
+        }
     };
 
     Some(context)
@@ -416,7 +442,9 @@ fn monitor_context(cli: &Cli, log_file: PathBuf) -> Option<telemetry::MonitorCon
             log_filter: cli.log.clone(),
             pid,
         },
-        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) => return None,
+        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) | Commands::Status(_) => {
+            return None;
+        }
     };
 
     Some(context)
@@ -507,7 +535,340 @@ fn command_role(command: &Commands) -> Option<&'static str> {
         Commands::Client(_) => Some("client"),
         Commands::Server(_) => Some("server"),
         Commands::Tun(_) => Some("tun"),
-        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) => None,
+        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) | Commands::Status(_) => None,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StatusTarget {
+    label: String,
+    pid_file: Option<PathBuf>,
+    telemetry_socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusReport {
+    services: Vec<ServiceStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct ServiceStatus {
+    role: String,
+    state: String,
+    pid_file: Option<PathBuf>,
+    telemetry_sock: Option<PathBuf>,
+    pid_from_file: Option<u32>,
+    runtime: Option<RuntimeStatus>,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeStatus {
+    command: String,
+    mode: String,
+    pid: u32,
+    listen: Option<String>,
+    upstream: Option<String>,
+    path: Option<String>,
+    log_file: PathBuf,
+    log_filter: String,
+    uptime_secs: u64,
+    total_relays: u64,
+    total_errors: u64,
+    total_warnings: u64,
+    total_uploaded: u64,
+    total_downloaded: u64,
+    last_event_age_ms: Option<u64>,
+    last_warning_age_ms: Option<u64>,
+    last_traffic_age_ms: Option<u64>,
+}
+
+impl From<telemetry::DashboardSnapshot> for RuntimeStatus {
+    fn from(snapshot: telemetry::DashboardSnapshot) -> Self {
+        Self {
+            command: snapshot.context.command_label,
+            mode: snapshot.context.mode_label,
+            pid: snapshot.context.pid,
+            listen: snapshot.context.listen,
+            upstream: snapshot.context.upstream,
+            path: snapshot.context.path,
+            log_file: snapshot.context.log_file,
+            log_filter: snapshot.context.log_filter,
+            uptime_secs: snapshot.uptime_secs,
+            total_relays: snapshot.total_relays,
+            total_errors: snapshot.total_errors,
+            total_warnings: snapshot.total_warnings,
+            total_uploaded: snapshot.total_uploaded,
+            total_downloaded: snapshot.total_downloaded,
+            last_event_age_ms: snapshot.last_event_age_ms,
+            last_warning_age_ms: snapshot.last_warning_age_ms,
+            last_traffic_age_ms: snapshot.last_traffic_age_ms,
+        }
+    }
+}
+
+async fn status_daemon_processes(
+    log_file: &Path,
+    configured_pid_file: Option<PathBuf>,
+    configured_socket: Option<PathBuf>,
+    args: StatusArgs,
+) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (log_file, configured_pid_file, configured_socket, args);
+        anyhow::bail!("pipit status is only supported on unix platforms");
+    }
+
+    #[cfg(unix)]
+    {
+        let targets =
+            resolve_status_targets(log_file, configured_pid_file, configured_socket, args.role)?;
+        let mut services = Vec::with_capacity(targets.len());
+        for target in targets {
+            services.push(inspect_status_target(target).await?);
+        }
+        let report = StatusReport { services };
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).context("failed to encode status JSON")?
+            );
+        } else {
+            print_status_report(&report);
+        }
+        Ok(())
+    }
+}
+
+fn resolve_status_targets(
+    log_file: &Path,
+    configured_pid_file: Option<PathBuf>,
+    configured_socket: Option<PathBuf>,
+    role: Option<ServiceRole>,
+) -> Result<Vec<StatusTarget>> {
+    if let Some(role) = role {
+        return Ok(vec![StatusTarget {
+            label: role.as_str().to_owned(),
+            pid_file: Some(match configured_pid_file {
+                Some(path) => absolute_path(&path)?,
+                None => default_pid_path(log_file, role.as_str())?,
+            }),
+            telemetry_socket: Some(match configured_socket {
+                Some(path) => absolute_path(&path)?,
+                None => default_socket_path(log_file, role.as_str())?,
+            }),
+        }]);
+    }
+
+    if configured_pid_file.is_some() || configured_socket.is_some() {
+        return Ok(vec![StatusTarget {
+            label: "service".to_owned(),
+            pid_file: configured_pid_file
+                .as_deref()
+                .map(absolute_path)
+                .transpose()?,
+            telemetry_socket: configured_socket
+                .as_deref()
+                .map(absolute_path)
+                .transpose()?,
+        }]);
+    }
+
+    Ok(["client", "server", "tun"]
+        .into_iter()
+        .map(|role| {
+            Ok(StatusTarget {
+                label: role.to_owned(),
+                pid_file: Some(default_pid_path(log_file, role)?),
+                telemetry_socket: Some(default_socket_path(log_file, role)?),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?)
+}
+
+#[cfg(unix)]
+async fn inspect_status_target(target: StatusTarget) -> Result<ServiceStatus> {
+    let mut notes = Vec::new();
+
+    let pid_file_exists = target.pid_file.as_ref().is_some_and(|path| path.exists());
+    let (pid_from_file, pid_alive) = match &target.pid_file {
+        Some(path) if path.exists() => match read_pid_file(path) {
+            Ok(pid) => {
+                let alive = process_exists(pid)?;
+                if !alive {
+                    notes.push(format!("stale pid file {}", path.display()));
+                }
+                (Some(pid), Some(alive))
+            }
+            Err(err) => {
+                notes.push(format!("{err:#}"));
+                (None, None)
+            }
+        },
+        Some(path) => {
+            notes.push(format!("pid file not found: {}", path.display()));
+            (None, None)
+        }
+        None => (None, None),
+    };
+
+    let runtime = match &target.telemetry_socket {
+        Some(path) if path.exists() => match telemetry::attach_socket(path).await {
+            Ok((snapshot, _receiver)) => Some(RuntimeStatus::from(snapshot)),
+            Err(err) => {
+                notes.push(format!(
+                    "failed to query telemetry socket {}: {err:#}",
+                    path.display()
+                ));
+                None
+            }
+        },
+        Some(path) => {
+            notes.push(format!("telemetry socket not found: {}", path.display()));
+            None
+        }
+        None => None,
+    };
+
+    if let (Some(pid), Some(runtime)) = (pid_from_file, runtime.as_ref())
+        && pid != runtime.pid
+    {
+        notes.push(format!(
+            "pid file reports {}, telemetry reports {}",
+            pid, runtime.pid
+        ));
+    }
+
+    let role = runtime
+        .as_ref()
+        .map(|runtime| runtime.command.clone())
+        .unwrap_or_else(|| target.label.clone());
+    let state = classify_service_state(
+        target.pid_file.is_some(),
+        pid_file_exists,
+        pid_from_file,
+        pid_alive,
+        runtime.as_ref(),
+    );
+
+    Ok(ServiceStatus {
+        role,
+        state: state.to_owned(),
+        pid_file: target.pid_file,
+        telemetry_sock: target.telemetry_socket,
+        pid_from_file,
+        runtime,
+        detail: (!notes.is_empty()).then(|| notes.join("; ")),
+    })
+}
+
+fn classify_service_state(
+    expects_pid_file: bool,
+    pid_file_exists: bool,
+    pid_from_file: Option<u32>,
+    pid_alive: Option<bool>,
+    runtime: Option<&RuntimeStatus>,
+) -> &'static str {
+    if let Some(runtime) = runtime {
+        if expects_pid_file {
+            return match (pid_from_file, pid_alive) {
+                (Some(pid), Some(true)) if pid == runtime.pid => "running",
+                _ => "degraded",
+            };
+        }
+        return "running";
+    }
+
+    if matches!(pid_alive, Some(true)) {
+        return "degraded";
+    }
+
+    if expects_pid_file && (pid_file_exists || pid_from_file.is_some()) {
+        return "stale";
+    }
+
+    "not-running"
+}
+
+fn print_status_report(report: &StatusReport) {
+    for (index, service) in report.services.iter().enumerate() {
+        if index > 0 {
+            println!();
+        }
+
+        println!("{}: {}", service.role, service.state);
+        if let Some(pid) = service
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.pid)
+            .or(service.pid_from_file)
+        {
+            println!("  pid: {pid}");
+        }
+        if let Some(runtime) = &service.runtime {
+            println!("  mode: {}", runtime.mode);
+            if let Some(listen) = &runtime.listen {
+                println!("  listen: {listen}");
+            }
+            if let Some(upstream) = &runtime.upstream {
+                println!("  upstream: {upstream}");
+            }
+            if let Some(path) = &runtime.path {
+                println!("  path: {path}");
+            }
+            println!("  uptime: {}", format_duration(runtime.uptime_secs));
+            println!(
+                "  traffic: up {} down {}",
+                format_bytes(runtime.total_uploaded),
+                format_bytes(runtime.total_downloaded)
+            );
+            println!(
+                "  health: relays {} warnings {} errors {}",
+                runtime.total_relays, runtime.total_warnings, runtime.total_errors
+            );
+            println!(
+                "  log: {} ({})",
+                runtime.log_file.display(),
+                runtime.log_filter
+            );
+        }
+        if let Some(pid_file) = &service.pid_file {
+            println!("  pid_file: {}", pid_file.display());
+        }
+        if let Some(telemetry_sock) = &service.telemetry_sock {
+            println!("  telemetry_sock: {}", telemetry_sock.display());
+        }
+        if let Some(detail) = &service.detail {
+            println!("  detail: {detail}");
+        }
+    }
+}
+
+fn format_duration(total_secs: u64) -> String {
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", bytes, UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 
@@ -682,5 +1043,114 @@ struct PidFileGuard {
 impl Drop for PidFileGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RuntimeStatus, ServiceRole, classify_service_state, resolve_status_targets};
+    use std::path::Path;
+
+    #[test]
+    fn status_targets_default_to_all_roles() {
+        let targets = resolve_status_targets(Path::new("proxy.log"), None, None, None).unwrap();
+        let labels = targets
+            .iter()
+            .map(|target| target.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["client", "server", "tun"]);
+        assert!(targets.iter().all(|target| target.pid_file.is_some()));
+        assert!(
+            targets
+                .iter()
+                .all(|target| target.telemetry_socket.is_some())
+        );
+    }
+
+    #[test]
+    fn status_target_uses_role_specific_overrides() {
+        let targets = resolve_status_targets(
+            Path::new("proxy.log"),
+            Some(Path::new("custom.pid").to_path_buf()),
+            Some(Path::new("custom.sock").to_path_buf()),
+            Some(ServiceRole::Tun),
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].label, "tun");
+        assert!(
+            targets[0]
+                .pid_file
+                .as_ref()
+                .is_some_and(|path| path.ends_with("custom.pid"))
+        );
+        assert!(
+            targets[0]
+                .telemetry_socket
+                .as_ref()
+                .is_some_and(|path| path.ends_with("custom.sock"))
+        );
+    }
+
+    #[test]
+    fn status_state_is_running_when_pid_and_runtime_match() {
+        let runtime = RuntimeStatus {
+            command: "client".to_owned(),
+            mode: "native-http".to_owned(),
+            pid: 42,
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: Path::new("proxy.log").to_path_buf(),
+            log_filter: "info".to_owned(),
+            uptime_secs: 0,
+            total_relays: 0,
+            total_errors: 0,
+            total_warnings: 0,
+            total_uploaded: 0,
+            total_downloaded: 0,
+            last_event_age_ms: None,
+            last_warning_age_ms: None,
+            last_traffic_age_ms: None,
+        };
+        assert_eq!(
+            classify_service_state(true, true, Some(42), Some(true), Some(&runtime)),
+            "running"
+        );
+    }
+
+    #[test]
+    fn status_state_is_degraded_when_runtime_disagrees_with_pid_file() {
+        let runtime = RuntimeStatus {
+            command: "tun".to_owned(),
+            mode: "native-http".to_owned(),
+            pid: 77,
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: Path::new("proxy.log").to_path_buf(),
+            log_filter: "info".to_owned(),
+            uptime_secs: 0,
+            total_relays: 0,
+            total_errors: 0,
+            total_warnings: 0,
+            total_uploaded: 0,
+            total_downloaded: 0,
+            last_event_age_ms: None,
+            last_warning_age_ms: None,
+            last_traffic_age_ms: None,
+        };
+        assert_eq!(
+            classify_service_state(true, true, Some(42), Some(true), Some(&runtime)),
+            "degraded"
+        );
+    }
+
+    #[test]
+    fn status_state_is_stale_when_only_pid_file_remains() {
+        assert_eq!(
+            classify_service_state(true, true, Some(42), Some(false), None),
+            "stale"
+        );
     }
 }

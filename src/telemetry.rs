@@ -351,6 +351,7 @@ pub async fn start_socket_server(path: PathBuf) -> Result<()> {
     }
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("failed to bind telemetry socket {}", path.display()))?;
+    prepare_attachable_socket(&path)?;
     let sender = hub.sender.clone();
     let snapshot = hub.snapshot.clone();
 
@@ -368,6 +369,63 @@ pub async fn start_socket_server(path: PathBuf) -> Result<()> {
     });
 
     Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_attachable_socket(path: &Path) -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+
+    if let (Some(uid), Some(gid)) = (sudo_uid(), sudo_gid())
+        && chown_socket_to_user(path, uid, gid).is_ok()
+    {
+        return set_socket_mode(path, 0o660);
+    }
+
+    // Root-launched daemons should still be inspectable from the invoking user.
+    set_socket_mode(path, 0o666)
+}
+
+#[cfg(unix)]
+fn sudo_uid() -> Option<u32> {
+    std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+}
+
+#[cfg(unix)]
+fn sudo_gid() -> Option<u32> {
+    std::env::var("SUDO_GID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+}
+
+#[cfg(unix)]
+fn chown_socket_to_user(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid socket path")
+    })?;
+    let rc = unsafe { libc::chown(path.as_ptr(), uid, gid) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn set_socket_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).with_context(|| {
+        format!(
+            "failed to update telemetry socket permissions {}",
+            path.display()
+        )
+    })
 }
 
 #[cfg(not(unix))]
