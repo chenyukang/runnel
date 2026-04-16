@@ -286,10 +286,19 @@ impl DashboardApp {
         self.capture_listener_context(&event);
         self.capture_recent_event(&event);
 
+        if event.message == "dns query" {
+            self.capture_recent_domain(&event);
+            return;
+        }
+
         if event.message == "traffic sample" {
             self.last_traffic_at = Some(Instant::now());
             let uploaded = parse_u64(event.fields.get("uploaded"));
             let downloaded = parse_u64(event.fields.get("downloaded"));
+            if traffic_sample_is_aggregate(&event) {
+                self.total_uploaded += uploaded;
+                self.total_downloaded += downloaded;
+            }
             if let Some(last) = self.upload_history.last_mut() {
                 *last += uploaded;
             }
@@ -338,6 +347,33 @@ impl DashboardApp {
             });
             self.recent_targets.truncate(RECENT_TARGETS);
         }
+    }
+
+    fn capture_recent_domain(&mut self, event: &TraceEvent) {
+        let target = event
+            .fields
+            .get("target")
+            .cloned()
+            .unwrap_or_else(|| "-".to_owned());
+        let link = event
+            .fields
+            .get("link")
+            .cloned()
+            .unwrap_or_else(|| link_from_target(&target));
+        let route = event
+            .fields
+            .get("route")
+            .cloned()
+            .unwrap_or_else(|| "remote".to_owned());
+
+        self.recent_targets.push_front(RecentTarget {
+            seen_at: clock_stamp(event.at),
+            link,
+            route,
+            uploaded: 0,
+            downloaded: 0,
+        });
+        self.recent_targets.truncate(RECENT_TARGETS);
     }
 
     fn refresh_process_stats(&mut self) {
@@ -394,6 +430,9 @@ impl DashboardApp {
     }
 
     fn capture_recent_event(&mut self, event: &TraceEvent) {
+        if event.message == "traffic sample" || event.message == "dns query" {
+            return;
+        }
         if event.message.contains("relay completed") && self.recent_events.len() >= RECENT_EVENTS {
             return;
         }
@@ -596,41 +635,36 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[3]);
 
+    let speed = current_speed(app);
     let rows = app.recent_targets.iter().map(|item| {
         Row::new(vec![
             Cell::from(item.seen_at.clone()),
             Cell::from(item.route.clone()),
             Cell::from(item.link.clone()),
-            Cell::from(format!(
-                "{} / {}",
-                format_bytes(item.uploaded),
-                format_bytes(item.downloaded)
-            )),
+            Cell::from(recent_target_activity(item, &app.context, speed)),
         ])
     });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(8),
-            Constraint::Length(7),
-            Constraint::Percentage(55),
-            Constraint::Length(18),
-        ],
-    )
-    .header(
-        Row::new(vec!["When", "Route", "Link", "Up / Down"]).style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Recent Domains")
-            .border_style(Style::default().fg(Color::Blue)),
-    )
-    .column_spacing(1);
+    let table = Table::new(rows, recent_targets_widths())
+        .header(
+            Row::new(vec![
+                "When",
+                "Route",
+                "Link",
+                recent_targets_activity_header(&app.context),
+            ])
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(recent_targets_title(&app.context))
+                .border_style(Style::default().fg(Color::Blue)),
+        )
+        .column_spacing(1);
     frame.render_widget(table, lower[0]);
 
     let items = app
@@ -781,6 +815,11 @@ fn parse_bool(value: Option<&String>) -> bool {
         .unwrap_or(false)
 }
 
+fn traffic_sample_is_aggregate(event: &TraceEvent) -> bool {
+    parse_bool(event.fields.get("aggregate"))
+        || event.fields.get("mode").is_some_and(|mode| mode == "wg")
+}
+
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -836,6 +875,66 @@ fn link_from_target(target: &str) -> String {
         Some(port) => format!("tcp://{host}:{port}"),
         None => format!("tcp://{target}"),
     }
+}
+
+fn recent_targets_title(context: &DashboardContext) -> &'static str {
+    if recent_targets_are_domain_events(context) {
+        "Recent Domains"
+    } else {
+        "Recent Domains"
+    }
+}
+
+fn recent_targets_activity_header(context: &DashboardContext) -> &'static str {
+    if recent_targets_are_domain_events(context) {
+        "Tunnel Speed"
+    } else {
+        "Up / Down"
+    }
+}
+
+fn recent_target_activity(
+    item: &RecentTarget,
+    context: &DashboardContext,
+    speed: (u64, u64),
+) -> String {
+    if recent_targets_are_domain_events(context) || item.link.starts_with("dns://") {
+        return format_speed(speed);
+    }
+
+    format!(
+        "{} / {}",
+        format_bytes(item.uploaded),
+        format_bytes(item.downloaded)
+    )
+}
+
+fn current_speed(app: &DashboardApp) -> (u64, u64) {
+    (
+        app.upload_history.last().copied().unwrap_or_default(),
+        app.download_history.last().copied().unwrap_or_default(),
+    )
+}
+
+fn format_speed((uploaded_per_sec, downloaded_per_sec): (u64, u64)) -> String {
+    format!(
+        "{}/s / {}/s",
+        format_bytes(uploaded_per_sec),
+        format_bytes(downloaded_per_sec)
+    )
+}
+
+fn recent_targets_are_domain_events(context: &DashboardContext) -> bool {
+    context.mode_label == "wg" || context.command_label.starts_with("wg-")
+}
+
+fn recent_targets_widths() -> [Constraint; 4] {
+    [
+        Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Min(16),
+        Constraint::Length(24),
+    ]
 }
 
 fn sample_process_stats(pid: u32) -> ProcessStats {
@@ -914,7 +1013,13 @@ fn split_target(target: &str) -> (String, Option<u16>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_wave_data_to_width, link_from_target, split_target};
+    use super::{
+        DashboardApp, DashboardContext, RecentTarget, TraceEvent, fit_wave_data_to_width,
+        link_from_target, recent_target_activity, recent_targets_activity_header,
+        recent_targets_title, recent_targets_widths, split_target,
+    };
+    use ratatui::layout::Constraint;
+    use std::{collections::BTreeMap, path::PathBuf, time::SystemTime};
 
     #[test]
     fn wave_data_uses_full_width_when_panel_is_wider() {
@@ -942,5 +1047,208 @@ mod tests {
     #[test]
     fn split_ipv6_target() {
         assert_eq!(split_target("[::1]:1080"), ("::1".to_owned(), Some(1080)));
+    }
+
+    #[test]
+    fn traffic_sample_updates_history_without_totals_by_default() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        });
+
+        app.ingest(trace_event(
+            "INFO",
+            "traffic sample",
+            &[("uploaded", "12"), ("downloaded", "34")],
+        ));
+
+        assert_eq!(app.total_uploaded, 0);
+        assert_eq!(app.total_downloaded, 0);
+        assert_eq!(app.total_relays, 0);
+        assert_eq!(app.upload_history.last().copied(), Some(12));
+        assert_eq!(app.download_history.last().copied(), Some(34));
+        assert!(app.last_traffic_at.is_some());
+    }
+
+    #[test]
+    fn wg_traffic_sample_updates_totals_without_recent_target() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        });
+
+        app.ingest(trace_event(
+            "INFO",
+            "traffic sample",
+            &[
+                ("uploaded", "12"),
+                ("downloaded", "34"),
+                ("mode", "wg"),
+                ("target", "wireguard"),
+                ("link", "wg://wireguard"),
+                ("route", "wg-client"),
+            ],
+        ));
+
+        assert_eq!(app.total_uploaded, 12);
+        assert_eq!(app.total_downloaded, 34);
+        assert_eq!(app.total_relays, 0);
+        assert!(app.recent_targets.is_empty());
+    }
+
+    #[test]
+    fn traffic_sample_does_not_fill_recent_events_or_targets() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        });
+
+        app.ingest(trace_event(
+            "INFO",
+            "traffic sample",
+            &[
+                ("uploaded", "12"),
+                ("downloaded", "34"),
+                ("mode", "wg"),
+                ("target", "wireguard"),
+            ],
+        ));
+
+        assert!(app.recent_events.is_empty());
+        assert!(app.recent_targets.is_empty());
+    }
+
+    #[test]
+    fn dns_query_updates_recent_domain_without_recent_event_spam() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        });
+
+        app.ingest(trace_event(
+            "INFO",
+            "dns query",
+            &[
+                ("target", "example.com"),
+                ("link", "dns://example.com"),
+                ("route", "wg-dns"),
+            ],
+        ));
+
+        assert!(app.recent_events.is_empty());
+        assert_eq!(app.recent_targets.len(), 1);
+        assert_eq!(app.recent_targets[0].link, "dns://example.com");
+        assert_eq!(app.recent_targets[0].route, "wg-dns");
+    }
+
+    #[test]
+    fn wg_context_renames_recent_domains_panel() {
+        let context = DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        };
+
+        assert_eq!(recent_targets_title(&context), "Recent Domains");
+        assert_eq!(recent_targets_activity_header(&context), "Tunnel Speed");
+    }
+
+    #[test]
+    fn wg_recent_domain_activity_shows_tunnel_speed() {
+        let context = DashboardContext {
+            command_label: "client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        };
+        let item = RecentTarget {
+            seen_at: "08:27:01".to_owned(),
+            route: "wg-dns".to_owned(),
+            link: "dns://example.com".to_owned(),
+            uploaded: 0,
+            downloaded: 0,
+        };
+
+        assert_eq!(
+            recent_target_activity(&item, &context, (1536, 2048)),
+            "1.5 KiB/s / 2.0 KiB/s"
+        );
+    }
+
+    #[test]
+    fn non_wg_recent_target_activity_keeps_byte_totals() {
+        let context = DashboardContext {
+            command_label: "client".to_owned(),
+            mode_label: "native-http".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        };
+        let item = RecentTarget {
+            seen_at: "08:27:01".to_owned(),
+            route: "remote".to_owned(),
+            link: "https://example.com".to_owned(),
+            uploaded: 1024,
+            downloaded: 2048,
+        };
+
+        assert_eq!(recent_targets_activity_header(&context), "Up / Down");
+        assert_eq!(
+            recent_target_activity(&item, &context, (0, 0)),
+            "1.0 KiB / 2.0 KiB"
+        );
+    }
+
+    #[test]
+    fn recent_targets_widths_fit_wg_route_and_common_totals() {
+        let widths = recent_targets_widths();
+
+        assert!(
+            matches!(widths[1], Constraint::Length(width) if width >= "wg-client".len() as u16)
+        );
+        assert!(
+            matches!(widths[3], Constraint::Length(width) if width >= "25.4 KiB / 39.9 KiB".len() as u16)
+        );
+    }
+
+    fn trace_event(level: &str, message: &str, fields: &[(&str, &str)]) -> TraceEvent {
+        TraceEvent {
+            at: SystemTime::UNIX_EPOCH,
+            level: level.to_owned(),
+            message: message.to_owned(),
+            fields: fields
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect::<BTreeMap<_, _>>(),
+        }
     }
 }

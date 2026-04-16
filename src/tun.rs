@@ -1634,6 +1634,7 @@ mod tests {
             system_proxy_services: Vec::new(),
             tun_dns_redirect_ip: None,
             tun_dns_upstream: None,
+            wg: Default::default(),
         };
 
         super::normalize_client_args_for_tun(&mut args).expect("tun normalization succeeds");
@@ -1666,6 +1667,7 @@ mod tests {
             system_proxy_services: vec!["Wi-Fi".to_owned()],
             tun_dns_redirect_ip: None,
             tun_dns_upstream: None,
+            wg: Default::default(),
         };
 
         super::normalize_client_args_for_tun(&mut args).expect("tun normalization succeeds");
@@ -1697,6 +1699,7 @@ mod tests {
             system_proxy_services: Vec::new(),
             tun_dns_redirect_ip: None,
             tun_dns_upstream: None,
+            wg: Default::default(),
         };
 
         let err =
@@ -1729,6 +1732,7 @@ mod tests {
             system_proxy_services: Vec::new(),
             tun_dns_redirect_ip: None,
             tun_dns_upstream: None,
+            wg: Default::default(),
         };
 
         let err = super::normalize_client_args_for_tun(&mut args)
@@ -1762,6 +1766,7 @@ mod tests {
                 system_proxy_services: Vec::new(),
                 tun_dns_redirect_ip: None,
                 tun_dns_upstream: None,
+                wg: Default::default(),
             },
             device: "utun233".to_owned(),
             shell: "/bin/sh".to_owned(),

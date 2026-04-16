@@ -1,45 +1,44 @@
+# Sample native-http config.
+# Use PIPIT_PASSWORD for the shared secret; do not commit real passwords.
+
 log: info
-log_file: proxy.log
+log_file: ./logs/pipit-native-http.log
+telemetry_sock: ./run/pipit-native-http.sock
 tui: true
 
 client:
   listen: 127.0.0.1:1080
-  server: server-ip:1443
-  server_name: example.com
-  ca_cert: server.crt
+  server: SERVER-IP:1443
+  server_name: SERVER-NAME
+  ca_cert: ./certs/server.crt
   mode: native-http
-  password: PASSWORD-PALCE-HOLDER
-  filter: rule
-  rule_file: rule.ls
-  cidr_file: rule.cidr
-  system_proxy: false
-  system_proxy_services:
-    - Wi-Fi
+  path: /connect
+  filter: proxy
   user_agent: Mozilla/5.0
   handshake_timeout_secs: 10
   connect_timeout_secs: 10
   max_header_size: 8192
+  system_proxy: false
 
 server:
   listen: 0.0.0.0:1443
-  cert: server.crt
-  key: server.key
+  cert: ./certs/server.crt
+  key: ./certs/server.key
   mode: native-http
-  password: PASSWORD-PALCE-HOLDER
   path: /connect
-  mux_path: /mux
   auth_window_secs: 120
   handshake_timeout_secs: 10
   connect_timeout_secs: 10
   max_header_size: 16384
   max_tunnel_body_size: 8192
   allow_private_targets: false
-  fallback_url: https://www.qq.com
+  fallback_url: https://example.org
   fallback_timeout_secs: 15
   max_fallback_body_size: 1048576
 
 cert:
-  cert: server.crt
-  key: server.key
+  cert: ./certs/server.crt
+  key: ./certs/server.key
   names:
-    - example.com
+    - SERVER-NAME
+

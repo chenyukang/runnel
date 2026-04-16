@@ -73,6 +73,7 @@ async fn native_http_server_fallback_serves_plain_tls_requests() -> Result<()> {
             fallback_url: format!("http://127.0.0.1:{fallback_port}"),
             fallback_timeout_secs: 5,
             max_fallback_body_size: 1024 * 1024,
+            wg: Default::default(),
         },
         Some(fallback_handle),
         None,
@@ -130,6 +131,7 @@ async fn daze_baboon_server_fallback_serves_plain_http_requests() -> Result<()> 
             fallback_url: format!("http://127.0.0.1:{fallback_port}"),
             fallback_timeout_secs: 5,
             max_fallback_body_size: 1024 * 1024,
+            wg: Default::default(),
         },
         Some(fallback_handle),
         None,
@@ -184,6 +186,7 @@ async fn native_http_mode_rejects_private_literal_targets_by_default() -> Result
         system_proxy_services: Vec::new(),
         tun_dns_redirect_ip: None,
         tun_dns_upstream: None,
+        wg: Default::default(),
     };
 
     let _env = start_server(
@@ -204,6 +207,7 @@ async fn native_http_mode_rejects_private_literal_targets_by_default() -> Result
             fallback_url: "http://127.0.0.1:1".to_owned(),
             fallback_timeout_secs: 1,
             max_fallback_body_size: 1024,
+            wg: Default::default(),
         },
         None,
         Some(client_args),

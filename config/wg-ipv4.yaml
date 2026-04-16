@@ -1,0 +1,37 @@
+# Sample WG IPv4 config.
+# Prefer generating a fresh config with `pipit wg-config`.
+# Replace every REPLACE_WITH_* value before running.
+
+log: info
+log_file: ./logs/pipit-wg-ipv4.log
+telemetry_sock: ./run/pipit-wg-ipv4.sock
+tui: true
+
+client:
+  mode: wg
+  wg:
+    endpoint: SERVER-IP:51820
+    private_key: REPLACE_WITH_CLIENT_PRIVATE_KEY
+    peer_public_key: REPLACE_WITH_SERVER_PUBLIC_KEY
+    tunnel_ip: 10.8.0.2
+    peer_tunnel_ip: 10.8.0.1
+    mtu: 1420
+    persistent_keepalive_secs: 25
+    dns: 1.1.1.1
+    dns_capture: true
+    allowed_ips:
+      - 0.0.0.0/0
+    exclude_lan: true
+
+server:
+  mode: wg
+  wg:
+    listen: 0.0.0.0:51820
+    private_key: REPLACE_WITH_SERVER_PRIVATE_KEY
+    peer_public_key: REPLACE_WITH_CLIENT_PUBLIC_KEY
+    tunnel_ip: 10.8.0.1
+    peer_tunnel_ip: 10.8.0.2
+    mtu: 1420
+    peer_allowed_ips:
+      - 10.8.0.2/32
+    nat_out_interface: eth0

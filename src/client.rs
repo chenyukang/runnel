@@ -1,6 +1,6 @@
 use crate::{
     auth::AuthProof, http, mode::ProxyMode, netlog, route, route::FilterMode, route::RouteDecision,
-    socks5, system_proxy, tls, traffic, udp_assoc,
+    socks5, system_proxy, tls, traffic, udp_assoc, wg,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -15,8 +15,8 @@ use tokio::{
     net::{TcpListener, TcpStream},
     time::timeout,
 };
-use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use tracing::{info, warn};
 
 const TUN_DNS_PORT: u16 = 53;
@@ -65,6 +65,8 @@ pub struct ClientArgs {
     pub tun_dns_redirect_ip: Option<IpAddr>,
     #[arg(skip)]
     pub tun_dns_upstream: Option<SocketAddr>,
+    #[arg(skip)]
+    pub wg: wg::WgClientArgs,
 }
 
 pub async fn run(args: ClientArgs) -> Result<()> {
@@ -76,6 +78,10 @@ pub async fn run_embedded(args: ClientArgs) -> Result<()> {
 }
 
 async fn run_with_signal_handling(args: ClientArgs, handle_signals: bool) -> Result<()> {
+    if matches!(args.effective_mode()?, ProxyMode::Wg) {
+        return wg::run_client(args.wg).await;
+    }
+
     args.validate_required()?;
     let _system_proxy = system_proxy::maybe_activate(&args)?;
 
@@ -85,6 +91,7 @@ async fn run_with_signal_handling(args: ClientArgs, handle_signals: bool) -> Res
             ProxyMode::NativeMux => crate::mux::run_client(args).await,
             ProxyMode::DazeAshe | ProxyMode::DazeBaboon => crate::daze::run_client(args).await,
             ProxyMode::DazeCzar => crate::czar::run_client(args).await,
+            ProxyMode::Wg => unreachable!("wg mode is dispatched before SOCKS client startup"),
         }
     };
 
@@ -255,8 +262,9 @@ async fn handle_connection(
             Ok(tunnel) => tunnel,
             Err(err) => {
                 let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
-                return Err(err)
-                    .with_context(|| format!("failed to open remote tun DNS tunnel to {upstream_target}"));
+                return Err(err).with_context(|| {
+                    format!("failed to open remote tun DNS tunnel to {upstream_target}")
+                });
             }
         };
         socks5::send_success(&mut inbound).await?;
@@ -304,23 +312,22 @@ async fn handle_connection(
         RouteDecision::Remote => {}
     }
 
-    let tunnel =
-        match establish_remote_tunnel(
-            &args,
-            &connector,
-            &host_header,
-            &server_name,
-            &target_string,
-            http::TunnelTransport::Tcp,
-        )
-        .await
-        {
-            Ok(tunnel) => tunnel,
-            Err(err) => {
-                let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
-                return Err(err).context("failed to establish remote tunnel");
-            }
-        };
+    let tunnel = match establish_remote_tunnel(
+        &args,
+        &connector,
+        &host_header,
+        &server_name,
+        &target_string,
+        http::TunnelTransport::Tcp,
+    )
+    .await
+    {
+        Ok(tunnel) => tunnel,
+        Err(err) => {
+            let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
+            return Err(err).context("failed to establish remote tunnel");
+        }
+    };
 
     socks5::send_success(&mut inbound).await?;
     let stats = traffic::relay_with_telemetry(

@@ -337,7 +337,8 @@ async fn create_remote_tcp_dns_session(
             {
                 Ok(response) => {
                     if let Err(err) =
-                        forward_udp_response(&relay, &client_addr, &response_target, &response).await
+                        forward_udp_response(&relay, &client_addr, &response_target, &response)
+                            .await
                     {
                         warn!(
                             target = %response_target,
@@ -395,7 +396,10 @@ async fn exchange_remote_dns_over_tcp(
         .write_all(payload)
         .await
         .context("failed to write TCP DNS request body")?;
-    tunnel.flush().await.context("failed to flush TCP DNS request")?;
+    tunnel
+        .flush()
+        .await
+        .context("failed to flush TCP DNS request")?;
 
     let mut length = [0_u8; 2];
     tunnel
