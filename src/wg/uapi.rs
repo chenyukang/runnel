@@ -180,6 +180,7 @@ mod tests {
             private_key: [0x11; 32],
             peer_public_key: [0x22; 32],
             peer_allowed_ips: default_client_allowed_ips(),
+            excluded_ips: Vec::new(),
         };
 
         let request = build_set_request(&runtime);
@@ -205,6 +206,7 @@ mod tests {
             private_key: [0x33; 32],
             peer_public_key: [0x44; 32],
             peer_allowed_ips: default_server_allowed_ips(IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2))),
+            excluded_ips: Vec::new(),
         };
 
         let request = build_set_request(&runtime);

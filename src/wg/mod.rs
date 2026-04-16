@@ -1,7 +1,9 @@
 mod client;
 mod configgen;
+mod dns;
 mod hooks;
 mod keys;
+mod preflight;
 mod server;
 mod stats;
 mod uapi;
@@ -21,10 +23,12 @@ pub use configgen::{WgConfigArgs, run_config};
 pub use keys::{WgKeygenArgs, WgPubkeyArgs, run_keygen, run_pubkey};
 pub use server::{WgServerArgs, run as run_server};
 
+pub(crate) use dns::start_dns_capture;
 pub(crate) use hooks::{
     HookGuard, effective_hook_plan, log_plan_lines, plan_client_hooks, plan_server_hooks,
     print_plan, run_hooks,
 };
+pub(crate) use preflight::{WgPreflightRole, check as check_preflight};
 pub(crate) use stats::start_stats_poller;
 pub(crate) use uapi::{WgDeviceStats, apply_device_config, control_socket_path, read_device_stats};
 
@@ -46,6 +50,7 @@ pub(crate) struct WgRuntimeConfig {
     pub private_key: [u8; WG_KEY_LEN],
     pub peer_public_key: [u8; WG_KEY_LEN],
     pub peer_allowed_ips: Vec<String>,
+    pub excluded_ips: Vec<String>,
 }
 
 impl WgRuntimeConfig {
@@ -58,6 +63,9 @@ impl WgRuntimeConfig {
         }
         if self.tunnel_ip == self.peer_tunnel_ip {
             bail!("{role} tunnel_ip and peer_tunnel_ip must differ");
+        }
+        if self.tunnel_ip.is_ipv4() != self.peer_tunnel_ip.is_ipv4() {
+            bail!("{role} tunnel_ip and peer_tunnel_ip must use the same IP version");
         }
         if !self.bind.ip().is_unspecified() {
             bail!(
@@ -76,6 +84,11 @@ impl WgRuntimeConfig {
         for allowed_ip in &self.peer_allowed_ips {
             allowed_ip.parse::<IpNet>().with_context(|| {
                 format!("{role} allowed_ip must be a CIDR literal, got {allowed_ip}")
+            })?;
+        }
+        for excluded_ip in &self.excluded_ips {
+            excluded_ip.parse::<IpNet>().with_context(|| {
+                format!("{role} exclude_ip must be a CIDR literal, got {excluded_ip}")
             })?;
         }
         Ok(())
@@ -150,8 +163,27 @@ pub(crate) fn normalize_allowed_ips(
     Ok(values)
 }
 
+#[cfg(test)]
 pub(crate) fn default_client_allowed_ips() -> Vec<String> {
-    vec!["0.0.0.0/0".to_owned()]
+    default_client_allowed_ips_for(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+}
+
+pub(crate) fn default_client_allowed_ips_for(tunnel_ip: IpAddr) -> Vec<String> {
+    vec![match tunnel_ip {
+        IpAddr::V4(_) => "0.0.0.0/0".to_owned(),
+        IpAddr::V6(_) => "::/0".to_owned(),
+    }]
+}
+
+pub(crate) fn default_client_excluded_lan_ips() -> Vec<String> {
+    vec![
+        "10.0.0.0/8".to_owned(),
+        "172.16.0.0/12".to_owned(),
+        "192.168.0.0/16".to_owned(),
+        "169.254.0.0/16".to_owned(),
+        "fc00::/7".to_owned(),
+        "fe80::/10".to_owned(),
+    ]
 }
 
 pub(crate) fn default_server_allowed_ips(peer_tunnel_ip: IpAddr) -> Vec<String> {
@@ -299,6 +331,7 @@ mod tests {
             private_key: [1u8; 32],
             peer_public_key: [2u8; 32],
             peer_allowed_ips: default_client_allowed_ips(),
+            excluded_ips: Vec::new(),
         };
 
         config.validate("wg test").unwrap();
@@ -328,6 +361,7 @@ mod tests {
             private_key: client_private,
             peer_public_key: server_public,
             peer_allowed_ips: default_client_allowed_ips(),
+            excluded_ips: Vec::new(),
         };
         let server_runtime = WgRuntimeConfig {
             bind: SocketAddr::from(([0, 0, 0, 0], 51820)),
@@ -339,6 +373,7 @@ mod tests {
             private_key: server_private,
             peer_public_key: client_public,
             peer_allowed_ips: default_server_allowed_ips(IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2))),
+            excluded_ips: Vec::new(),
         };
 
         let mut client = client_runtime.new_tunnel(1);

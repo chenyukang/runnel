@@ -142,6 +142,11 @@ impl SnapshotState {
 
         self.capture_recent_event(event);
 
+        if event.message == "dns query" {
+            self.capture_recent_domain(event);
+            return;
+        }
+
         if event.message == "traffic sample" {
             self.last_traffic_at = Some(Instant::now());
             let uploaded = parse_u64(event.fields.get("uploaded"));
@@ -149,7 +154,6 @@ impl SnapshotState {
             if traffic_sample_is_aggregate(event) {
                 self.total_uploaded += uploaded;
                 self.total_downloaded += downloaded;
-                self.capture_recent_sample_target(event, uploaded, downloaded);
             }
             if let Some(last) = self.upload_history.last_mut() {
                 *last += uploaded;
@@ -203,11 +207,7 @@ impl SnapshotState {
         }
     }
 
-    fn capture_recent_sample_target(&mut self, event: &TraceEvent, uploaded: u64, downloaded: u64) {
-        if uploaded == 0 && downloaded == 0 {
-            return;
-        }
-
+    fn capture_recent_domain(&mut self, event: &TraceEvent) {
         let target = event
             .fields
             .get("target")
@@ -229,8 +229,8 @@ impl SnapshotState {
             link,
             target,
             route,
-            uploaded,
-            downloaded,
+            uploaded: 0,
+            downloaded: 0,
         });
         self.recent_targets.truncate(RECENT_TARGETS);
     }
@@ -264,7 +264,7 @@ impl SnapshotState {
     }
 
     fn capture_recent_event(&mut self, event: &TraceEvent) {
-        if event.message == "traffic sample" {
+        if event.message == "traffic sample" || event.message == "dns query" {
             return;
         }
         if event.message.contains("relay completed") && self.recent_events.len() >= RECENT_EVENTS {
@@ -835,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn wg_traffic_sample_updates_snapshot_totals_and_recent_target() {
+    fn wg_traffic_sample_updates_snapshot_totals_without_recent_target() {
         let mut snapshot = SnapshotState::default();
         let event = trace_event(
             "INFO",
@@ -855,13 +855,11 @@ mod tests {
         assert_eq!(snapshot.total_uploaded, 12);
         assert_eq!(snapshot.total_downloaded, 34);
         assert_eq!(snapshot.total_relays, 0);
-        assert_eq!(snapshot.recent_targets.len(), 1);
-        assert_eq!(snapshot.recent_targets[0].link, "wg://wireguard");
-        assert_eq!(snapshot.recent_targets[0].route, "wg-client");
+        assert!(snapshot.recent_targets.is_empty());
     }
 
     #[test]
-    fn traffic_sample_does_not_fill_recent_events() {
+    fn traffic_sample_does_not_fill_recent_events_or_targets() {
         let mut snapshot = SnapshotState::default();
         let event = trace_event(
             "INFO",
@@ -877,7 +875,29 @@ mod tests {
         snapshot.ingest(&event);
 
         assert!(snapshot.recent_events.is_empty());
+        assert!(snapshot.recent_targets.is_empty());
+    }
+
+    #[test]
+    fn dns_query_updates_recent_domain_without_recent_event_spam() {
+        let mut snapshot = SnapshotState::default();
+        let event = trace_event(
+            "INFO",
+            "dns query",
+            &[
+                ("target", "example.com"),
+                ("link", "dns://example.com"),
+                ("route", "wg-dns"),
+            ],
+        );
+
+        snapshot.ingest(&event);
+
+        assert!(snapshot.recent_events.is_empty());
         assert_eq!(snapshot.recent_targets.len(), 1);
+        assert_eq!(snapshot.recent_targets[0].target, "example.com");
+        assert_eq!(snapshot.recent_targets[0].link, "dns://example.com");
+        assert_eq!(snapshot.recent_targets[0].route, "wg-dns");
     }
 
     #[test]

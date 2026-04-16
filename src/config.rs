@@ -104,7 +104,10 @@ pub struct WgClientConfig {
     pub mtu: Option<u16>,
     pub persistent_keepalive_secs: Option<u16>,
     pub dns: Option<std::net::IpAddr>,
+    pub dns_capture: Option<bool>,
     pub allowed_ips: Option<Vec<String>>,
+    pub excluded_ips: Option<Vec<String>>,
+    pub exclude_lan: Option<bool>,
     pub up: Option<Vec<String>>,
     pub down: Option<Vec<String>>,
     pub print_hooks: Option<bool>,
@@ -480,9 +483,24 @@ pub fn apply_wg_client(
         args.dns = Some(dns);
     }
     maybe_assign(
+        &mut args.dns_capture,
+        &wg_client.dns_capture,
+        should_override(matches, "dns_capture"),
+    );
+    maybe_assign(
         &mut args.allowed_ips,
         &wg_client.allowed_ips,
         should_override(matches, "allowed_ips"),
+    );
+    maybe_assign(
+        &mut args.excluded_ips,
+        &wg_client.excluded_ips,
+        should_override(matches, "excluded_ips"),
+    );
+    maybe_assign(
+        &mut args.exclude_lan,
+        &wg_client.exclude_lan,
+        should_override(matches, "exclude_lan"),
     );
     maybe_assign(&mut args.up, &wg_client.up, should_override(matches, "up"));
     maybe_assign(
@@ -671,6 +689,10 @@ wg_client:
   tunnel_ip: 10.8.0.2
   peer_tunnel_ip: 10.8.0.1
   dns: 1.1.1.1
+  dns_capture: true
+  excluded_ips:
+    - 192.168.0.0/16
+  exclude_lan: true
   up:
     - ip route replace 203.0.113.0/24 dev pipitwg0
   print_hooks: true
@@ -743,7 +765,23 @@ server:
             Some("1.1.1.1".parse().unwrap())
         );
         assert_eq!(
+            parsed.wg_client.as_ref().and_then(|cfg| cfg.dns_capture),
+            Some(true)
+        );
+        assert_eq!(
             parsed.wg_client.as_ref().and_then(|cfg| cfg.print_hooks),
+            Some(true)
+        );
+        assert_eq!(
+            parsed
+                .wg_client
+                .as_ref()
+                .and_then(|cfg| cfg.excluded_ips.as_ref())
+                .cloned(),
+            Some(vec!["192.168.0.0/16".to_owned()])
+        );
+        assert_eq!(
+            parsed.wg_client.as_ref().and_then(|cfg| cfg.exclude_lan),
             Some(true)
         );
         assert_eq!(

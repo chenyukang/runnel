@@ -286,6 +286,11 @@ impl DashboardApp {
         self.capture_listener_context(&event);
         self.capture_recent_event(&event);
 
+        if event.message == "dns query" {
+            self.capture_recent_domain(&event);
+            return;
+        }
+
         if event.message == "traffic sample" {
             self.last_traffic_at = Some(Instant::now());
             let uploaded = parse_u64(event.fields.get("uploaded"));
@@ -293,7 +298,6 @@ impl DashboardApp {
             if traffic_sample_is_aggregate(&event) {
                 self.total_uploaded += uploaded;
                 self.total_downloaded += downloaded;
-                self.capture_recent_sample_target(&event, uploaded, downloaded);
             }
             if let Some(last) = self.upload_history.last_mut() {
                 *last += uploaded;
@@ -345,11 +349,7 @@ impl DashboardApp {
         }
     }
 
-    fn capture_recent_sample_target(&mut self, event: &TraceEvent, uploaded: u64, downloaded: u64) {
-        if uploaded == 0 && downloaded == 0 {
-            return;
-        }
-
+    fn capture_recent_domain(&mut self, event: &TraceEvent) {
         let target = event
             .fields
             .get("target")
@@ -370,8 +370,8 @@ impl DashboardApp {
             seen_at: clock_stamp(event.at),
             link,
             route,
-            uploaded,
-            downloaded,
+            uploaded: 0,
+            downloaded: 0,
         });
         self.recent_targets.truncate(RECENT_TARGETS);
     }
@@ -430,7 +430,7 @@ impl DashboardApp {
     }
 
     fn capture_recent_event(&mut self, event: &TraceEvent) {
-        if event.message == "traffic sample" {
+        if event.message == "traffic sample" || event.message == "dns query" {
             return;
         }
         if event.message.contains("relay completed") && self.recent_events.len() >= RECENT_EVENTS {
@@ -876,7 +876,7 @@ fn link_from_target(target: &str) -> String {
 
 fn recent_targets_title(context: &DashboardContext) -> &'static str {
     if context.mode_label == "wg" || context.command_label.starts_with("wg-") {
-        "Recent WG Traffic"
+        "Recent Domains"
     } else {
         "Recent Domains"
     }
@@ -1029,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn wg_traffic_sample_updates_totals_and_recent_target() {
+    fn wg_traffic_sample_updates_totals_without_recent_target() {
         let mut app = DashboardApp::new(DashboardContext {
             command_label: "wg-client".to_owned(),
             mode_label: "wg".to_owned(),
@@ -1056,13 +1056,11 @@ mod tests {
         assert_eq!(app.total_uploaded, 12);
         assert_eq!(app.total_downloaded, 34);
         assert_eq!(app.total_relays, 0);
-        assert_eq!(app.recent_targets.len(), 1);
-        assert_eq!(app.recent_targets[0].link, "wg://wireguard");
-        assert_eq!(app.recent_targets[0].route, "wg-client");
+        assert!(app.recent_targets.is_empty());
     }
 
     #[test]
-    fn traffic_sample_does_not_fill_recent_events() {
+    fn traffic_sample_does_not_fill_recent_events_or_targets() {
         let mut app = DashboardApp::new(DashboardContext {
             command_label: "wg-client".to_owned(),
             mode_label: "wg".to_owned(),
@@ -1085,7 +1083,35 @@ mod tests {
         ));
 
         assert!(app.recent_events.is_empty());
+        assert!(app.recent_targets.is_empty());
+    }
+
+    #[test]
+    fn dns_query_updates_recent_domain_without_recent_event_spam() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        });
+
+        app.ingest(trace_event(
+            "INFO",
+            "dns query",
+            &[
+                ("target", "example.com"),
+                ("link", "dns://example.com"),
+                ("route", "wg-dns"),
+            ],
+        ));
+
+        assert!(app.recent_events.is_empty());
         assert_eq!(app.recent_targets.len(), 1);
+        assert_eq!(app.recent_targets[0].link, "dns://example.com");
+        assert_eq!(app.recent_targets[0].route, "wg-dns");
     }
 
     #[test]
@@ -1100,7 +1126,7 @@ mod tests {
             log_filter: "info".to_owned(),
         };
 
-        assert_eq!(recent_targets_title(&context), "Recent WG Traffic");
+        assert_eq!(recent_targets_title(&context), "Recent Domains");
     }
 
     #[test]

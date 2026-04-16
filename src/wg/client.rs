@@ -1,14 +1,15 @@
 use super::{
-    DEFAULT_TUNNEL_MTU, HookGuard, WgRuntimeConfig, apply_device_config, control_socket_path,
-    create_device_handle, default_client_allowed_ips, effective_hook_plan, log_plan_lines,
-    normalize_allowed_ips, parse_key, parse_socket_addr, plan_client_hooks, print_plan,
-    select_device_name, start_stats_poller, wait_for_shutdown_signal,
+    DEFAULT_TUNNEL_MTU, HookGuard, WgPreflightRole, WgRuntimeConfig, apply_device_config,
+    control_socket_path, create_device_handle, default_client_allowed_ips_for,
+    default_client_excluded_lan_ips, effective_hook_plan, log_plan_lines, normalize_allowed_ips,
+    parse_key, parse_socket_addr, plan_client_hooks, print_plan, select_device_name,
+    start_dns_capture, start_stats_poller, wait_for_shutdown_signal,
 };
 use anyhow::{Context, Result, bail};
 use boringtun::noise::TunnResult;
 use clap::Args;
 use std::net::IpAddr;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::system_proxy;
 
@@ -37,8 +38,14 @@ pub struct WgClientArgs {
     pub persistent_keepalive_secs: Option<u16>,
     #[arg(long)]
     pub dns: Option<IpAddr>,
+    #[arg(long)]
+    pub dns_capture: bool,
     #[arg(long = "allowed-ip")]
     pub allowed_ips: Vec<String>,
+    #[arg(long = "exclude-ip")]
+    pub excluded_ips: Vec<String>,
+    #[arg(long)]
+    pub exclude_lan: bool,
     #[arg(long)]
     pub up: Vec<String>,
     #[arg(long)]
@@ -51,6 +58,18 @@ pub struct WgClientArgs {
 
 pub async fn run(args: WgClientArgs) -> Result<()> {
     let runtime = args.resolve()?;
+    if args.dns.is_some() && !args.dns_capture {
+        warn!(
+            "wg DNS capture is disabled; TUI Recent Domains requires --dns-capture or wg_client.dns_capture: true"
+        );
+    }
+    if !args.dry_run {
+        super::check_preflight(
+            WgPreflightRole::Client,
+            args.dns.is_some() || args.dns_capture,
+            false,
+        )?;
+    }
     let planned_device = select_device_name(&args.device)?;
     let default_plan = plan_client_hooks(&planned_device, &runtime)?;
     let plan = effective_hook_plan(default_plan, &args.up, &args.down);
@@ -81,9 +100,15 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
     // Keep the device alive until we receive a shutdown signal. The guard is declared
     // after the handle so cleanup hooks run before the device file descriptor closes.
     let _cleanup = HookGuard::new("wg-client", plan.down);
-    let _dns_guard = match args.dns {
-        Some(dns) => system_proxy::maybe_activate_tun_dns(&[dns.to_string()])?,
-        None => None,
+    let _dns_capture = match (args.dns_capture, args.dns) {
+        (true, Some(dns)) => Some(start_dns_capture(dns).await?),
+        (true, None) => bail!("wg client --dns-capture requires --dns as the upstream resolver"),
+        (false, _) => None,
+    };
+    let _dns_guard = match (args.dns, args.dns_capture) {
+        (Some(_), true) => system_proxy::maybe_activate_tun_dns(&["127.0.0.1".to_owned()])?,
+        (Some(dns), false) => system_proxy::maybe_activate_tun_dns(&[dns.to_string()])?,
+        (None, _) => None,
     };
 
     info!(
@@ -92,6 +117,7 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
         tunnel_ip = %runtime.tunnel_ip,
         peer_tunnel_ip = %runtime.peer_tunnel_ip,
         dns = ?args.dns,
+        dns_capture = args.dns_capture,
         mtu = runtime.mtu,
         uapi_socket = %socket_path.display(),
         "wg client started"
@@ -128,11 +154,20 @@ fn plan_lines(
         runtime.peer_allowed_ips.join(", ")
     ));
     lines.push(format!(
+        "  excluded_ips: {}",
+        if runtime.excluded_ips.is_empty() {
+            "-".to_owned()
+        } else {
+            runtime.excluded_ips.join(", ")
+        }
+    ));
+    lines.push(format!(
         "  dns: {}",
         args.dns
             .map(|dns| dns.to_string())
             .unwrap_or_else(|| "-".to_owned())
     ));
+    lines.push(format!("  dns_capture: {}", args.dns_capture));
     lines.push("  up hooks:".to_owned());
     if plan.up.is_empty() {
         lines.push("    - (none)".to_owned());
@@ -167,6 +202,9 @@ impl WgClientArgs {
                 "wg client peer_public_key is required; pass --peer-public-key or set it in --config"
             );
         }
+        if self.dns_capture && self.dns.is_none() {
+            bail!("wg client --dns-capture requires --dns as the upstream resolver");
+        }
         Ok(())
     }
 
@@ -184,8 +222,9 @@ impl WgClientArgs {
             peer_allowed_ips: normalize_allowed_ips(
                 "wg client",
                 &self.allowed_ips,
-                &default_client_allowed_ips(),
+                &default_client_allowed_ips_for(self.tunnel_ip),
             )?,
+            excluded_ips: self.normalized_excluded_ips()?,
         };
         runtime.validate("wg client")?;
 
@@ -205,6 +244,16 @@ impl WgClientArgs {
         }
 
         Ok(runtime)
+    }
+
+    fn normalized_excluded_ips(&self) -> Result<Vec<String>> {
+        let mut excluded = normalize_allowed_ips("wg client exclude", &self.excluded_ips, &[])?;
+        if self.exclude_lan {
+            excluded.extend(default_client_excluded_lan_ips());
+        }
+        excluded.sort();
+        excluded.dedup();
+        Ok(excluded)
     }
 }
 
@@ -228,7 +277,10 @@ mod tests {
             mtu: 1420,
             persistent_keepalive_secs: Some(25),
             dns: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+            dns_capture: false,
             allowed_ips: Vec::new(),
+            excluded_ips: Vec::new(),
+            exclude_lan: false,
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -258,7 +310,10 @@ mod tests {
             mtu: 1420,
             persistent_keepalive_secs: Some(25),
             dns: None,
+            dns_capture: false,
             allowed_ips: vec!["203.0.113.0/24".to_owned()],
+            excluded_ips: Vec::new(),
+            exclude_lan: false,
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -267,6 +322,61 @@ mod tests {
 
         let runtime = args.resolve().unwrap();
         assert_eq!(runtime.peer_allowed_ips, vec!["203.0.113.0/24"]);
+    }
+
+    #[test]
+    fn client_args_collect_excluded_ips_and_lan_excludes() {
+        let args = WgClientArgs {
+            bind: "0.0.0.0:0".to_owned(),
+            endpoint: "198.51.100.10:51820".to_owned(),
+            private_key: STANDARD.encode([1u8; 32]),
+            peer_public_key: STANDARD.encode([2u8; 32]),
+            device: "auto".to_owned(),
+            tunnel_ip: IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2)),
+            peer_tunnel_ip: IpAddr::V4(Ipv4Addr::new(10, 8, 0, 1)),
+            mtu: 1420,
+            persistent_keepalive_secs: Some(25),
+            dns: None,
+            dns_capture: false,
+            allowed_ips: Vec::new(),
+            excluded_ips: vec!["100.64.0.0/10".to_owned()],
+            exclude_lan: true,
+            up: Vec::new(),
+            down: Vec::new(),
+            print_hooks: false,
+            dry_run: true,
+        };
+
+        let runtime = args.resolve().unwrap();
+        assert!(runtime.excluded_ips.contains(&"100.64.0.0/10".to_owned()));
+        assert!(runtime.excluded_ips.contains(&"192.168.0.0/16".to_owned()));
+    }
+
+    #[test]
+    fn client_args_reject_dns_capture_without_dns_upstream() {
+        let args = WgClientArgs {
+            bind: "0.0.0.0:0".to_owned(),
+            endpoint: "198.51.100.10:51820".to_owned(),
+            private_key: STANDARD.encode([1u8; 32]),
+            peer_public_key: STANDARD.encode([2u8; 32]),
+            device: "auto".to_owned(),
+            tunnel_ip: IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2)),
+            peer_tunnel_ip: IpAddr::V4(Ipv4Addr::new(10, 8, 0, 1)),
+            mtu: 1420,
+            persistent_keepalive_secs: Some(25),
+            dns: None,
+            dns_capture: true,
+            allowed_ips: Vec::new(),
+            excluded_ips: Vec::new(),
+            exclude_lan: false,
+            up: Vec::new(),
+            down: Vec::new(),
+            print_hooks: false,
+            dry_run: true,
+        };
+
+        let err = args.resolve().unwrap_err().to_string();
+        assert!(err.contains("dns-capture"), "{err}");
     }
 
     #[test]
@@ -282,7 +392,10 @@ mod tests {
             mtu: 1420,
             persistent_keepalive_secs: Some(25),
             dns: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+            dns_capture: true,
             allowed_ips: vec!["203.0.113.0/24".to_owned()],
+            excluded_ips: Vec::new(),
+            exclude_lan: false,
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: true,
@@ -301,6 +414,7 @@ mod tests {
         );
 
         assert!(lines.iter().any(|line| line == "  dns: 1.1.1.1"));
+        assert!(lines.iter().any(|line| line == "  dns_capture: true"));
         assert!(
             lines
                 .iter()

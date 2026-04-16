@@ -1,8 +1,8 @@
 use super::{
-    DEFAULT_TUNNEL_MTU, HookGuard, WgRuntimeConfig, apply_device_config, control_socket_path,
-    create_device_handle, default_server_allowed_ips, effective_hook_plan, log_plan_lines,
-    normalize_allowed_ips, parse_key, parse_socket_addr, plan_server_hooks, print_plan,
-    select_device_name, start_stats_poller, wait_for_shutdown_signal,
+    DEFAULT_TUNNEL_MTU, HookGuard, WgPreflightRole, WgRuntimeConfig, apply_device_config,
+    control_socket_path, create_device_handle, default_server_allowed_ips, effective_hook_plan,
+    log_plan_lines, normalize_allowed_ips, parse_key, parse_socket_addr, plan_server_hooks,
+    print_plan, select_device_name, start_stats_poller, wait_for_shutdown_signal,
 };
 use anyhow::{Result, bail};
 use clap::Args;
@@ -43,6 +43,13 @@ pub struct WgServerArgs {
 
 pub async fn run(args: WgServerArgs) -> Result<()> {
     let runtime = args.resolve()?;
+    if !args.dry_run {
+        super::check_preflight(
+            WgPreflightRole::Server,
+            false,
+            args.nat_out_interface.is_some(),
+        )?;
+    }
     let planned_device = select_device_name(&args.device)?;
     let default_plan =
         plan_server_hooks(&planned_device, &runtime, args.nat_out_interface.as_deref())?;
@@ -162,6 +169,7 @@ impl WgServerArgs {
                 &self.peer_allowed_ips,
                 &default_server_allowed_ips(self.peer_tunnel_ip),
             )?,
+            excluded_ips: Vec::new(),
         };
         runtime.validate("wg server")?;
         Ok(runtime)
