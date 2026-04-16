@@ -10,6 +10,12 @@ use std::{
 
 use super::WgRuntimeConfig;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WgDeviceStats {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
 pub(crate) fn control_socket_path(device_name: &str) -> PathBuf {
     Path::new("/var/run/wireguard").join(format!("{device_name}.sock"))
 }
@@ -42,6 +48,11 @@ pub(crate) fn build_set_request(runtime: &WgRuntimeConfig) -> String {
 pub(crate) fn apply_device_config(socket_path: &Path, runtime: &WgRuntimeConfig) -> Result<()> {
     let request = build_set_request(runtime);
     send_set_request(socket_path, &request)
+}
+
+pub(crate) fn read_device_stats(socket_path: &Path) -> Result<WgDeviceStats> {
+    let response = send_get_request(socket_path)?;
+    parse_device_stats(&response)
 }
 
 fn send_set_request(socket_path: &Path, body: &str) -> Result<()> {
@@ -82,6 +93,53 @@ fn try_send_set_request(socket_path: &Path, body: &str) -> Result<()> {
     parse_errno(&response)
 }
 
+fn send_get_request(socket_path: &Path) -> Result<String> {
+    let mut socket = UnixStream::connect(socket_path).with_context(|| {
+        format!(
+            "failed to connect boringtun UAPI socket {}",
+            socket_path.display()
+        )
+    })?;
+    write!(socket, "get=1\n\n").with_context(|| {
+        format!(
+            "failed to write boringtun UAPI socket {}",
+            socket_path.display()
+        )
+    })?;
+    let mut response = String::new();
+    socket.read_to_string(&mut response).with_context(|| {
+        format!(
+            "failed to read boringtun UAPI socket {}",
+            socket_path.display()
+        )
+    })?;
+    Ok(response)
+}
+
+fn parse_device_stats(response: &str) -> Result<WgDeviceStats> {
+    parse_errno(response)?;
+
+    let mut stats = WgDeviceStats::default();
+    for line in response.lines() {
+        if let Some(value) = line.strip_prefix("rx_bytes=") {
+            stats.rx_bytes = stats
+                .rx_bytes
+                .saturating_add(parse_stat(value, "rx_bytes")?);
+        } else if let Some(value) = line.strip_prefix("tx_bytes=") {
+            stats.tx_bytes = stats
+                .tx_bytes
+                .saturating_add(parse_stat(value, "tx_bytes")?);
+        }
+    }
+    Ok(stats)
+}
+
+fn parse_stat(value: &str, field: &str) -> Result<u64> {
+    value
+        .parse::<u64>()
+        .with_context(|| format!("invalid boringtun {field} field: {value}"))
+}
+
 fn parse_errno(response: &str) -> Result<()> {
     let errno = response
         .lines()
@@ -98,7 +156,7 @@ fn parse_errno(response: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_set_request, control_socket_path};
+    use super::{WgDeviceStats, build_set_request, control_socket_path, parse_device_stats};
     use crate::wg::{WgRuntimeConfig, default_client_allowed_ips, default_server_allowed_ips};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -157,5 +215,55 @@ mod tests {
         assert!(request.contains("allowed_ip=10.8.0.2/32"));
         assert!(!request.contains("endpoint="));
         assert!(!request.contains("persistent_keepalive_interval="));
+    }
+
+    #[test]
+    fn parses_device_stats_from_uapi_get_response() {
+        let response = "\
+own_public_key=aaaa
+listen_port=51820
+public_key=bbbb
+allowed_ip=10.8.0.2/32
+rx_bytes=123
+tx_bytes=456
+errno=0
+
+";
+
+        assert_eq!(
+            parse_device_stats(response).unwrap(),
+            WgDeviceStats {
+                rx_bytes: 123,
+                tx_bytes: 456,
+            }
+        );
+    }
+
+    #[test]
+    fn sums_device_stats_across_peers() {
+        let response = "\
+public_key=bbbb
+rx_bytes=10
+tx_bytes=20
+public_key=cccc
+rx_bytes=30
+tx_bytes=40
+errno=0
+
+";
+
+        assert_eq!(
+            parse_device_stats(response).unwrap(),
+            WgDeviceStats {
+                rx_bytes: 40,
+                tx_bytes: 60,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_nonzero_uapi_errno_when_parsing_stats() {
+        let err = parse_device_stats("errno=22\n\n").unwrap_err().to_string();
+        assert!(err.contains("errno=22"));
     }
 }

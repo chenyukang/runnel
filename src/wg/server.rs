@@ -2,7 +2,7 @@ use super::{
     DEFAULT_TUNNEL_MTU, HookGuard, WgRuntimeConfig, apply_device_config, control_socket_path,
     create_device_handle, default_server_allowed_ips, effective_hook_plan, log_plan_lines,
     normalize_allowed_ips, parse_key, parse_socket_addr, plan_server_hooks, print_plan,
-    select_device_name, wait_for_shutdown_signal,
+    select_device_name, start_stats_poller, wait_for_shutdown_signal,
 };
 use anyhow::{Result, bail};
 use clap::Args;
@@ -63,6 +63,7 @@ pub async fn run(args: WgServerArgs) -> Result<()> {
     let (_device_handle, actual_device) = create_device_handle(&args.device)?;
     let socket_path = control_socket_path(&actual_device);
     apply_device_config(&socket_path, &runtime)?;
+    start_stats_poller("wg-server", socket_path.clone());
     let plan = effective_hook_plan(
         plan_server_hooks(&actual_device, &runtime, args.nat_out_interface.as_deref())?,
         &args.up,

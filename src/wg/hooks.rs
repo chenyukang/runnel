@@ -125,7 +125,10 @@ pub(crate) fn build_client_hook_plan(
             );
         }
 
-        let mut up = vec![format!("ifconfig {device} inet {local} {peer} up")];
+        let mut up = vec![format!(
+            "ifconfig {device} inet {local} {peer} mtu {} up",
+            runtime.mtu
+        )];
         up.push(default_macos_bypass_route(endpoint, route));
         up.extend(
             routes
@@ -214,7 +217,10 @@ pub(crate) fn build_server_hook_plan(
 
     #[cfg(target_os = "macos")]
     {
-        let mut up = vec![format!("ifconfig {device} inet {local} {peer} up")];
+        let mut up = vec![format!(
+            "ifconfig {device} inet {local} {peer} mtu {} up",
+            runtime.mtu
+        )];
         up.extend(
             routes
                 .iter()
@@ -485,7 +491,7 @@ mod tests {
 
         assert_eq!(
             plan.up.first().map(String::as_str),
-            Some("ifconfig utun123 inet 10.8.0.2 10.8.0.1 up")
+            Some("ifconfig utun123 inet 10.8.0.2 10.8.0.1 mtu 1420 up")
         );
         assert!(
             plan.up

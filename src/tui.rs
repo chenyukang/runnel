@@ -290,6 +290,11 @@ impl DashboardApp {
             self.last_traffic_at = Some(Instant::now());
             let uploaded = parse_u64(event.fields.get("uploaded"));
             let downloaded = parse_u64(event.fields.get("downloaded"));
+            if traffic_sample_is_aggregate(&event) {
+                self.total_uploaded += uploaded;
+                self.total_downloaded += downloaded;
+                self.capture_recent_sample_target(&event, uploaded, downloaded);
+            }
             if let Some(last) = self.upload_history.last_mut() {
                 *last += uploaded;
             }
@@ -338,6 +343,37 @@ impl DashboardApp {
             });
             self.recent_targets.truncate(RECENT_TARGETS);
         }
+    }
+
+    fn capture_recent_sample_target(&mut self, event: &TraceEvent, uploaded: u64, downloaded: u64) {
+        if uploaded == 0 && downloaded == 0 {
+            return;
+        }
+
+        let target = event
+            .fields
+            .get("target")
+            .cloned()
+            .unwrap_or_else(|| "-".to_owned());
+        let link = event
+            .fields
+            .get("link")
+            .cloned()
+            .unwrap_or_else(|| link_from_target(&target));
+        let route = event
+            .fields
+            .get("route")
+            .cloned()
+            .unwrap_or_else(|| "remote".to_owned());
+
+        self.recent_targets.push_front(RecentTarget {
+            seen_at: clock_stamp(event.at),
+            link,
+            route,
+            uploaded,
+            downloaded,
+        });
+        self.recent_targets.truncate(RECENT_TARGETS);
     }
 
     fn refresh_process_stats(&mut self) {
@@ -394,6 +430,9 @@ impl DashboardApp {
     }
 
     fn capture_recent_event(&mut self, event: &TraceEvent) {
+        if event.message == "traffic sample" {
+            return;
+        }
         if event.message.contains("relay completed") && self.recent_events.len() >= RECENT_EVENTS {
             return;
         }
@@ -608,29 +647,21 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
             )),
         ])
     });
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(8),
-            Constraint::Length(7),
-            Constraint::Percentage(55),
-            Constraint::Length(18),
-        ],
-    )
-    .header(
-        Row::new(vec!["When", "Route", "Link", "Up / Down"]).style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Recent Domains")
-            .border_style(Style::default().fg(Color::Blue)),
-    )
-    .column_spacing(1);
+    let table = Table::new(rows, recent_targets_widths())
+        .header(
+            Row::new(vec!["When", "Route", "Link", "Up / Down"]).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(recent_targets_title(&app.context))
+                .border_style(Style::default().fg(Color::Blue)),
+        )
+        .column_spacing(1);
     frame.render_widget(table, lower[0]);
 
     let items = app
@@ -781,6 +812,11 @@ fn parse_bool(value: Option<&String>) -> bool {
         .unwrap_or(false)
 }
 
+fn traffic_sample_is_aggregate(event: &TraceEvent) -> bool {
+    parse_bool(event.fields.get("aggregate"))
+        || event.fields.get("mode").is_some_and(|mode| mode == "wg")
+}
+
 fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -836,6 +872,23 @@ fn link_from_target(target: &str) -> String {
         Some(port) => format!("tcp://{host}:{port}"),
         None => format!("tcp://{target}"),
     }
+}
+
+fn recent_targets_title(context: &DashboardContext) -> &'static str {
+    if context.mode_label == "wg" || context.command_label.starts_with("wg-") {
+        "Recent WG Traffic"
+    } else {
+        "Recent Domains"
+    }
+}
+
+fn recent_targets_widths() -> [Constraint; 4] {
+    [
+        Constraint::Length(8),
+        Constraint::Length(10),
+        Constraint::Min(16),
+        Constraint::Length(24),
+    ]
 }
 
 fn sample_process_stats(pid: u32) -> ProcessStats {
@@ -914,7 +967,12 @@ fn split_target(target: &str) -> (String, Option<u16>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_wave_data_to_width, link_from_target, split_target};
+    use super::{
+        DashboardApp, DashboardContext, TraceEvent, fit_wave_data_to_width, link_from_target,
+        recent_targets_title, recent_targets_widths, split_target,
+    };
+    use ratatui::layout::Constraint;
+    use std::{collections::BTreeMap, path::PathBuf, time::SystemTime};
 
     #[test]
     fn wave_data_uses_full_width_when_panel_is_wider() {
@@ -942,5 +1000,130 @@ mod tests {
     #[test]
     fn split_ipv6_target() {
         assert_eq!(split_target("[::1]:1080"), ("::1".to_owned(), Some(1080)));
+    }
+
+    #[test]
+    fn traffic_sample_updates_history_without_totals_by_default() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        });
+
+        app.ingest(trace_event(
+            "INFO",
+            "traffic sample",
+            &[("uploaded", "12"), ("downloaded", "34")],
+        ));
+
+        assert_eq!(app.total_uploaded, 0);
+        assert_eq!(app.total_downloaded, 0);
+        assert_eq!(app.total_relays, 0);
+        assert_eq!(app.upload_history.last().copied(), Some(12));
+        assert_eq!(app.download_history.last().copied(), Some(34));
+        assert!(app.last_traffic_at.is_some());
+    }
+
+    #[test]
+    fn wg_traffic_sample_updates_totals_and_recent_target() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        });
+
+        app.ingest(trace_event(
+            "INFO",
+            "traffic sample",
+            &[
+                ("uploaded", "12"),
+                ("downloaded", "34"),
+                ("mode", "wg"),
+                ("target", "wireguard"),
+                ("link", "wg://wireguard"),
+                ("route", "wg-client"),
+            ],
+        ));
+
+        assert_eq!(app.total_uploaded, 12);
+        assert_eq!(app.total_downloaded, 34);
+        assert_eq!(app.total_relays, 0);
+        assert_eq!(app.recent_targets.len(), 1);
+        assert_eq!(app.recent_targets[0].link, "wg://wireguard");
+        assert_eq!(app.recent_targets[0].route, "wg-client");
+    }
+
+    #[test]
+    fn traffic_sample_does_not_fill_recent_events() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        });
+
+        app.ingest(trace_event(
+            "INFO",
+            "traffic sample",
+            &[
+                ("uploaded", "12"),
+                ("downloaded", "34"),
+                ("mode", "wg"),
+                ("target", "wireguard"),
+            ],
+        ));
+
+        assert!(app.recent_events.is_empty());
+        assert_eq!(app.recent_targets.len(), 1);
+    }
+
+    #[test]
+    fn wg_context_renames_recent_domains_panel() {
+        let context = DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        };
+
+        assert_eq!(recent_targets_title(&context), "Recent WG Traffic");
+    }
+
+    #[test]
+    fn recent_targets_widths_fit_wg_route_and_common_totals() {
+        let widths = recent_targets_widths();
+
+        assert!(
+            matches!(widths[1], Constraint::Length(width) if width >= "wg-client".len() as u16)
+        );
+        assert!(
+            matches!(widths[3], Constraint::Length(width) if width >= "25.4 KiB / 39.9 KiB".len() as u16)
+        );
+    }
+
+    fn trace_event(level: &str, message: &str, fields: &[(&str, &str)]) -> TraceEvent {
+        TraceEvent {
+            at: SystemTime::UNIX_EPOCH,
+            level: level.to_owned(),
+            message: message.to_owned(),
+            fields: fields
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect::<BTreeMap<_, _>>(),
+        }
     }
 }

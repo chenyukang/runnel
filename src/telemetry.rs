@@ -146,6 +146,11 @@ impl SnapshotState {
             self.last_traffic_at = Some(Instant::now());
             let uploaded = parse_u64(event.fields.get("uploaded"));
             let downloaded = parse_u64(event.fields.get("downloaded"));
+            if traffic_sample_is_aggregate(event) {
+                self.total_uploaded += uploaded;
+                self.total_downloaded += downloaded;
+                self.capture_recent_sample_target(event, uploaded, downloaded);
+            }
             if let Some(last) = self.upload_history.last_mut() {
                 *last += uploaded;
             }
@@ -198,6 +203,38 @@ impl SnapshotState {
         }
     }
 
+    fn capture_recent_sample_target(&mut self, event: &TraceEvent, uploaded: u64, downloaded: u64) {
+        if uploaded == 0 && downloaded == 0 {
+            return;
+        }
+
+        let target = event
+            .fields
+            .get("target")
+            .cloned()
+            .unwrap_or_else(|| "-".to_owned());
+        let link = event
+            .fields
+            .get("link")
+            .cloned()
+            .unwrap_or_else(|| link_from_target(&target));
+        let route = event
+            .fields
+            .get("route")
+            .cloned()
+            .unwrap_or_else(|| "remote".to_owned());
+
+        self.recent_targets.push_front(RecentTargetSnapshot {
+            seen_at: clock_stamp(event.at),
+            link,
+            target,
+            route,
+            uploaded,
+            downloaded,
+        });
+        self.recent_targets.truncate(RECENT_TARGETS);
+    }
+
     fn snapshot(&self) -> Option<DashboardSnapshot> {
         let context = self.context.clone()?;
         Some(DashboardSnapshot {
@@ -227,6 +264,9 @@ impl SnapshotState {
     }
 
     fn capture_recent_event(&mut self, event: &TraceEvent) {
+        if event.message == "traffic sample" {
+            return;
+        }
         if event.message.contains("relay completed") && self.recent_events.len() >= RECENT_EVENTS {
             return;
         }
@@ -546,6 +586,11 @@ fn parse_bool(value: Option<&String>) -> bool {
         .unwrap_or(false)
 }
 
+fn traffic_sample_is_aggregate(event: &TraceEvent) -> bool {
+    parse_bool(event.fields.get("aggregate"))
+        || event.fields.get("mode").is_some_and(|mode| mode == "wg")
+}
+
 pub(crate) fn event_impacts_health(command_label: Option<&str>, event: &TraceEvent) -> bool {
     if event.level != "WARN" && event.level != "ERROR" && !event.message.contains("with error") {
         return false;
@@ -768,6 +813,71 @@ mod tests {
 
         assert_eq!(snapshot.total_warnings, 1);
         assert!(snapshot.last_warning_at.is_none());
+    }
+
+    #[test]
+    fn traffic_sample_updates_snapshot_history_without_totals_by_default() {
+        let mut snapshot = SnapshotState::default();
+        let event = trace_event(
+            "INFO",
+            "traffic sample",
+            &[("uploaded", "12"), ("downloaded", "34")],
+        );
+
+        snapshot.ingest(&event);
+
+        assert_eq!(snapshot.total_uploaded, 0);
+        assert_eq!(snapshot.total_downloaded, 0);
+        assert_eq!(snapshot.total_relays, 0);
+        assert_eq!(snapshot.upload_history.last().copied(), Some(12));
+        assert_eq!(snapshot.download_history.last().copied(), Some(34));
+        assert!(snapshot.last_traffic_at.is_some());
+    }
+
+    #[test]
+    fn wg_traffic_sample_updates_snapshot_totals_and_recent_target() {
+        let mut snapshot = SnapshotState::default();
+        let event = trace_event(
+            "INFO",
+            "traffic sample",
+            &[
+                ("uploaded", "12"),
+                ("downloaded", "34"),
+                ("mode", "wg"),
+                ("target", "wireguard"),
+                ("link", "wg://wireguard"),
+                ("route", "wg-client"),
+            ],
+        );
+
+        snapshot.ingest(&event);
+
+        assert_eq!(snapshot.total_uploaded, 12);
+        assert_eq!(snapshot.total_downloaded, 34);
+        assert_eq!(snapshot.total_relays, 0);
+        assert_eq!(snapshot.recent_targets.len(), 1);
+        assert_eq!(snapshot.recent_targets[0].link, "wg://wireguard");
+        assert_eq!(snapshot.recent_targets[0].route, "wg-client");
+    }
+
+    #[test]
+    fn traffic_sample_does_not_fill_recent_events() {
+        let mut snapshot = SnapshotState::default();
+        let event = trace_event(
+            "INFO",
+            "traffic sample",
+            &[
+                ("uploaded", "12"),
+                ("downloaded", "34"),
+                ("mode", "wg"),
+                ("target", "wireguard"),
+            ],
+        );
+
+        snapshot.ingest(&event);
+
+        assert!(snapshot.recent_events.is_empty());
+        assert_eq!(snapshot.recent_targets.len(), 1);
     }
 
     #[test]
