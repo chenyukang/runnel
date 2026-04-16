@@ -7,12 +7,15 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::time::sleep;
+use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 const DAEMON_ENV: &str = "PIPIT_DAEMONIZED";
+const DAEMON_STARTUP_CHECK: Duration = Duration::from_millis(1200);
+const DAEMON_STARTUP_POLL: Duration = Duration::from_millis(100);
 const SERVICE_ROLES: &[&str] = &["client", "server", "tun"];
 
 #[derive(Debug, Parser)]
@@ -34,7 +37,7 @@ struct Cli {
     tui: bool,
     #[arg(long, global = true)]
     daemon: bool,
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "PIPIT_CONFIG")]
     config: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
@@ -101,12 +104,166 @@ struct StatusArgs {
     json: bool,
 }
 
+fn discover_default_config_path() -> Option<PathBuf> {
+    first_existing_config_path(default_config_paths())
+}
+
+fn first_existing_config_path(paths: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    paths.into_iter().find(|path| path.is_file())
+}
+
+fn default_config_paths() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let sudo_home = sudo_user_home_dir();
+    default_config_paths_for(
+        home.as_deref(),
+        xdg_config_home.as_deref(),
+        sudo_home.as_deref(),
+    )
+}
+
+fn default_config_paths_for(
+    home: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+    sudo_home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    if let Some(home) = home {
+        push_legacy_home_config_paths(&mut paths, &mut seen, home);
+    }
+    if let Some(xdg_config_home) = xdg_config_home {
+        push_config_path(
+            &mut paths,
+            &mut seen,
+            xdg_config_home.join("pipit").join("config.yaml"),
+        );
+    }
+    if let Some(home) = home {
+        push_modern_home_config_paths(&mut paths, &mut seen, home);
+    }
+    if let Some(sudo_home) = sudo_home {
+        push_legacy_home_config_paths(&mut paths, &mut seen, sudo_home);
+        push_modern_home_config_paths(&mut paths, &mut seen, sudo_home);
+    }
+
+    #[cfg(unix)]
+    push_config_path(
+        &mut paths,
+        &mut seen,
+        PathBuf::from("/etc/pipit/config.yaml"),
+    );
+
+    paths
+}
+
+fn push_legacy_home_config_paths(
+    paths: &mut Vec<PathBuf>,
+    seen: &mut BTreeSet<PathBuf>,
+    home: &Path,
+) {
+    push_config_path(paths, seen, home.join(".pipit").join("config.yaml"));
+}
+
+fn push_modern_home_config_paths(
+    paths: &mut Vec<PathBuf>,
+    seen: &mut BTreeSet<PathBuf>,
+    home: &Path,
+) {
+    push_config_path(
+        paths,
+        seen,
+        home.join(".config").join("pipit").join("config.yaml"),
+    );
+
+    #[cfg(target_os = "macos")]
+    push_config_path(
+        paths,
+        seen,
+        home.join("Library")
+            .join("Application Support")
+            .join("pipit")
+            .join("config.yaml"),
+    );
+}
+
+fn push_config_path(paths: &mut Vec<PathBuf>, seen: &mut BTreeSet<PathBuf>, path: PathBuf) {
+    if seen.insert(path.clone()) {
+        paths.push(path);
+    }
+}
+
+#[cfg(unix)]
+fn sudo_user_home_dir() -> Option<PathBuf> {
+    use std::{
+        ffi::{CStr, CString},
+        mem::MaybeUninit,
+        os::unix::ffi::OsStrExt,
+        ptr,
+    };
+
+    let sudo_user = std::env::var_os("SUDO_USER")?;
+    if sudo_user.as_os_str() == "root" {
+        return None;
+    }
+    let sudo_user = CString::new(sudo_user.as_os_str().as_bytes()).ok()?;
+
+    let initial_size = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    let initial_size = if initial_size > 0 {
+        initial_size as usize
+    } else {
+        16 * 1024
+    };
+    let mut buffer = vec![0u8; initial_size];
+
+    loop {
+        let mut passwd = MaybeUninit::<libc::passwd>::uninit();
+        let mut result = ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwnam_r(
+                sudo_user.as_ptr(),
+                passwd.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+
+        if rc == libc::ERANGE {
+            buffer.resize(buffer.len().saturating_mul(2), 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+
+        let passwd = unsafe { passwd.assume_init() };
+        if passwd.pw_dir.is_null() {
+            return None;
+        }
+
+        return Some(PathBuf::from(
+            unsafe { CStr::from_ptr(passwd.pw_dir) }
+                .to_string_lossy()
+                .into_owned(),
+        ));
+    }
+}
+
+#[cfg(not(unix))]
+fn sudo_user_home_dir() -> Option<PathBuf> {
+    None
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).context("failed to parse CLI arguments")?;
-    if let Some(config_path) = &cli.config {
+    let config_path = cli.config.clone().or_else(discover_default_config_path);
+    if let Some(config_path) = &config_path {
         let (file_config, base_dir) = config::load(config_path)?;
         config::apply_globals(
             &mut cli.log,
@@ -208,6 +365,13 @@ async fn main() -> Result<()> {
             Commands::Status(_) => Ok(()),
         }
     };
+    let command = async move {
+        let result = command.await;
+        if let Err(error) = &result {
+            error!(error = %format!("{error:#}"), "pipit command exited with error");
+        }
+        result
+    };
 
     if let Some(context) = dashboard_context {
         let receiver = telemetry::subscribe().context("telemetry channel is not initialized")?;
@@ -294,9 +458,29 @@ fn spawn_daemon_process(cli: &Cli) -> Result<()> {
         }
     }
 
-    let child = command
+    let mut child = command
         .spawn()
         .context("failed to start daemon process in background")?;
+    if let Some(status) = wait_for_daemon_startup(&mut child)? {
+        let mut message = format!("pipit daemon exited during startup with {status}");
+        if let Ok(log_file) = absolute_path(&cli.log_file) {
+            if log_file.exists() {
+                message.push_str(&format!("\nlog: {}", log_file.display()));
+                if let Ok(tail) = read_file_tail(&log_file, 20)
+                    && !tail.trim().is_empty()
+                {
+                    message.push_str("\nrecent log lines:\n");
+                    message.push_str(&tail);
+                }
+            } else {
+                message.push_str(&format!(
+                    "\nlog file was not created: {}",
+                    log_file.display()
+                ));
+            }
+        }
+        anyhow::bail!("{message}");
+    }
     if let Some(role) = command_role(&cli.command) {
         let pid_file = resolve_pid_file_for_role(&cli.log_file, cli.pid_file.clone(), role).ok();
         if let Some(pid_file) = pid_file {
@@ -312,6 +496,32 @@ fn spawn_daemon_process(cli: &Cli) -> Result<()> {
         println!("pipit daemon started pid={}", child.id());
     }
     Ok(())
+}
+
+fn wait_for_daemon_startup(
+    child: &mut std::process::Child,
+) -> Result<Option<std::process::ExitStatus>> {
+    let deadline = Instant::now() + DAEMON_STARTUP_CHECK;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to inspect daemon startup status")?
+        {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(DAEMON_STARTUP_POLL);
+    }
+}
+
+fn read_file_tail(path: &Path, max_lines: usize) -> Result<String> {
+    let contents =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut lines = contents.lines().rev().take(max_lines).collect::<Vec<_>>();
+    lines.reverse();
+    Ok(lines.join("\n"))
 }
 
 struct ObservabilityGuard {
@@ -1370,10 +1580,92 @@ impl Drop for PidFileGuard {
 mod tests {
     use super::{
         Commands, RuntimeStatus, ServiceRole, classify_service_state, command_role,
+        default_config_paths_for, first_existing_config_path, read_file_tail,
         resolve_status_targets, run_utility_command, should_show_status_state,
+        wait_for_daemon_startup,
     };
     use pipit::wg;
-    use std::path::Path;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::Command as ProcessCommand,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn default_config_paths_prefer_user_home_then_xdg_then_system() {
+        let paths = default_config_paths_for(
+            Some(Path::new("/home/alice")),
+            Some(Path::new("/xdg")),
+            Some(Path::new("/home/alice")),
+        );
+
+        assert_eq!(paths[0], PathBuf::from("/home/alice/.pipit/config.yaml"));
+        assert_eq!(paths[1], PathBuf::from("/xdg/pipit/config.yaml"));
+        assert!(paths.contains(&PathBuf::from("/home/alice/.config/pipit/config.yaml")));
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| *path == &PathBuf::from("/home/alice/.pipit/config.yaml"))
+                .count(),
+            1
+        );
+        #[cfg(unix)]
+        assert!(paths.ends_with(&[PathBuf::from("/etc/pipit/config.yaml")]));
+    }
+
+    #[test]
+    fn first_existing_config_path_uses_first_existing_candidate() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "pipit-config-discovery-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing.yaml");
+        let first = dir.join("first.yaml");
+        let second = dir.join("second.yaml");
+        fs::write(&first, "log: debug\n").unwrap();
+        fs::write(&second, "log: info\n").unwrap();
+
+        assert_eq!(
+            first_existing_config_path([missing, first.clone(), second]),
+            Some(first)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wait_for_daemon_startup_reports_early_exit() {
+        let mut child = ProcessCommand::new("sh")
+            .arg("-c")
+            .arg("exit 7")
+            .spawn()
+            .unwrap();
+        let status = wait_for_daemon_startup(&mut child)
+            .unwrap()
+            .expect("child should exit during startup check");
+        assert_eq!(status.code(), Some(7));
+    }
+
+    #[test]
+    fn read_file_tail_returns_last_lines() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "pipit-log-tail-{}-{suffix}.log",
+            std::process::id()
+        ));
+        fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
+
+        assert_eq!(read_file_tail(&path, 2).unwrap(), "three\nfour");
+        let _ = fs::remove_file(path);
+    }
 
     #[test]
     fn status_targets_default_to_all_roles() {

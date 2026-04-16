@@ -323,6 +323,18 @@ Most CLI flags can move into YAML and be loaded with `--config`.
   client
 ```
 
+If `--config` is omitted, `pipit` loads the first existing default config:
+
+1. `~/.pipit/config.yaml`
+2. `$XDG_CONFIG_HOME/pipit/config.yaml`
+3. `~/.config/pipit/config.yaml`
+4. `~/Library/Application Support/pipit/config.yaml` on macOS
+5. the original sudo user's matching home config paths, when running through `sudo`
+6. `/etc/pipit/config.yaml` on Unix
+
+You can also set `PIPIT_CONFIG=/path/to/config.yaml`. Working-directory config
+files are not loaded implicitly because configs can contain hook commands.
+
 Config precedence:
 
 1. explicit CLI flags

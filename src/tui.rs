@@ -734,14 +734,15 @@ fn render_wave(
         .borders(Borders::ALL)
         .title(wave_title(title, history))
         .border_style(Style::default().fg(color));
-    let width = usize::from(block.inner(area).width);
-    let data = fit_wave_data_to_width(history, width);
+    let inner = block.inner(area);
+    let width = usize::from(inner.width);
+    let wave_data = fit_wave_data_to_width(history, width);
 
     frame.render_widget(
         Sparkline::default()
             .block(block)
             .style(Style::default().fg(color))
-            .data(&data),
+            .data(&wave_data),
         area,
     );
 }
@@ -849,10 +850,12 @@ fn format_uptime(elapsed: Duration) -> String {
 fn wave_title(label: &str, history: &[u64]) -> String {
     let current = history.last().copied().unwrap_or(0);
     let peak = history.iter().copied().max().unwrap_or(0);
+    let active = history.iter().filter(|value| **value > 0).count();
     format!(
-        "{label} · {}/s now · {}/s peak",
+        "{label} · {}/s now · {}/s peak · active {active}/{}",
         format_bytes(current),
-        format_bytes(peak)
+        format_bytes(peak),
+        history.len()
     )
 }
 
