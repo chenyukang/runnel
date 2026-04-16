@@ -33,6 +33,7 @@ enum TunnelPair {
 }
 
 impl TunnelPair {
+    #[cfg(target_os = "macos")]
     fn peer_ip(self) -> IpAddr {
         match self {
             Self::V4 { peer, .. } => IpAddr::V4(peer),
