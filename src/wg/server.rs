@@ -21,9 +21,9 @@ pub struct WgServerArgs {
     pub peer_public_key: String,
     #[arg(long, default_value = "auto")]
     pub device: String,
-    #[arg(long)]
+    #[arg(long, default_value = "10.8.0.1")]
     pub tunnel_ip: IpAddr,
-    #[arg(long)]
+    #[arg(long, default_value = "10.8.0.2")]
     pub peer_tunnel_ip: IpAddr,
     #[arg(long = "peer-allowed-ip")]
     pub peer_allowed_ips: Vec<String>,
