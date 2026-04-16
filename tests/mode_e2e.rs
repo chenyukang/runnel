@@ -41,8 +41,11 @@ struct TestEnv {
 }
 
 struct LocalClientEnv {
-    _echo_handle: JoinHandle<()>,
+    _upstream_handle: JoinHandle<()>,
+    _server_handle: JoinHandle<()>,
     _client_handle: JoinHandle<()>,
+    cert_path: PathBuf,
+    key_path: PathBuf,
 }
 
 impl Drop for TestEnv {
@@ -61,8 +64,11 @@ impl Drop for TestEnv {
 
 impl Drop for LocalClientEnv {
     fn drop(&mut self) {
-        self._echo_handle.abort();
+        self._upstream_handle.abort();
+        self._server_handle.abort();
         self._client_handle.abort();
+        let _ = fs::remove_file(&self.cert_path);
+        let _ = fs::remove_file(&self.key_path);
     }
 }
 
@@ -88,47 +94,14 @@ async fn native_http_mode_udp_associate_round_trip_works() {
 }
 
 #[tokio::test]
-async fn native_http_mode_tun_dns_tcp_override_relays_locally() {
+async fn native_http_mode_tun_dns_tcp_override_relays_via_remote_tunnel() {
     let _guard = test_lock().lock().await;
     init_test_tracing();
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let upstream_port = free_port().unwrap();
-    let socks_port = free_port().unwrap();
-    let server_port = free_port().unwrap();
-
     let echo_handle = tokio::spawn(run_tcp_echo_target(upstream_port));
-    let client_args = ClientArgs {
-        listen: format!("127.0.0.1:{socks_port}"),
-        server: format!("127.0.0.1:{server_port}"),
-        server_name: None,
-        ca_cert: None,
-        mode: ProxyMode::NativeHttp,
-        password: "hello-world".to_owned(),
-        path: "/connect".to_owned(),
-        mux_path: "/mux".to_owned(),
-        mux: false,
-        filter: FilterMode::Proxy,
-        rule_file: None,
-        cidr_file: None,
-        user_agent: "pipit-test".to_owned(),
-        handshake_timeout_secs: 10,
-        connect_timeout_secs: 1,
-        max_header_size: 16 * 1024,
-        system_proxy: false,
-        system_proxy_services: Vec::new(),
-        tun_dns_redirect_ip: Some(Ipv4Addr::new(198, 18, 0, 1).into()),
-        tun_dns_upstream: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, upstream_port))),
-    };
-
-    let client_handle = tokio::spawn(async move {
-        let _ = client::run(client_args).await;
-    });
-    let _env = LocalClientEnv {
-        _echo_handle: echo_handle,
-        _client_handle: client_handle,
-    };
-    wait_for_tcp_listener(socks_port).await.unwrap();
+    let (_env, socks_port) = start_local_dns_client(echo_handle, upstream_port).await.unwrap();
 
     let payload = b"\x00\x05hello";
     let response = timeout(
@@ -141,6 +114,33 @@ async fn native_http_mode_tun_dns_tcp_override_relays_locally() {
     )
     .await
     .context("timed out waiting for tun DNS TCP override round trip")
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(response, payload);
+}
+
+#[tokio::test]
+async fn native_http_mode_tun_dns_udp_override_relays_via_remote_tcp_tunnel() {
+    let _guard = test_lock().lock().await;
+    init_test_tracing();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let upstream_port = free_port().unwrap();
+    let echo_handle = tokio::spawn(run_tcp_echo_target(upstream_port));
+    let (_env, socks_port) = start_local_dns_client(echo_handle, upstream_port).await.unwrap();
+
+    let payload = b"\x12\x34hello over dns";
+    let response = timeout(
+        Duration::from_secs(5),
+        exchange_udp_via_socks_target(
+            socks_port,
+            socks5::TargetAddr::Ip(Ipv4Addr::new(198, 18, 0, 1).into(), 53),
+            payload,
+        ),
+    )
+    .await
+    .context("timed out waiting for tun DNS UDP override round trip")
     .unwrap()
     .unwrap();
 
@@ -458,6 +458,19 @@ async fn exchange_udp_via_socks(
     target_port: u16,
     payload: &[u8],
 ) -> Result<Vec<u8>> {
+    exchange_udp_via_socks_target(
+        socks_port,
+        socks5::TargetAddr::Ip(Ipv4Addr::LOCALHOST.into(), target_port),
+        payload,
+    )
+    .await
+}
+
+async fn exchange_udp_via_socks_target(
+    socks_port: u16,
+    target: socks5::TargetAddr,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
     let mut control = TcpStream::connect(("127.0.0.1", socks_port))
         .await
         .context("failed to connect to local SOCKS listener")?;
@@ -474,10 +487,7 @@ async fn exchange_udp_via_socks(
     let relay = UdpSocket::bind(("127.0.0.1", 0))
         .await
         .context("failed to bind local UDP client socket")?;
-    let packet = socks5::build_udp_packet(
-        &socks5::TargetAddr::Ip(Ipv4Addr::LOCALHOST.into(), target_port),
-        payload,
-    );
+    let packet = socks5::build_udp_packet(&target, payload);
     relay
         .send_to(&packet, relay_addr)
         .await
@@ -490,7 +500,7 @@ async fn exchange_udp_via_socks(
         .context("failed to receive UDP packet from SOCKS relay")?;
     let response = socks5::parse_udp_packet(&buf[..n]).context("invalid SOCKS UDP response")?;
     anyhow::ensure!(
-        response.target == socks5::TargetAddr::Ip(Ipv4Addr::LOCALHOST.into(), target_port),
+        response.target == target,
         "unexpected UDP response target: {}",
         response.target
     );
@@ -558,6 +568,78 @@ async fn wait_for_tcp_listener(port: u16) -> Result<()> {
     .context("timed out waiting for test listener to accept connections")??;
 
     Ok(())
+}
+
+async fn start_local_dns_client(
+    upstream_handle: JoinHandle<()>,
+    upstream_port: u16,
+) -> Result<(LocalClientEnv, u16)> {
+    let server_port = free_port()?;
+    let socks_port = free_port()?;
+    let (cert_path, key_path) = write_temp_cert_pair()?;
+
+    let server_args = ServerArgs {
+        listen: format!("127.0.0.1:{server_port}"),
+        cert: Some(cert_path.clone()),
+        key: Some(key_path.clone()),
+        mode: ProxyMode::NativeHttp,
+        password: "hello-world".to_owned(),
+        path: "/connect".to_owned(),
+        mux_path: "/mux".to_owned(),
+        auth_window_secs: 120,
+        handshake_timeout_secs: 10,
+        connect_timeout_secs: 10,
+        max_header_size: 16 * 1024,
+        max_tunnel_body_size: 8 * 1024,
+        allow_private_targets: true,
+        fallback_url: "http://127.0.0.1:1".to_owned(),
+        fallback_timeout_secs: 1,
+        max_fallback_body_size: 1024,
+    };
+    let client_args = ClientArgs {
+        listen: format!("127.0.0.1:{socks_port}"),
+        server: format!("127.0.0.1:{server_port}"),
+        server_name: Some("example.com".to_owned()),
+        ca_cert: Some(cert_path.clone()),
+        mode: ProxyMode::NativeHttp,
+        password: "hello-world".to_owned(),
+        path: "/connect".to_owned(),
+        mux_path: "/mux".to_owned(),
+        mux: false,
+        filter: FilterMode::Proxy,
+        rule_file: None,
+        cidr_file: None,
+        user_agent: "pipit-test".to_owned(),
+        handshake_timeout_secs: 10,
+        connect_timeout_secs: 10,
+        max_header_size: 16 * 1024,
+        system_proxy: false,
+        system_proxy_services: Vec::new(),
+        tun_dns_redirect_ip: Some(Ipv4Addr::new(198, 18, 0, 1).into()),
+        tun_dns_upstream: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, upstream_port))),
+    };
+
+    let server_handle = tokio::spawn(async move {
+        let _ = server::run(server_args).await;
+    });
+    wait_for_tcp_listener(server_port).await?;
+    sleep(Duration::from_millis(50)).await;
+
+    let client_handle = tokio::spawn(async move {
+        let _ = client::run(client_args).await;
+    });
+    wait_for_tcp_listener(socks_port).await?;
+
+    Ok((
+        LocalClientEnv {
+            _upstream_handle: upstream_handle,
+            _server_handle: server_handle,
+            _client_handle: client_handle,
+            cert_path,
+            key_path,
+        },
+        socks_port,
+    ))
 }
 
 fn write_temp_cert_pair() -> Result<(PathBuf, PathBuf)> {

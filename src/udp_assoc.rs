@@ -1,25 +1,21 @@
 use crate::{
-    auth::AuthProof,
-    client::ClientArgs,
-    http::{self, TunnelTransport},
+    client::{ClientArgs, establish_remote_tunnel},
+    http::TunnelTransport,
     route::{RouteDecision, Router},
     socks5::{self, TargetAddr},
-    tls, udp,
+    udp,
 };
 use anyhow::{Context, Result, bail};
 use std::{
     collections::HashMap,
-    io::Cursor,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
-    time::Duration,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
     sync::{Mutex, mpsc},
     task::JoinHandle,
-    time::timeout,
 };
 use tokio_rustls::TlsConnector;
 use tracing::{debug, info, warn};
@@ -109,6 +105,25 @@ async fn run_udp_association(
 
         let target = packet.target;
         let key = target.to_string();
+
+        if let Some(dns_upstream) = args.tun_dns_udp_upstream(&target) {
+            let dns_key = format!("dns-tcp:{dns_upstream}");
+            send_via_session(&remote_sessions, &dns_key, packet.payload, || {
+                create_remote_tcp_dns_session(
+                    target.clone(),
+                    dns_upstream.clone(),
+                    relay.clone(),
+                    client_addr.clone(),
+                    tasks.clone(),
+                    args.clone(),
+                    connector.clone(),
+                    host_header.clone(),
+                    server_name.clone(),
+                )
+            })
+            .await?;
+            continue;
+        }
 
         match router.decide(&target).await? {
             RouteDecision::Direct => {
@@ -235,80 +250,18 @@ async fn create_remote_udp_session(
     server_name: String,
 ) -> Result<mpsc::Sender<Vec<u8>>> {
     let target_string = target.to_string();
-    let upstream = timeout(
-        Duration::from_secs(args.connect_timeout_secs),
-        TcpStream::connect(&args.server),
+    let tunnel = establish_remote_tunnel(
+        &args,
+        &connector,
+        &host_header,
+        &server_name,
+        &target_string,
+        TunnelTransport::Udp,
     )
     .await
-    .context("server connect timed out for UDP session")??;
-    upstream.set_nodelay(true)?;
+    .with_context(|| format!("failed to establish remote UDP tunnel for {target_string}"))?;
 
-    let server_name = tls::server_name(&server_name)?;
-    let mut tunnel = match timeout(
-        Duration::from_secs(args.handshake_timeout_secs),
-        connector.connect(server_name, upstream),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(err)) => {
-            return Err(err).context("TLS handshake with server failed for UDP session");
-        }
-        Err(_) => bail!("TLS handshake with server timed out for UDP session"),
-    };
-
-    let proof = AuthProof::sign(&args.password, "POST", &args.path, &target_string)?;
-    let payload = http::TunnelPayload {
-        target: target_string.clone(),
-        transport: TunnelTransport::Udp,
-        timestamp: proof.timestamp,
-        nonce: proof.nonce,
-        signature: proof.signature,
-    };
-    let request = http::build_tunnel_request(&host_header, &args.path, &payload, &args.user_agent)?;
-    tunnel.write_all(&request).await?;
-
-    let response_head = match timeout(
-        Duration::from_secs(args.handshake_timeout_secs),
-        http::read_head(&mut tunnel, args.max_header_size),
-    )
-    .await
-    {
-        Ok(Ok((head, body_prefix))) => (head, body_prefix),
-        Ok(Err(err)) => return Err(err).context("failed to read server response for UDP session"),
-        Err(_) => bail!("server response timed out for UDP session"),
-    };
-
-    let response = http::parse_response_head(&response_head.0)
-        .context("invalid server response for UDP session")?;
-    if !response.is_http1 {
-        bail!("server returned an unsupported HTTP version for UDP session");
-    }
-    if response.status != 200 {
-        let detail = http::read_response_body_text(
-            &mut tunnel,
-            &response_head.1,
-            response.content_length,
-            args.max_header_size,
-        )
-        .await;
-        if let Some(detail) = detail {
-            bail!(
-                "server refused UDP tunnel with status {} {}: {}",
-                response.status,
-                response.reason,
-                detail
-            );
-        }
-        bail!(
-            "server refused UDP tunnel with status {} {}",
-            response.status,
-            response.reason
-        );
-    }
-
-    let (reader, writer) = tokio::io::split(tunnel);
-    let mut reader = Cursor::new(response_head.1).chain(reader);
+    let (mut reader, writer) = tokio::io::split(tunnel);
     let mut writer = writer;
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
     let response_target = target.clone();
@@ -356,6 +309,106 @@ async fn create_remote_udp_session(
     handles.push(read_handle);
     handles.push(write_handle);
     Ok(tx)
+}
+
+async fn create_remote_tcp_dns_session(
+    response_target: TargetAddr,
+    upstream_target: TargetAddr,
+    relay: Arc<UdpSocket>,
+    client_addr: Arc<Mutex<Option<SocketAddr>>>,
+    tasks: BackgroundTasks,
+    args: ClientArgs,
+    connector: TlsConnector,
+    host_header: String,
+    server_name: String,
+) -> Result<mpsc::Sender<Vec<u8>>> {
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+    let handle = tokio::spawn(async move {
+        while let Some(payload) = rx.recv().await {
+            match exchange_remote_dns_over_tcp(
+                &args,
+                &connector,
+                &host_header,
+                &server_name,
+                &upstream_target,
+                &payload,
+            )
+            .await
+            {
+                Ok(response) => {
+                    if let Err(err) =
+                        forward_udp_response(&relay, &client_addr, &response_target, &response).await
+                    {
+                        warn!(
+                            target = %response_target,
+                            upstream = %upstream_target,
+                            error = %err,
+                            "remote TCP DNS response forwarding failed"
+                        );
+                        break;
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        target = %response_target,
+                        upstream = %upstream_target,
+                        error = %err,
+                        "remote TCP DNS exchange failed"
+                    );
+                }
+            }
+        }
+    });
+
+    tasks.lock().await.push(handle);
+    Ok(tx)
+}
+
+async fn exchange_remote_dns_over_tcp(
+    args: &ClientArgs,
+    connector: &TlsConnector,
+    host_header: &str,
+    server_name: &str,
+    upstream_target: &TargetAddr,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let target_string = upstream_target.to_string();
+    let mut tunnel = establish_remote_tunnel(
+        args,
+        connector,
+        host_header,
+        server_name,
+        &target_string,
+        TunnelTransport::Tcp,
+    )
+    .await
+    .with_context(|| format!("failed to establish remote TCP DNS tunnel for {target_string}"))?;
+
+    if payload.len() > u16::MAX as usize {
+        bail!("DNS payload exceeded {} bytes", u16::MAX);
+    }
+    tunnel
+        .write_all(&(payload.len() as u16).to_be_bytes())
+        .await
+        .context("failed to write TCP DNS request length")?;
+    tunnel
+        .write_all(payload)
+        .await
+        .context("failed to write TCP DNS request body")?;
+    tunnel.flush().await.context("failed to flush TCP DNS request")?;
+
+    let mut length = [0_u8; 2];
+    tunnel
+        .read_exact(&mut length)
+        .await
+        .context("failed to read TCP DNS response length")?;
+    let response_len = u16::from_be_bytes(length) as usize;
+    let mut response = vec![0_u8; response_len];
+    tunnel
+        .read_exact(&mut response)
+        .await
+        .context("failed to read TCP DNS response body")?;
+    Ok(response)
 }
 
 async fn forward_udp_response(
