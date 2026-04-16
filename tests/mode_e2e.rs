@@ -101,7 +101,9 @@ async fn native_http_mode_tun_dns_tcp_override_relays_via_remote_tunnel() {
 
     let upstream_port = free_port().unwrap();
     let echo_handle = tokio::spawn(run_tcp_echo_target(upstream_port));
-    let (_env, socks_port) = start_local_dns_client(echo_handle, upstream_port).await.unwrap();
+    let (_env, socks_port) = start_local_dns_client(echo_handle, upstream_port)
+        .await
+        .unwrap();
 
     let payload = b"\x00\x05hello";
     let response = timeout(
@@ -128,7 +130,9 @@ async fn native_http_mode_tun_dns_udp_override_relays_via_remote_tcp_tunnel() {
 
     let upstream_port = free_port().unwrap();
     let echo_handle = tokio::spawn(run_tcp_echo_target(upstream_port));
-    let (_env, socks_port) = start_local_dns_client(echo_handle, upstream_port).await.unwrap();
+    let (_env, socks_port) = start_local_dns_client(echo_handle, upstream_port)
+        .await
+        .unwrap();
 
     let payload = b"\x12\x34hello over dns";
     let response = timeout(

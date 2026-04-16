@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use pipit::{cert, client, config, server, telemetry, tui, tun};
+use pipit::{cert, client, config, server, telemetry, tui, tun, wg};
 use serde::Serialize;
 use std::{
     fs,
@@ -43,6 +43,11 @@ enum Commands {
     Server(server::ServerArgs),
     Client(client::ClientArgs),
     Tun(tun::TunArgs),
+    WgClient(wg::WgClientArgs),
+    WgServer(wg::WgServerArgs),
+    WgConfig(wg::WgConfigArgs),
+    WgKeygen(wg::WgKeygenArgs),
+    WgPubkey(wg::WgPubkeyArgs),
     Cert(cert::CertArgs),
     Tui(TuiArgs),
     Stop(StopArgs),
@@ -60,6 +65,8 @@ enum ServiceRole {
     Client,
     Server,
     Tun,
+    WgClient,
+    WgServer,
 }
 
 impl ServiceRole {
@@ -68,6 +75,8 @@ impl ServiceRole {
             Self::Client => "client",
             Self::Server => "server",
             Self::Tun => "tun",
+            Self::WgClient => "wg-client",
+            Self::WgServer => "wg-server",
         }
     }
 }
@@ -117,6 +126,15 @@ async fn main() -> Result<()> {
                 (Commands::Tun(args), "tun") => {
                     config::apply_tun(args, &file_config, sub_matches, &base_dir);
                 }
+                (Commands::WgClient(args), "wg-client") => {
+                    config::apply_wg_client(args, &file_config, sub_matches, &base_dir);
+                }
+                (Commands::WgServer(args), "wg-server") => {
+                    config::apply_wg_server(args, &file_config, sub_matches, &base_dir);
+                }
+                (Commands::WgConfig(_), "wg-config")
+                | (Commands::WgKeygen(_), "wg-keygen")
+                | (Commands::WgPubkey(_), "wg-pubkey") => {}
                 (Commands::Cert(args), "cert") => {
                     config::apply_cert(args, &file_config, sub_matches, &base_dir);
                 }
@@ -154,6 +172,9 @@ async fn main() -> Result<()> {
         let socket = resolve_attach_socket(&cli.log_file, cli.telemetry_sock, args.attach)?;
         return tui::run_attached(socket).await;
     }
+    if let Some(result) = run_utility_command(&cli.command) {
+        return result;
+    }
     telemetry::init_channel(2048);
     let observability = init_tracing(&cli.log, &cli.log_file, !cli.tui && !cli.daemon)?;
     tun::set_embedded_tui(cli.tui);
@@ -172,6 +193,11 @@ async fn main() -> Result<()> {
             Commands::Server(args) => server::run(args).await,
             Commands::Client(args) => client::run(args).await,
             Commands::Tun(args) => tun::run(args).await,
+            Commands::WgClient(args) => wg::run_client(args).await,
+            Commands::WgServer(args) => wg::run_server(args).await,
+            Commands::WgConfig(args) => wg::run_config(args),
+            Commands::WgKeygen(args) => wg::run_keygen(args),
+            Commands::WgPubkey(args) => wg::run_pubkey(args),
             Commands::Cert(args) => cert::run(args),
             Commands::Tui(_) => Ok(()),
             Commands::Stop(_) => Ok(()),
@@ -216,9 +242,21 @@ fn validate_daemon_mode(cli: &Cli) -> Result<()> {
     }
 
     match cli.command {
-        Commands::Client(_) | Commands::Server(_) | Commands::Tun(_) => Ok(()),
-        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) | Commands::Status(_) => {
-            anyhow::bail!("--daemon is only supported for client, server, and tun")
+        Commands::Client(_)
+        | Commands::Server(_)
+        | Commands::Tun(_)
+        | Commands::WgClient(_)
+        | Commands::WgServer(_) => Ok(()),
+        Commands::WgConfig(_)
+        | Commands::WgKeygen(_)
+        | Commands::WgPubkey(_)
+        | Commands::Cert(_)
+        | Commands::Tui(_)
+        | Commands::Stop(_)
+        | Commands::Status(_) => {
+            anyhow::bail!(
+                "--daemon is only supported for client, server, tun, wg-client, and wg-server"
+            )
         }
     }
 }
@@ -383,7 +421,31 @@ fn dashboard_context(cli: &Cli, log_file: PathBuf) -> Option<tui::DashboardConte
             log_file,
             log_filter: cli.log.clone(),
         },
-        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) | Commands::Status(_) => {
+        Commands::WgClient(args) => tui::DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: Some(args.bind.clone()),
+            upstream: Some(args.endpoint.clone()),
+            path: Some(args.device.clone()),
+            log_file,
+            log_filter: cli.log.clone(),
+        },
+        Commands::WgServer(args) => tui::DashboardContext {
+            command_label: "wg-server".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: Some(args.listen.clone()),
+            upstream: Some(args.peer_tunnel_ip.to_string()),
+            path: Some(args.device.clone()),
+            log_file,
+            log_filter: cli.log.clone(),
+        },
+        Commands::WgConfig(_)
+        | Commands::WgKeygen(_)
+        | Commands::WgPubkey(_)
+        | Commands::Cert(_)
+        | Commands::Tui(_)
+        | Commands::Stop(_)
+        | Commands::Status(_) => {
             return None;
         }
     };
@@ -442,7 +504,33 @@ fn monitor_context(cli: &Cli, log_file: PathBuf) -> Option<telemetry::MonitorCon
             log_filter: cli.log.clone(),
             pid,
         },
-        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) | Commands::Status(_) => {
+        Commands::WgClient(args) => telemetry::MonitorContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: Some(args.bind.clone()),
+            upstream: Some(args.endpoint.clone()),
+            path: Some(args.device.clone()),
+            log_file,
+            log_filter: cli.log.clone(),
+            pid,
+        },
+        Commands::WgServer(args) => telemetry::MonitorContext {
+            command_label: "wg-server".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: Some(args.listen.clone()),
+            upstream: Some(args.peer_tunnel_ip.to_string()),
+            path: Some(args.device.clone()),
+            log_file,
+            log_filter: cli.log.clone(),
+            pid,
+        },
+        Commands::WgConfig(_)
+        | Commands::WgKeygen(_)
+        | Commands::WgPubkey(_)
+        | Commands::Cert(_)
+        | Commands::Tui(_)
+        | Commands::Stop(_)
+        | Commands::Status(_) => {
             return None;
         }
     };
@@ -471,6 +559,8 @@ fn resolve_attach_socket(
     let client = default_socket_path(log_file, "client")?;
     let server = default_socket_path(log_file, "server")?;
     let tun = default_socket_path(log_file, "tun")?;
+    let wg_client = default_socket_path(log_file, "wg-client")?;
+    let wg_server = default_socket_path(log_file, "wg-server")?;
 
     let mut found = Vec::new();
     if client.exists() {
@@ -481,6 +571,12 @@ fn resolve_attach_socket(
     }
     if tun.exists() {
         found.push(tun);
+    }
+    if wg_client.exists() {
+        found.push(wg_client);
+    }
+    if wg_server.exists() {
+        found.push(wg_server);
     }
 
     match found.len() {
@@ -535,7 +631,25 @@ fn command_role(command: &Commands) -> Option<&'static str> {
         Commands::Client(_) => Some("client"),
         Commands::Server(_) => Some("server"),
         Commands::Tun(_) => Some("tun"),
-        Commands::Cert(_) | Commands::Tui(_) | Commands::Stop(_) | Commands::Status(_) => None,
+        Commands::WgClient(_) => Some("wg-client"),
+        Commands::WgServer(_) => Some("wg-server"),
+        Commands::WgConfig(_)
+        | Commands::WgKeygen(_)
+        | Commands::WgPubkey(_)
+        | Commands::Cert(_)
+        | Commands::Tui(_)
+        | Commands::Stop(_)
+        | Commands::Status(_) => None,
+    }
+}
+
+fn run_utility_command(command: &Commands) -> Option<Result<()>> {
+    match command {
+        Commands::WgConfig(args) => Some(wg::run_config(args.clone())),
+        Commands::WgKeygen(args) => Some(wg::run_keygen(args.clone())),
+        Commands::WgPubkey(args) => Some(wg::run_pubkey(args.clone())),
+        Commands::Cert(args) => Some(cert::run(args.clone())),
+        _ => None,
     }
 }
 
@@ -674,7 +788,7 @@ fn resolve_status_targets(
         }]);
     }
 
-    Ok(["client", "server", "tun"]
+    Ok(["client", "server", "tun", "wg-client", "wg-server"]
         .into_iter()
         .map(|role| {
             Ok(StatusTarget {
@@ -980,6 +1094,8 @@ fn resolve_stop_pid_file(
     let client = default_pid_path(log_file, "client")?;
     let server = default_pid_path(log_file, "server")?;
     let tun = default_pid_path(log_file, "tun")?;
+    let wg_client = default_pid_path(log_file, "wg-client")?;
+    let wg_server = default_pid_path(log_file, "wg-server")?;
     let mut found = Vec::new();
     if client.exists() {
         found.push(client);
@@ -990,14 +1106,20 @@ fn resolve_stop_pid_file(
     if tun.exists() {
         found.push(tun);
     }
+    if wg_client.exists() {
+        found.push(wg_client);
+    }
+    if wg_server.exists() {
+        found.push(wg_server);
+    }
 
     match found.len() {
         0 => anyhow::bail!(
-            "no pid file found; pass `stop client`, `stop server`, `stop tun`, or `--pid-file`"
+            "no pid file found; pass `stop client`, `stop server`, `stop tun`, `stop wg-client`, `stop wg-server`, or `--pid-file`"
         ),
         1 => Ok(found.remove(0)),
         _ => anyhow::bail!(
-            "multiple pid files exist; pass `stop client`, `stop server`, `stop tun`, or `--pid-file`"
+            "multiple pid files exist; pass `stop client`, `stop server`, `stop tun`, `stop wg-client`, `stop wg-server`, or `--pid-file`"
         ),
     }
 }
@@ -1048,7 +1170,11 @@ impl Drop for PidFileGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeStatus, ServiceRole, classify_service_state, resolve_status_targets};
+    use super::{
+        Commands, RuntimeStatus, ServiceRole, classify_service_state, command_role,
+        resolve_status_targets, run_utility_command,
+    };
+    use pipit::wg;
     use std::path::Path;
 
     #[test]
@@ -1058,7 +1184,10 @@ mod tests {
             .iter()
             .map(|target| target.label.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(labels, vec!["client", "server", "tun"]);
+        assert_eq!(
+            labels,
+            vec!["client", "server", "tun", "wg-client", "wg-server"]
+        );
         assert!(targets.iter().all(|target| target.pid_file.is_some()));
         assert!(
             targets
@@ -1090,6 +1219,35 @@ mod tests {
                 .as_ref()
                 .is_some_and(|path| path.ends_with("custom.sock"))
         );
+    }
+
+    #[test]
+    fn wg_utility_commands_are_not_treated_as_services() {
+        let config = Commands::WgConfig(wg::WgConfigArgs {
+            server_endpoint: "198.51.100.10:51820".to_owned(),
+            client_tunnel_ip: "10.8.0.2".parse().unwrap(),
+            server_tunnel_ip: "10.8.0.1".parse().unwrap(),
+            mtu: 1420,
+            persistent_keepalive_secs: 25,
+            dns: None,
+            allowed_ips: Vec::new(),
+            peer_allowed_ips: Vec::new(),
+            nat_out_interface: None,
+            json: false,
+        });
+        assert!(command_role(&config).is_none());
+        assert!(run_utility_command(&config).is_some_and(|result| result.is_ok()));
+
+        let keygen = Commands::WgKeygen(wg::WgKeygenArgs { json: false });
+        assert!(command_role(&keygen).is_none());
+        assert!(run_utility_command(&keygen).is_some());
+
+        let pubkey = Commands::WgPubkey(wg::WgPubkeyArgs {
+            private_key: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=".to_owned(),
+            json: false,
+        });
+        assert!(command_role(&pubkey).is_none());
+        assert!(run_utility_command(&pubkey).is_some_and(|result| result.is_ok()));
     }
 
     #[test]

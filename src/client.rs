@@ -15,8 +15,8 @@ use tokio::{
     net::{TcpListener, TcpStream},
     time::timeout,
 };
-use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use tracing::{info, warn};
 
 const TUN_DNS_PORT: u16 = 53;
@@ -255,8 +255,9 @@ async fn handle_connection(
             Ok(tunnel) => tunnel,
             Err(err) => {
                 let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
-                return Err(err)
-                    .with_context(|| format!("failed to open remote tun DNS tunnel to {upstream_target}"));
+                return Err(err).with_context(|| {
+                    format!("failed to open remote tun DNS tunnel to {upstream_target}")
+                });
             }
         };
         socks5::send_success(&mut inbound).await?;
@@ -304,23 +305,22 @@ async fn handle_connection(
         RouteDecision::Remote => {}
     }
 
-    let tunnel =
-        match establish_remote_tunnel(
-            &args,
-            &connector,
-            &host_header,
-            &server_name,
-            &target_string,
-            http::TunnelTransport::Tcp,
-        )
-        .await
-        {
-            Ok(tunnel) => tunnel,
-            Err(err) => {
-                let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
-                return Err(err).context("failed to establish remote tunnel");
-            }
-        };
+    let tunnel = match establish_remote_tunnel(
+        &args,
+        &connector,
+        &host_header,
+        &server_name,
+        &target_string,
+        http::TunnelTransport::Tcp,
+    )
+    .await
+    {
+        Ok(tunnel) => tunnel,
+        Err(err) => {
+            let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
+            return Err(err).context("failed to establish remote tunnel");
+        }
+    };
 
     socks5::send_success(&mut inbound).await?;
     let stats = traffic::relay_with_telemetry(

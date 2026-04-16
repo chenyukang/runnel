@@ -19,3 +19,4 @@ pub mod tui;
 pub mod tun;
 pub mod udp;
 pub mod udp_assoc;
+pub mod wg;
