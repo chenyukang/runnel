@@ -16,6 +16,7 @@ use crate::{
 };
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileConfig {
     pub log: Option<String>,
     pub log_file: Option<PathBuf>,
@@ -30,6 +31,7 @@ pub struct FileConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub listen: Option<String>,
     pub server: Option<String>,
@@ -53,6 +55,7 @@ pub struct ClientConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: Option<String>,
     pub cert: Option<PathBuf>,
@@ -74,6 +77,7 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CertConfig {
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
@@ -81,6 +85,7 @@ pub struct CertConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TunConfig {
     pub device: Option<String>,
     pub shell: Option<String>,
@@ -94,6 +99,7 @@ pub struct TunConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WgClientConfig {
     pub bind: Option<String>,
     pub endpoint: Option<String>,
@@ -116,6 +122,7 @@ pub struct WgClientConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WgServerConfig {
     pub listen: Option<String>,
     pub private_key: Option<String>,
@@ -860,6 +867,39 @@ server:
                 .and_then(|cfg| cfg.dry_run),
             Some(true)
         );
+    }
+
+    #[test]
+    fn yaml_parse_rejects_unknown_fields() {
+        let nested_raw = r#"
+client:
+  mode: wg
+  telemetry-sock: /tmp/pipit.sock
+  wg:
+    endpoint: 198.51.100.10:51820
+"#;
+
+        let err = serde_yaml::from_str::<FileConfig>(nested_raw)
+            .expect_err("unknown client field should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown field `telemetry-sock`"),
+            "{message}"
+        );
+        assert!(message.contains("client:"), "{message}");
+
+        let top_level_raw = r#"
+telemetry-sock: /tmp/pipit.sock
+"#;
+
+        let err = serde_yaml::from_str::<FileConfig>(top_level_raw)
+            .expect_err("unknown top-level field should fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown field `telemetry-sock`"),
+            "{message}"
+        );
+        assert!(message.contains("telemetry_sock"), "{message}");
     }
 
     #[test]
