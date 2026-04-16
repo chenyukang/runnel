@@ -17,7 +17,7 @@ Usage:
 
 Options:
   --role client|server       Which side to diagnose. Default: client.
-  --config PATH              pipit WG YAML config. Default: pipit.wg.yaml.
+  --config PATH              pipit YAML config with client/server mode: wg. Default: pipit.wg.yaml.
   --pipit PATH               pipit binary. Default: ./target/release/pipit.
   --start                    Start the selected pipit WG side in the background.
   --domain NAME              DNS smoke-test domain. Default: example.com.
@@ -84,6 +84,27 @@ section_value() {
     $0 ~ "^" section ":" { in_section=1; next }
     /^[^[:space:]][^:]*:/ { in_section=0 }
     in_section && $1 == key ":" {
+      sub("^[[:space:]]*" key ":[[:space:]]*", "")
+      print
+      exit
+    }
+  ' "$CONFIG"
+}
+
+nested_section_value() {
+  local parent="$1"
+  local child="$2"
+  local key="$3"
+  awk -v parent="$parent" -v child="$child" -v key="$key" '
+    $0 ~ "^" parent ":" { in_parent=1; in_child=0; next }
+    /^[^[:space:]][^:]*:/ { in_parent=0; in_child=0 }
+    in_parent && $0 ~ "^[[:space:]]+" child ":" { in_child=1; next }
+    in_parent && in_child && $0 ~ "^  [^[:space:]][^:]*:" {
+      if ($1 != key ":") {
+        in_child=0
+      }
+    }
+    in_parent && in_child && $1 == key ":" {
       sub("^[[:space:]]*" key ":[[:space:]]*", "")
       print
       exit
@@ -161,16 +182,16 @@ detect_iface() {
 
 server_smoke() {
   local listen
-  listen="$(strip_quotes "$(section_value wg_server listen)")"
+  listen="$(strip_quotes "$(nested_section_value server wg listen)")"
   local port="${listen##*:}"
   local logfile="$LOG_DIR/pipit-wg-server-smoke.log"
 
   if [[ "$START" -eq 1 ]]; then
-    start_pipit "wg-server" "$logfile"
+    start_pipit "server" "$logfile"
   fi
 
   run_step "server process"
-  pgrep -fl 'pipit.*wg-server' || true
+  pgrep -fl 'pipit.*server' || true
 
   if command -v ss >/dev/null 2>&1; then
     run_step "UDP listen check with ss"
@@ -186,19 +207,19 @@ server_smoke() {
 
 client_smoke() {
   local endpoint peer_tunnel dns host port iface tcpdump_log logfile
-  endpoint="$(strip_quotes "$(section_value wg_client endpoint)")"
-  peer_tunnel="$(strip_quotes "$(section_value wg_client peer_tunnel_ip)")"
-  dns="$(strip_quotes "$(section_value wg_client dns)")"
+  endpoint="$(strip_quotes "$(nested_section_value client wg endpoint)")"
+  peer_tunnel="$(strip_quotes "$(nested_section_value client wg peer_tunnel_ip)")"
+  dns="$(strip_quotes "$(nested_section_value client wg dns)")"
   host="$(endpoint_host "$endpoint")"
   port="$(endpoint_port "$endpoint")"
   logfile="$LOG_DIR/pipit-wg-client-smoke.log"
 
   if [[ "$START" -eq 1 ]]; then
-    start_pipit "wg-client" "$logfile"
+    start_pipit "client" "$logfile"
   fi
 
   run_step "client process"
-  pgrep -fl 'pipit.*wg-client' || true
+  pgrep -fl 'pipit.*client' || true
 
   run_step "route to WG endpoint $host"
   if [[ "$(uname -s)" == "Darwin" ]]; then

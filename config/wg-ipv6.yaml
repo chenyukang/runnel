@@ -1,0 +1,36 @@
+# Sample WG IPv6-only config.
+# Prefer generating a fresh config with `pipit wg-config`.
+# Replace every REPLACE_WITH_* value before running.
+
+log: info
+log_file: ./logs/pipit-wg-ipv6.log
+telemetry_sock: ./run/pipit-wg-ipv6.sock
+tui: true
+
+client:
+  mode: wg
+  wg:
+    endpoint: "[SERVER-IPv6]:51820"
+    private_key: REPLACE_WITH_CLIENT_PRIVATE_KEY
+    peer_public_key: REPLACE_WITH_SERVER_PUBLIC_KEY
+    tunnel_ip: fd00:8::2
+    peer_tunnel_ip: fd00:8::1
+    mtu: 1420
+    persistent_keepalive_secs: 25
+    dns: 2606:4700:4700::1111
+    dns_capture: true
+    allowed_ips:
+      - ::/0
+    exclude_lan: true
+
+server:
+  mode: wg
+  wg:
+    listen: "[::]:51820"
+    private_key: REPLACE_WITH_SERVER_PRIVATE_KEY
+    peer_public_key: REPLACE_WITH_CLIENT_PUBLIC_KEY
+    tunnel_ip: fd00:8::1
+    peer_tunnel_ip: fd00:8::2
+    mtu: 1420
+    peer_allowed_ips:
+      - fd00:8::2/128

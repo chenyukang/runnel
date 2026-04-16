@@ -1,0 +1,26 @@
+# Sample TUN config.
+# Use PIPIT_PASSWORD for the embedded client shared secret.
+
+log: info
+log_file: ./logs/pipit-tun.log
+telemetry_sock: ./run/pipit-tun.sock
+tui: true
+
+client:
+  listen: 127.0.0.1:1080
+  server: SERVER-IP:1443
+  server_name: SERVER-NAME
+  ca_cert: ./certs/server.crt
+  mode: native-http
+  filter: proxy
+  user_agent: Mozilla/5.0
+  handshake_timeout_secs: 10
+  connect_timeout_secs: 10
+
+tun:
+  device: auto
+  dns_upstream: 1.1.1.1:53
+  helper_ready_delay_ms: 1200
+  print_hooks: false
+  dry_run: false
+

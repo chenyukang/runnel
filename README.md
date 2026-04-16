@@ -1,46 +1,220 @@
 # Pipit
 
-Pipit is a compact Rust proxy that keeps the moving parts small:
+Pipit is a compact Rust proxy and tunnel toolbox. Its recommended path is WG
+mode: a WireGuard-style UDP tunnel built on `boringtun`. It also keeps classic
+SOCKS and native/daze transports available for app-level proxying and debugging.
 
-- local `SOCKS5` on the client side
-- selectable native TLS or daze-style transport modes
-- HTTP-looking handshakes for the native modes
-- shared-secret HMAC authentication so the server is not an unauthenticated open proxy
-- optional config, daemon, TUI, and TUN workflows in the same binary
+The project intentionally keeps the moving parts visible:
 
-The design is inspired by lightweight remote proxies such as [daze](https://github.com/libraries/daze), but the scope stays intentionally conservative: TCP only, SOCKS5 `CONNECT` only, no traffic shaping, and no full userspace IP stack.
+- `pipit client` runs the recommended WG client when `client.mode: wg`, or
+  exposes a local SOCKS5 proxy for native/daze modes.
+- `pipit server` accepts one of several client/server modes.
+- `pipit tun` optionally captures local IP traffic through the classic
+  native-http client path.
+- `client.mode: wg` / `server.mode: wg` create a WireGuard-style UDP tunnel.
+- config files, daemon mode, status checks, telemetry sockets, and TUI dashboards
+  are available from the same binary.
 
-## Feature Snapshot
+## Mental Model
 
-- `pipit client` exposes a local SOCKS5 proxy
-- `pipit server` accepts `native-http`, `native-mux`, `daze-ashe`, `daze-baboon`, or `daze-czar`
-- `pipit tun` routes TUN traffic through the normal client path with embedded `tun2proxy`
-- `pipit cert` generates a self-signed certificate for quick setup
-- proxy control can decide per target whether to connect directly, proxy remotely, or block it
-- replay protection and private-target blocking are enabled by default
+Pipit has two separate concerns. Keeping them separate makes the modes easier
+to reason about:
 
-## Quick Start
+1. **Client/server mode**: how `pipit client` talks to `pipit server`.
+2. **Client traffic intake**: whether local traffic enters through SOCKS or a
+   local TUN device.
 
-1. Generate a certificate for your server name:
+### Client/Server Modes
+
+These are the `--mode` values shared by `pipit client` and `pipit server`.
+
+| Mode | Shape | Best for | Main tradeoff |
+| --- | --- | --- | --- |
+| `native-http` | TLS + HTTP-looking per-connection tunnel | Classic SOCKS proxy, compatibility path, UDP ASSOCIATE support | One upstream TCP/TLS connection per SOCKS connection |
+| `native-mux` | One long-lived TLS session with logical streams | Many short-lived TCP connections | A single session carries many streams |
+| `daze-ashe` | Raw TCP daze-style encrypted stream | Minimal alternate transport | No TLS camouflage |
+| `daze-baboon` | HTTP-looking request, then daze-style stream | Daze-style handshake hidden behind a normal-looking request | More specialized than `native-http` |
+| `daze-czar` | Raw TCP multiplexed daze-style session | Daze-style multiplexing | More stateful than `daze-ashe` |
+| `wg` | WireGuard-style UDP via `boringtun` | Recommended full-tunnel or split-tunnel mode with real UDP tunnel semantics | Usually needs root or network privileges; automatic true dual-stack still needs more schema work |
+
+### Client Traffic Intake
+
+This decides how traffic reaches the local client side. For native/daze modes,
+the intake is conceptually separate from the client/server mode. WG is the
+exception: `client.mode: wg` selects the WireGuard-style client/server mode and
+also creates its own TUN-based traffic intake.
+
+| Intake | Entry point | What it captures | Current implementation status |
+| --- | --- | --- | --- |
+| SOCKS | `pipit client` with native/daze modes | Apps explicitly configured for `socks5://127.0.0.1:1080` | Works with `native-http`, `native-mux`, and `daze-*` |
+| macOS system proxy | `pipit client --system-proxy` | Apps that honor the macOS SOCKS proxy setting | Works with the normal SOCKS client path |
+| TUN | `pipit tun` | System IP traffic routed into a local TUN device | Architecturally a client-side intake mode; currently implemented only with `native-http` because DNS/UDP handling relies on SOCKS `UDP ASSOCIATE` |
+| WG TUN | `pipit client` with `client.mode: wg` | System IP traffic routed into the WireGuard-style TUN device | Works with `server.mode: wg`; uses UDP transport via `boringtun` and does not use SOCKS or `pipit tun` |
+
+So `pipit tun` is not a competing server transport. It answers “should the
+native/daze client capture system traffic?” while `native-http`, `native-mux`,
+and `daze-*` answer “how does the client connect to the server?” Today the
+implementation only allows `pipit tun` + `native-http`; broader combinations
+need transport support for the traffic semantics that TUN requires.
+
+### WG As Mode And Intake
+
+`wg` is a client/server mode, configured under `client.wg` and `server.wg`.
+Unlike the native/daze modes, it does not expose a local SOCKS listener. The WG
+client creates its own TUN device and sends encrypted UDP packets directly to
+the WG server endpoint.
+
+New configs should use `client.mode: wg` and `server.mode: wg`.
+
+In practice:
+
+- Start with `client.mode: wg` / `server.mode: wg` for the recommended full-tunnel or split-tunnel path.
+- Use classic `client` + `server --mode native-http` when you specifically want a local SOCKS proxy.
+- Add `--system-proxy` if you want macOS apps to use the local SOCKS proxy automatically.
+- Use `pipit tun` only when you want the native-http SOCKS path behind a TUN intake instead of WG.
+- Use `native-mux` or `daze-*` when you specifically want those alternate client/server transport shapes.
+
+Sample config files live in [`config/`](./config/). They use documentation-only
+hosts, addresses, and placeholders; bring your own `PIPIT_PASSWORD`, certificates,
+and WG keys.
+
+## Install And Build
 
 ```bash
-cargo run -- cert --name example.com --cert server.crt --key server.key
+cargo build --release
 ```
 
-2. Start the server in the default `native-http` mode:
+During development you can replace `./target/release/pipit` with:
 
 ```bash
-PIPIT_PASSWORD='replace-me' cargo run -- server \
+cargo run -- ...
+```
+
+## Quick Start: WG Mode
+
+WG mode is the recommended path for daily use. It is a WireGuard-style tunnel
+built on `boringtun`, uses UDP between `pipit client` and `pipit server`, and
+supports full-tunnel or split-tunnel routing. It does not use SOCKS,
+`pipit tun`, or the native/daze handshakes.
+
+Generate a paired config, replacing `SERVER-IP` with the real server IP before
+running the command:
+
+```bash
+./target/release/pipit wg-config \
+  --server-endpoint SERVER-IP:51820 \
+  --client-tunnel-ip 10.8.0.2 \
+  --server-tunnel-ip 10.8.0.1 \
+  --dns 1.1.1.1 \
+  --dns-capture \
+  --exclude-lan \
+  --nat-out-interface eth0 > pipit.wg.yaml
+```
+
+There are also shape-only templates at
+[`config/wg-ipv4.yaml`](./config/wg-ipv4.yaml) and
+[`config/wg-ipv6.yaml`](./config/wg-ipv6.yaml). Prefer `wg-config` for real
+deployments so each client/server pair gets fresh keys.
+
+Start the server first:
+
+```bash
+sudo ./target/release/pipit \
+  --log-file /tmp/pipit-wg-server.log \
+  --config pipit.wg.yaml \
+  server
+```
+
+Start the client second:
+
+```bash
+sudo ./target/release/pipit \
+  --log-file /tmp/pipit-wg-client.log \
+  --config pipit.wg.yaml \
+  --tui \
+  client
+```
+
+Preview hooks without changing the system:
+
+Temporarily add these fields under the side you want to inspect:
+
+```yaml
+client:
+  wg:
+    print_hooks: true
+    dry_run: true
+
+server:
+  wg:
+    print_hooks: true
+    dry_run: true
+```
+
+Then run the normal entry point:
+
+```bash
+./target/release/pipit \
+  --log-file /tmp/pipit-wg-client-dry-run.log \
+  --config pipit.wg.yaml \
+  client
+
+./target/release/pipit \
+  --log-file /tmp/pipit-wg-server-dry-run.log \
+  --config pipit.wg.yaml \
+  server
+```
+
+Remove `dry_run: true` before real startup.
+
+Run a repeatable smoke check:
+
+```bash
+# server machine
+sudo ./scripts/pipit-wg-smoke.sh --role server --config pipit.wg.yaml --start
+
+# client machine
+sudo ./scripts/pipit-wg-smoke.sh --role client --config pipit.wg.yaml --start
+```
+
+WG mode notes:
+
+- Startup preflight checks privileges and platform tools before hooks run.
+- Linux server NAT defaults to IPv4 `iptables` masquerade.
+- macOS client DNS capture uses a local UDP DNS forwarder on `127.0.0.1:53`.
+- TUI can show aggregate WG traffic; Recent Domains require `--dns-capture`.
+- IPv4-only and IPv6-only automatic hooks are supported. True dual-stack still
+  needs a schema extension with separate IPv4 and IPv6 tunnel address pairs.
+- More detail lives in [`docs/wg-mode-quickstart.md`](./docs/wg-mode-quickstart.md).
+
+## Optional: SOCKS Proxy
+
+Use the classic SOCKS path when you want app-level proxying instead of a
+system-level WG tunnel.
+
+Generate a certificate for the server name:
+
+```bash
+./target/release/pipit cert \
+  --name example.com \
+  --cert server.crt \
+  --key server.key
+```
+
+Start the server:
+
+```bash
+PIPIT_PASSWORD='replace-me' ./target/release/pipit server \
   --mode native-http \
   --listen 0.0.0.0:1443 \
   --cert server.crt \
   --key server.key
 ```
 
-3. Start the local client in the same mode:
+Start the local client:
 
 ```bash
-PIPIT_PASSWORD='replace-me' cargo run -- client \
+PIPIT_PASSWORD='replace-me' ./target/release/pipit client \
   --mode native-http \
   --listen 127.0.0.1:1080 \
   --server example.com:1443 \
@@ -48,192 +222,33 @@ PIPIT_PASSWORD='replace-me' cargo run -- client \
   --ca-cert server.crt
 ```
 
-4. Point your browser or tools at `socks5://127.0.0.1:1080`.
+Point your browser or CLI tools at:
 
-## macOS System Proxy
+```text
+socks5://127.0.0.1:1080
+```
 
-On macOS, `pipit client` can temporarily point the system SOCKS proxy at its local listener and restore the previous SOCKS settings when `pipit` exits normally.
+## Optional: Native TUN Intake
 
-Example:
+`pipit tun` is the TUN intake for the classic native-http client path. Prefer WG
+for VPN-style daily use; use `pipit tun` when you specifically need the
+native-http SOCKS pipeline behind a TUN device.
+
+Use a tun-specific config such as [`config/tun.yaml`](./config/tun.yaml):
 
 ```bash
-PIPIT_PASSWORD='replace-me' cargo run -- client \
-  --mode native-http \
-  --listen 127.0.0.1:1080 \
-  --server example.com:1443 \
-  --server-name example.com \
-  --ca-cert server.crt \
-  --system-proxy
+sudo PIPIT_PASSWORD='replace-me' ./target/release/pipit \
+  --config ./config/tun.yaml \
+  tun
 ```
 
-If you only want to touch specific macOS network services, repeat `--system-proxy-service`:
+Preview hooks before touching routes:
 
 ```bash
-cargo run -- client \
-  --listen 127.0.0.1:1080 \
-  --server example.com:1443 \
-  --system-proxy \
-  --system-proxy-service Wi-Fi \
-  --system-proxy-service "USB 10/100/1000 LAN"
+./target/release/pipit --config ./config/tun.yaml tun --dry-run
 ```
 
-Notes:
-
-- this feature is only supported on macOS
-- `pipit` snapshots the current SOCKS settings first, then restores them on a normal shutdown such as `Ctrl-C` or `SIGTERM`
-- if the existing SOCKS proxy uses authentication, `pipit` refuses to overwrite it because `networksetup` does not expose enough information to restore credentials safely
-- changing macOS network services may require running `pipit` from an administrator account
-
-## Config File
-
-You can move most CLI flags into a YAML config file and load it with `--config`.
-
-Example:
-
-```bash
-PIPIT_PASSWORD='replace-me' cargo run -- --config ./pipit.example.yaml client
-```
-
-The repository includes a ready-to-copy example at [`pipit.example.yaml`](./pipit.example.yaml).
-
-Config precedence is:
-
-- explicit CLI flags
-- environment variables
-- YAML config
-- built-in defaults
-
-Relative paths inside the YAML file are resolved relative to the config file itself, so this works well for portable bundles.
-
-You can also enable background mode from YAML:
-
-```yaml
-daemon: true
-```
-
-`daemon: true` is supported for `client`, `server`, and `tun`. If `tui: true` is also set, daemon mode automatically disables TUI.
-
-You can also pin the daemon pid file in YAML:
-
-```yaml
-pid_file: ./proxy.client.pid
-```
-
-You can also pin the local telemetry socket path in YAML:
-
-```yaml
-telemetry_sock: ./proxy.client.sock
-```
-
-## Daemon Mode
-
-`pipit client` and `pipit server` can run in the background with `--daemon`:
-
-```bash
-PIPIT_PASSWORD='replace-me' cargo run -- --daemon client \
-  --mode native-http \
-  --listen 127.0.0.1:1080 \
-  --server example.com:1443 \
-  --server-name example.com \
-  --ca-cert server.crt
-```
-
-```bash
-PIPIT_PASSWORD='replace-me' cargo run -- --daemon server \
-  --mode native-http \
-  --listen 0.0.0.0:1443 \
-  --cert server.crt \
-  --key server.key
-```
-
-Notes:
-
-- `--daemon` is supported for `client`, `server`, and `tun`
-- if `tui: true` or `--tui` is also set, daemon mode automatically disables TUI
-- logs still go to `--log-file`, which defaults to `proxy.log`
-- daemon mode writes a pid file; by default it lives next to the log file as `proxy.<role>.pid`
-- you can override that path with `--pid-file` or `pid_file:` in YAML
-
-## Stop Daemon
-
-Once a daemon is running, you can stop it cleanly with:
-
-```bash
-cargo run -- stop client
-```
-
-or with an explicit pid file:
-
-```bash
-cargo run -- --pid-file ./proxy.client.pid stop
-```
-
-Notes:
-
-- `stop` sends `SIGTERM`, so `tun` mode still gets a chance to run its cleanup hooks
-- if the pid file is stale, `pipit stop` removes it and exits cleanly
-- if more than one default pid file exists, pass `stop client`, `stop server`, `stop tun`, or `--pid-file`
-
-## Daemon Status
-
-You can inspect daemon state with:
-
-```bash
-cargo run -- status
-cargo run -- status client
-cargo run -- --pid-file ./proxy.client.pid status --json
-```
-
-`status` checks both the pid file and the telemetry socket when available, so it can distinguish between:
-
-- a healthy running daemon
-- a live process with degraded telemetry
-- a stale pid file
-- a daemon that is not running
-
-## Attach TUI
-
-Once a daemon is already running, you can open a separate dashboard process with:
-
-```bash
-cargo run -- tui --attach ./proxy.client.sock
-```
-
-If you already use a config file with `telemetry_sock`, you can reuse it:
-
-```bash
-cargo run -- --config ./pipit.client.yaml tui
-```
-
-By default, `pipit tui` looks for an existing `client`, `server`, or `tun` socket derived from `--log-file`.
-
-## Tun Mode
-
-`pipit tun` is the VPN-style entry point. It runs the normal `pipit client` internally, feeds TUN traffic through embedded `tun2proxy`, and keeps route setup, logging, daemon mode, and TUI attach inside the same `pipit` process.
-
-Use a tun-specific config such as [`pipit.tun.yaml`](./pipit.tun.yaml). `tun` currently requires `client.mode: native-http`; it does not support inheriting `native-mux`, `daze-*`, or `system_proxy` settings from a standalone SOCKS client config.
-
-Example:
-
-```bash
-sudo PIPIT_PASSWORD='replace-me' cargo run -- --config ./pipit.tun.yaml tun
-```
-
-Before you touch the network, you can preview the exact helper and route commands with:
-
-```bash
-cargo run -- --config ./pipit.tun.yaml tun --dry-run
-```
-
-If you want to print the expanded helper and hook commands but still continue to run, use:
-
-```bash
-cargo run -- --config ./pipit.tun.yaml tun --print-hooks
-```
-
-The repository includes a starter template at [`pipit.tun.yaml`](./pipit.tun.yaml).
-
-There is also a small troubleshooting helper at [`scripts/pipit-tun.sh`](./scripts/pipit-tun.sh):
+Useful helper:
 
 ```bash
 ./scripts/pipit-tun.sh doctor
@@ -241,57 +256,38 @@ sudo ./scripts/pipit-tun.sh reset
 sudo ./scripts/pipit-tun.sh reset --dry-run
 ```
 
-Notes:
+Important limits:
 
-- the default path is fully in-process; an external helper is only used when `tun.helper_cmd` or `PIPIT_TUN_HELPER` is set
-- if `tun.device` or `--device` is omitted, `pipit` auto-picks the first free TUN device; on macOS it scans upward from `utun233` to avoid lower-numbered VPN interfaces
-- `pipit tun` keeps a small state file next to the log file so it can reject a second live tun instance and attempt stale cleanup after crashes
-- on macOS, if `tun.up` / `tun.down` are omitted and the upstream server resolves to IPv4, `pipit` configures the TUN device as `198.18.0.1`, pins the upstream server IP to the original egress path, and installs the standard split-route set (`1.0.0.0/8`, `2.0.0.0/7`, ..., `128.0.0.0/1`, plus `198.18.0.0/15`)
-- if you set `tun.dns_upstream: 1.1.1.1:53`, `pipit tun` passes that IP to tun2proxy as `--dns-addr`; on macOS it also temporarily points active network services at `198.18.0.1` so DNS inside the TUN stops leaking to the original system resolver
-- `tun` forces the embedded client to use `filter: proxy`; `direct` or `rule` decisions can recurse traffic back into the TUN split routes unless you build explicit bypass routes
-- `tun` currently requires `client.mode: native-http` because embedded DNS and other UDP traffic depend on SOCKS `UDP ASSOCIATE`; `native-mux` and `daze-*` modes are rejected at startup
-- `tun` ignores `client.system_proxy` and `client.system_proxy_services`; the TUN device already captures traffic without flipping the OS SOCKS proxy
-- the default route hooks usually need elevated privileges, so `sudo` is typical
-- if you override `tun.helper_cmd` and still want `tun.dns_upstream` to apply, include `--dns-addr {dns_upstream_ip}` in the helper command
-- `tun.helper_cmd`, `tun.up`, and `tun.down` are still fully overrideable
-- placeholders available in commands and hooks are:
-  - `{device}`
-  - `{socks}` or `{socks_listen}`
-  - `{server}`
-  - `{server_host}`
-  - `{server_port}`
-  - `{server_ip}`
-  - `{dns_upstream}`
-  - `{dns_upstream_ip}`
-  - `{dns_upstream_port}`
-  - `{dns_redirect_ip}`
-  - `{egress_interface}`
-  - `{egress_gateway}`
-  - `{log_file}`
+- `tun` is conceptually independent from the client/server transport, but the
+  current implementation requires `client.mode: native-http`.
+- `tun` ignores `client.system_proxy`; traffic is already captured by the TUN.
+- Default route and DNS hooks usually require `sudo`.
+- Direct/rule routing can loop back into the TUN, so `tun` forces
+  `client.filter: proxy`.
 
-## Modes
+## SOCKS Split Routing And Proxy Control
 
-- `native-http`: one TLS tunnel per local SOCKS connection. This is the default mode.
-- `native-mux`: one persistent TLS session carrying many logical streams.
-- `daze-ashe`: a daze-style raw TCP mode using the ashe handshake and RC4 stream encryption.
-- `daze-baboon`: daze-ashe hidden behind an HTTP-looking `POST /sync` request plus fallback website masking.
-- `daze-czar`: daze-ashe running on top of a compact raw TCP multiplexing layer.
+The SOCKS client can decide per target whether to connect directly, proxy
+remotely, or block.
 
-Native modes require `--cert` and `--key` on the server. `daze-ashe`, `daze-baboon`, and `daze-czar` ignore those TLS settings.
+```bash
+PIPIT_PASSWORD='replace-me' ./target/release/pipit client \
+  --mode native-http \
+  --listen 127.0.0.1:1080 \
+  --server example.com:1443 \
+  --server-name example.com \
+  --ca-cert server.crt \
+  --filter rule \
+  --rule-file ./rule.ls \
+  --cidr-file ./rule.cidr
+```
 
-## Proxy Control
+Filter modes:
 
-The client can now do daze-style proxy control before it decides whether a target should use the remote tunnel.
-
-- `--filter proxy`: always use the remote proxy. This is the default and preserves the old behavior.
+- `--filter proxy`: always use the remote proxy. This is the default.
 - `--filter direct`: always connect directly from the client machine.
-- `--filter rule`: evaluate glob rules first, then CIDR rules, then fall back to remote.
-
-When `--filter rule` is enabled:
-
-- `--rule-file` loads hostname glob rules in the same `L / R / B` style used by daze.
-- `--cidr-file` loads CIDR rules in the same `L / R / B` style.
-- reserved and loopback IP ranges are treated as direct by default, similar to daze's local-network shortcut.
+- `--filter rule`: evaluate hostname glob rules, then CIDR rules, then fall back
+  to remote.
 
 Example `rule.ls`:
 
@@ -309,139 +305,122 @@ R 1.1.1.0/24
 B 203.0.113.0/24
 ```
 
-Example client command:
+## Config Files
+
+Most CLI flags can move into YAML and be loaded with `--config`.
 
 ```bash
-PIPIT_PASSWORD='replace-me' cargo run -- client \
+./target/release/pipit \
+  --config pipit.wg.yaml \
+  client
+```
+
+Config precedence:
+
+1. explicit CLI flags
+2. environment variables
+3. YAML config
+4. built-in defaults
+
+Relative paths inside YAML are resolved relative to the config file.
+
+Starter files:
+
+- WG mode samples:
+  [`config/wg-ipv4.yaml`](./config/wg-ipv4.yaml) and
+  [`config/wg-ipv6.yaml`](./config/wg-ipv6.yaml).
+- Client/server transport samples:
+  [`config/native-http.yaml`](./config/native-http.yaml),
+  [`config/native-mux.yaml`](./config/native-mux.yaml),
+  [`config/daze-ashe.yaml`](./config/daze-ashe.yaml),
+  [`config/daze-baboon.yaml`](./config/daze-baboon.yaml), and
+  [`config/daze-czar.yaml`](./config/daze-czar.yaml).
+- Client intake sample:
+  [`config/tun.yaml`](./config/tun.yaml), currently paired with
+  `client.mode: native-http`.
+- [`config/README.md`](./config/README.md) explains the templates and key/password policy.
+
+## Daemon, Status, And TUI
+
+Run supported service commands in the background:
+
+```bash
+sudo ./target/release/pipit --daemon \
+  --log-file ./pipit-wg-server.log \
+  --telemetry-sock ./pipit-wg-server.sock \
+  --config pipit.wg.yaml \
+  server
+
+sudo ./target/release/pipit --daemon \
+  --log-file ./pipit-wg-client.log \
+  --telemetry-sock ./pipit-wg-client.sock \
+  --config pipit.wg.yaml \
+  client
+```
+
+Check status:
+
+```bash
+./target/release/pipit status
+./target/release/pipit status client
+./target/release/pipit status server
+./target/release/pipit status --json
+```
+
+Stop a daemon:
+
+```bash
+./target/release/pipit stop client
+```
+
+Attach a dashboard:
+
+```bash
+./target/release/pipit tui --attach ./pipit-wg-client.sock
+```
+
+Daemon mode is supported for `client`, `server`, and `tun`. If `--tui` is also
+set, daemon mode disables the inline TUI.
+
+## Optional: macOS System Proxy
+
+For the SOCKS client, macOS can temporarily point the system SOCKS proxy at the
+local listener and restore it on normal shutdown:
+
+```bash
+PIPIT_PASSWORD='replace-me' ./target/release/pipit client \
   --mode native-http \
   --listen 127.0.0.1:1080 \
   --server example.com:1443 \
   --server-name example.com \
   --ca-cert server.crt \
-  --filter rule \
-  --rule-file ./rule.ls \
-  --cidr-file ./rule.cidr
+  --system-proxy
 ```
 
-## Optional Multiplexing
-
-For short-lived connections, you can reuse one TLS session and multiplex multiple SOCKS streams through it:
-
-```bash
-PIPIT_PASSWORD='replace-me' cargo run -- server \
-  --mode native-mux \
-  --listen 0.0.0.0:1443 \
-  --cert server.crt \
-  --key server.key
-```
-
-```bash
-PIPIT_PASSWORD='replace-me' cargo run -- client \
-  --mode native-mux \
-  --listen 127.0.0.1:1080 \
-  --server example.com:1443 \
-  --server-name example.com \
-  --ca-cert server.crt
-```
-
-In `native-mux` mode, the client keeps a persistent TLS session and opens lightweight logical streams inside it instead of paying the full TCP + TLS + HTTP handshake cost for every SOCKS connection.
-Both sides default to `--mux-path /mux`, so you only need to set it when you want a custom path.
-
-For backward compatibility, `--mux` still maps to `--mode native-mux`.
-
-## Daze Ashe Mode
-
-If you want a daze-style raw TCP transport:
-
-```bash
-PIPIT_PASSWORD='replace-me' cargo run -- server \
-  --mode daze-ashe \
-  --listen 0.0.0.0:1081
-```
-
-```bash
-PIPIT_PASSWORD='replace-me' cargo run -- client \
-  --mode daze-ashe \
-  --listen 127.0.0.1:1080 \
-  --server example.com:1081
-```
-
-This mode skips TLS entirely and uses a daze-style per-connection handshake plus RC4 stream encryption. It is useful as an alternate strategy layer, but it does not provide the camouflage properties of the native HTTP-over-TLS modes.
-
-## Daze Baboon Mode
-
-If you want the daze handshake to be hidden behind a normal-looking HTTP request:
-
-```bash
-PIPIT_PASSWORD='replace-me' cargo run -- server \
-  --mode daze-baboon \
-  --listen 0.0.0.0:1081 \
-  --fallback-url https://www.qq.com
-```
-
-```bash
-PIPIT_PASSWORD='replace-me' cargo run -- client \
-  --mode daze-baboon \
-  --listen 127.0.0.1:1080 \
-  --server example.com:1081
-```
-
-`daze-baboon` starts with a `POST /sync` request carrying an `Authorization` signature. Unmatched requests are proxied to `--fallback-url`, so the server can still look like a normal website from the outside.
-
-## Daze Czar Mode
-
-If you want a daze-style multiplexed transport over one long-lived raw TCP session:
-
-```bash
-PIPIT_PASSWORD='replace-me' cargo run -- server \
-  --mode daze-czar \
-  --listen 0.0.0.0:1081
-```
-
-```bash
-PIPIT_PASSWORD='replace-me' cargo run -- client \
-  --mode daze-czar \
-  --listen 127.0.0.1:1080 \
-  --server example.com:1081
-```
-
-`daze-czar` keeps one raw TCP connection open to the server and multiplexes many logical streams over it. Each logical stream still uses the daze-ashe encrypted open handshake before switching into relay mode.
+Limit the affected network services by repeating `--system-proxy-service`.
 
 ## Security Notes
 
-- TLS certificate verification is enabled by default.
-- For self-signed deployments, pass the server certificate with `--ca-cert`.
-- The shared secret is read from `PIPIT_PASSWORD` or `--password`; prefer the environment variable in practice.
-- Authentication includes a timestamp and nonce. Replays outside the allowed window are rejected.
-- Literal private IP targets are blocked unless `--allow-private-targets` is set on the server.
-- `--fallback-url` lets the server mimic a different HTTPS site when requests do not match the tunnel handshake.
-- if you do not set it, unmatched requests default to `https://www.qq.com`
-- the client handshake uses a normal `POST` with JSON body and a configurable `--user-agent`
+- Prefer environment variables over putting shared secrets in shell history.
+- Keep WG private keys in local config files only; do not commit real keys.
+- Native modes require `--cert` and `--key` on the server.
+- Native clients verify TLS certificates by default.
+- Self-signed deployments should pass the server certificate with `--ca-cert`.
+- Authentication includes timestamp and nonce replay protection.
+- Literal private IP targets are blocked unless `--allow-private-targets` is set
+  on the server.
+- `--fallback-url` controls what unmatched native/daze-baboon requests see.
+- TUN and WG route hooks usually require root or equivalent network privileges.
 
-## Protocol Shape
+## Architecture Notes
 
-The `native-http` handshake is intentionally small:
-
-1. client accepts a local SOCKS5 `CONNECT`
-2. client opens TLS to the server
-3. client sends `POST /connect HTTP/1.1` with a small JSON body carrying target and auth proof
-4. server validates the HMAC proof and opens the outbound TCP connection
-5. server replies `200 Connection Established`
-6. both sides switch to raw byte relay
-
-Requests that do not match the tunnel path are forwarded to a real upstream website. By default that upstream is `https://www.qq.com`, and you can override it with `--fallback-url`.
-
-When `native-mux` is enabled on the client, it first establishes an authenticated `POST /mux HTTP/1.1` session inside TLS, then carries multiple logical `open/data/close` streams over a compact binary frame protocol on that single TLS connection.
-
-When `daze-ashe` is enabled, the client and server speak a daze-style raw TCP handshake using a password-derived key, a random salt, an encrypted timestamp, and then an encrypted target open request.
-
-When `daze-baboon` is enabled, the client first sends a signed `POST /sync HTTP/1.1` request. After the server returns `200 OK`, both sides immediately switch into the daze-ashe handshake on that same socket.
-
-When `daze-czar` is enabled, the client keeps one raw TCP session open and exchanges 4-byte `open/data/close/probe` frames. Each logical stream then runs the daze-ashe handshake inside that multiplexed channel.
+- Overall architecture: [`docs/arch.md`](./docs/arch.md)
+- WG mode quickstart: [`docs/wg-mode-quickstart.md`](./docs/wg-mode-quickstart.md)
 
 ## Development
 
 ```bash
 cargo check
 cargo test
+cargo build --release
 ```

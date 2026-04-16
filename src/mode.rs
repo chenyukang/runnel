@@ -11,6 +11,7 @@ pub enum ProxyMode {
     DazeAshe,
     DazeBaboon,
     DazeCzar,
+    Wg,
 }
 
 impl ProxyMode {
@@ -21,6 +22,7 @@ impl ProxyMode {
             ProxyMode::DazeAshe => "daze-ashe",
             ProxyMode::DazeBaboon => "daze-baboon",
             ProxyMode::DazeCzar => "daze-czar",
+            ProxyMode::Wg => "wg",
         }
     }
 
@@ -31,6 +33,9 @@ impl ProxyMode {
                 ProxyMode::NativeMux => Ok(ProxyMode::NativeMux),
                 ProxyMode::DazeAshe | ProxyMode::DazeBaboon | ProxyMode::DazeCzar => {
                     bail!("--mux cannot be combined with a daze mode")
+                }
+                ProxyMode::Wg => {
+                    bail!("--mux cannot be combined with wg mode")
                 }
             }
         } else {

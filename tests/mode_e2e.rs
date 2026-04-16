@@ -258,6 +258,7 @@ async fn start_env(mode: ProxyMode) -> Result<TestEnv> {
         fallback_url,
         fallback_timeout_secs: 5,
         max_fallback_body_size: 1024 * 1024,
+        wg: Default::default(),
     };
 
     let client_args = ClientArgs {
@@ -281,6 +282,7 @@ async fn start_env(mode: ProxyMode) -> Result<TestEnv> {
         system_proxy_services: Vec::new(),
         tun_dns_redirect_ip: None,
         tun_dns_upstream: None,
+        wg: Default::default(),
     };
 
     let server_handle = tokio::spawn(async move {
@@ -599,6 +601,7 @@ async fn start_local_dns_client(
         fallback_url: "http://127.0.0.1:1".to_owned(),
         fallback_timeout_secs: 1,
         max_fallback_body_size: 1024,
+        wg: Default::default(),
     };
     let client_args = ClientArgs {
         listen: format!("127.0.0.1:{socks_port}"),
@@ -621,6 +624,7 @@ async fn start_local_dns_client(
         system_proxy_services: Vec::new(),
         tun_dns_redirect_ip: Some(Ipv4Addr::new(198, 18, 0, 1).into()),
         tun_dns_upstream: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, upstream_port))),
+        wg: Default::default(),
     };
 
     let server_handle = tokio::spawn(async move {

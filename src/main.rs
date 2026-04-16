@@ -43,7 +43,9 @@ enum Commands {
     Server(server::ServerArgs),
     Client(client::ClientArgs),
     Tun(tun::TunArgs),
+    #[command(hide = true)]
     WgClient(wg::WgClientArgs),
+    #[command(hide = true)]
     WgServer(wg::WgServerArgs),
     WgConfig(wg::WgConfigArgs),
     WgKeygen(wg::WgKeygenArgs),
@@ -376,32 +378,48 @@ fn dashboard_context(cli: &Cli, log_file: PathBuf) -> Option<tui::DashboardConte
     }
 
     let context = match &cli.command {
-        Commands::Client(args) => tui::DashboardContext {
-            command_label: "client".to_owned(),
-            mode_label: args
-                .effective_mode()
-                .ok()
-                .map(|mode| mode.to_string())
-                .unwrap_or_else(|| "-".to_owned()),
-            listen: Some(args.listen.clone()),
-            upstream: Some(args.server.clone()),
-            path: Some(
-                args.effective_mode()
-                    .ok()
-                    .filter(|mode| matches!(mode, pipit::mode::ProxyMode::NativeMux))
-                    .map(|_| args.mux_path.clone())
-                    .unwrap_or_else(|| args.path.clone()),
-            ),
-            log_file,
-            log_filter: cli.log.clone(),
-        },
+        Commands::Client(args) => {
+            let mode = args.effective_mode().ok();
+            tui::DashboardContext {
+                command_label: "client".to_owned(),
+                mode_label: mode
+                    .map(|mode| mode.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                listen: Some(if matches!(mode, Some(pipit::mode::ProxyMode::Wg)) {
+                    args.wg.bind.clone()
+                } else {
+                    args.listen.clone()
+                }),
+                upstream: Some(if matches!(mode, Some(pipit::mode::ProxyMode::Wg)) {
+                    args.wg.endpoint.clone()
+                } else {
+                    args.server.clone()
+                }),
+                path: Some(match mode {
+                    Some(pipit::mode::ProxyMode::NativeMux) => args.mux_path.clone(),
+                    Some(pipit::mode::ProxyMode::Wg) => args.wg.device.clone(),
+                    _ => args.path.clone(),
+                }),
+                log_file,
+                log_filter: cli.log.clone(),
+            }
+        }
         Commands::Server(args) => tui::DashboardContext {
             command_label: "server".to_owned(),
             mode_label: args.mode.to_string(),
-            listen: Some(args.listen.clone()),
-            upstream: Some(args.fallback_url.clone()),
+            listen: Some(if matches!(args.mode, pipit::mode::ProxyMode::Wg) {
+                args.wg.listen.clone()
+            } else {
+                args.listen.clone()
+            }),
+            upstream: Some(if matches!(args.mode, pipit::mode::ProxyMode::Wg) {
+                args.wg.peer_tunnel_ip.to_string()
+            } else {
+                args.fallback_url.clone()
+            }),
             path: Some(match args.mode {
                 pipit::mode::ProxyMode::NativeMux => args.mux_path.clone(),
+                pipit::mode::ProxyMode::Wg => args.wg.device.clone(),
                 _ => args.path.clone(),
             }),
             log_file,
@@ -456,33 +474,49 @@ fn dashboard_context(cli: &Cli, log_file: PathBuf) -> Option<tui::DashboardConte
 fn monitor_context(cli: &Cli, log_file: PathBuf) -> Option<telemetry::MonitorContext> {
     let pid = std::process::id();
     let context = match &cli.command {
-        Commands::Client(args) => telemetry::MonitorContext {
-            command_label: "client".to_owned(),
-            mode_label: args
-                .effective_mode()
-                .ok()
-                .map(|mode| mode.to_string())
-                .unwrap_or_else(|| "-".to_owned()),
-            listen: Some(args.listen.clone()),
-            upstream: Some(args.server.clone()),
-            path: Some(
-                args.effective_mode()
-                    .ok()
-                    .filter(|mode| matches!(mode, pipit::mode::ProxyMode::NativeMux))
-                    .map(|_| args.mux_path.clone())
-                    .unwrap_or_else(|| args.path.clone()),
-            ),
-            log_file,
-            log_filter: cli.log.clone(),
-            pid,
-        },
+        Commands::Client(args) => {
+            let mode = args.effective_mode().ok();
+            telemetry::MonitorContext {
+                command_label: "client".to_owned(),
+                mode_label: mode
+                    .map(|mode| mode.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                listen: Some(if matches!(mode, Some(pipit::mode::ProxyMode::Wg)) {
+                    args.wg.bind.clone()
+                } else {
+                    args.listen.clone()
+                }),
+                upstream: Some(if matches!(mode, Some(pipit::mode::ProxyMode::Wg)) {
+                    args.wg.endpoint.clone()
+                } else {
+                    args.server.clone()
+                }),
+                path: Some(match mode {
+                    Some(pipit::mode::ProxyMode::NativeMux) => args.mux_path.clone(),
+                    Some(pipit::mode::ProxyMode::Wg) => args.wg.device.clone(),
+                    _ => args.path.clone(),
+                }),
+                log_file,
+                log_filter: cli.log.clone(),
+                pid,
+            }
+        }
         Commands::Server(args) => telemetry::MonitorContext {
             command_label: "server".to_owned(),
             mode_label: args.mode.to_string(),
-            listen: Some(args.listen.clone()),
-            upstream: Some(args.fallback_url.clone()),
+            listen: Some(if matches!(args.mode, pipit::mode::ProxyMode::Wg) {
+                args.wg.listen.clone()
+            } else {
+                args.listen.clone()
+            }),
+            upstream: Some(if matches!(args.mode, pipit::mode::ProxyMode::Wg) {
+                args.wg.peer_tunnel_ip.to_string()
+            } else {
+                args.fallback_url.clone()
+            }),
             path: Some(match args.mode {
                 pipit::mode::ProxyMode::NativeMux => args.mux_path.clone(),
+                pipit::mode::ProxyMode::Wg => args.wg.device.clone(),
                 _ => args.path.clone(),
             }),
             log_file,

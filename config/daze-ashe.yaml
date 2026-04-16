@@ -1,0 +1,24 @@
+# Sample daze-ashe config.
+# Use PIPIT_PASSWORD for the shared secret; do not commit real passwords.
+
+log: info
+log_file: ./logs/pipit-daze-ashe.log
+telemetry_sock: ./run/pipit-daze-ashe.sock
+tui: true
+
+client:
+  listen: 127.0.0.1:1080
+  server: SERVER-IP:1081
+  mode: daze-ashe
+  filter: proxy
+  handshake_timeout_secs: 10
+  connect_timeout_secs: 10
+
+server:
+  listen: 0.0.0.0:1081
+  mode: daze-ashe
+  auth_window_secs: 120
+  handshake_timeout_secs: 10
+  connect_timeout_secs: 10
+  allow_private_targets: false
+

@@ -41,6 +41,26 @@ pub struct WgServerArgs {
     pub dry_run: bool,
 }
 
+impl Default for WgServerArgs {
+    fn default() -> Self {
+        Self {
+            listen: "0.0.0.0:51820".to_owned(),
+            private_key: String::new(),
+            peer_public_key: String::new(),
+            device: "auto".to_owned(),
+            tunnel_ip: "10.8.0.1".parse().expect("valid default WG server IP"),
+            peer_tunnel_ip: "10.8.0.2".parse().expect("valid default WG peer IP"),
+            peer_allowed_ips: Vec::new(),
+            nat_out_interface: None,
+            mtu: DEFAULT_TUNNEL_MTU,
+            up: Vec::new(),
+            down: Vec::new(),
+            print_hooks: false,
+            dry_run: false,
+        }
+    }
+}
+
 pub async fn run(args: WgServerArgs) -> Result<()> {
     let runtime = args.resolve()?;
     if !args.dry_run {

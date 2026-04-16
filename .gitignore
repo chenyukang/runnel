@@ -2,7 +2,7 @@
 *.crt
 *.key
 *.log
-*.yaml
+/*.yaml
 *.state.json
 .cargo
 *.pid

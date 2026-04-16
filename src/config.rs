@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{ArgMatches, parser::ValueSource};
 use serde::Deserialize;
+use serde_yaml::Value;
 
 use crate::{
     cert::CertArgs,
@@ -25,8 +26,6 @@ pub struct FileConfig {
     pub client: Option<ClientConfig>,
     pub server: Option<ServerConfig>,
     pub tun: Option<TunConfig>,
-    pub wg_client: Option<WgClientConfig>,
-    pub wg_server: Option<WgServerConfig>,
     pub cert: Option<CertConfig>,
 }
 
@@ -50,6 +49,7 @@ pub struct ClientConfig {
     pub max_header_size: Option<usize>,
     pub system_proxy: Option<bool>,
     pub system_proxy_services: Option<Vec<String>>,
+    pub wg: Option<WgClientConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,6 +70,7 @@ pub struct ServerConfig {
     pub fallback_url: Option<String>,
     pub fallback_timeout_secs: Option<u64>,
     pub max_fallback_body_size: Option<usize>,
+    pub wg: Option<WgServerConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -141,13 +142,38 @@ pub fn load(path: &Path) -> Result<(FileConfig, PathBuf)> {
     };
     let contents = std::fs::read_to_string(&absolute)
         .with_context(|| format!("failed to read {}", absolute.display()))?;
-    let config: FileConfig = serde_yaml::from_str(&contents)
+    let raw_config: Value = serde_yaml::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", absolute.display()))?;
+    reject_deprecated_wg_sections(&raw_config, &absolute)?;
+    let config: FileConfig = serde_yaml::from_value(raw_config)
         .with_context(|| format!("failed to parse {}", absolute.display()))?;
     let base_dir = absolute
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     Ok((config, base_dir))
+}
+
+fn reject_deprecated_wg_sections(config: &Value, path: &Path) -> Result<()> {
+    let Value::Mapping(mapping) = config else {
+        return Ok(());
+    };
+
+    for (key, target) in [
+        ("wg_client", "client.wg with client.mode: wg"),
+        ("wg_server", "server.wg with server.mode: wg"),
+    ] {
+        if mapping.contains_key(&Value::String(key.to_owned())) {
+            bail!(
+                "{} uses deprecated top-level `{}`; move it under `{}`",
+                path.display(),
+                key,
+                target
+            );
+        }
+    }
+
+    Ok(())
 }
 
 pub fn apply_globals(
@@ -280,6 +306,9 @@ pub fn apply_client(
         &client.system_proxy_services,
         should_override(matches, "system_proxy_services"),
     );
+    if let Some(wg) = &client.wg {
+        apply_wg_client_config(&mut args.wg, wg, |_| true);
+    }
 }
 
 pub fn apply_server(
@@ -374,6 +403,9 @@ pub fn apply_server(
         &server.max_fallback_body_size,
         should_override(matches, "max_fallback_body_size"),
     );
+    if let Some(wg) = &server.wg {
+        apply_wg_server_config(&mut args.wg, wg, |_| true);
+    }
 }
 
 pub fn apply_tun(args: &mut TunArgs, config: &FileConfig, matches: &ArgMatches, base_dir: &Path) {
@@ -425,59 +457,74 @@ pub fn apply_tun(args: &mut TunArgs, config: &FileConfig, matches: &ArgMatches, 
 pub fn apply_wg_client(
     args: &mut WgClientArgs,
     config: &FileConfig,
-    matches: &ArgMatches,
+    _matches: &ArgMatches,
     _base_dir: &Path,
 ) {
-    let Some(wg_client) = &config.wg_client else {
+    let Some(client) = &config.client else {
+        return;
+    };
+    let Some(wg_client) = &client.wg else {
         return;
     };
 
-    maybe_assign(
-        &mut args.bind,
-        &wg_client.bind,
-        should_override(matches, "bind"),
-    );
+    apply_wg_client_config(args, wg_client, |id| should_override(_matches, id));
+}
+
+pub fn apply_wg_server(
+    args: &mut WgServerArgs,
+    config: &FileConfig,
+    _matches: &ArgMatches,
+    _base_dir: &Path,
+) {
+    let Some(server) = &config.server else {
+        return;
+    };
+    let Some(wg_server) = &server.wg else {
+        return;
+    };
+
+    apply_wg_server_config(args, wg_server, |id| should_override(_matches, id));
+}
+
+fn apply_wg_client_config(
+    args: &mut WgClientArgs,
+    wg_client: &WgClientConfig,
+    should_apply: impl Fn(&str) -> bool,
+) {
+    maybe_assign(&mut args.bind, &wg_client.bind, should_apply("bind"));
     maybe_assign(
         &mut args.endpoint,
         &wg_client.endpoint,
-        should_override(matches, "endpoint"),
+        should_apply("endpoint"),
     );
     maybe_assign(
         &mut args.private_key,
         &wg_client.private_key,
-        should_override(matches, "private_key"),
+        should_apply("private_key"),
     );
     maybe_assign(
         &mut args.peer_public_key,
         &wg_client.peer_public_key,
-        should_override(matches, "peer_public_key"),
+        should_apply("peer_public_key"),
     );
-    maybe_assign(
-        &mut args.device,
-        &wg_client.device,
-        should_override(matches, "device"),
-    );
-    if should_override(matches, "tunnel_ip")
+    maybe_assign(&mut args.device, &wg_client.device, should_apply("device"));
+    if should_apply("tunnel_ip")
         && let Some(tunnel_ip) = wg_client.tunnel_ip
     {
         args.tunnel_ip = tunnel_ip;
     }
-    if should_override(matches, "peer_tunnel_ip")
+    if should_apply("peer_tunnel_ip")
         && let Some(peer_tunnel_ip) = wg_client.peer_tunnel_ip
     {
         args.peer_tunnel_ip = peer_tunnel_ip;
     }
-    maybe_assign(
-        &mut args.mtu,
-        &wg_client.mtu,
-        should_override(matches, "mtu"),
-    );
+    maybe_assign(&mut args.mtu, &wg_client.mtu, should_apply("mtu"));
     maybe_assign_optional(
         &mut args.persistent_keepalive_secs,
         &wg_client.persistent_keepalive_secs,
-        should_override(matches, "persistent_keepalive_secs"),
+        should_apply("persistent_keepalive_secs"),
     );
-    if should_override(matches, "dns")
+    if should_apply("dns")
         && let Some(dns) = wg_client.dns
     {
         args.dns = Some(dns);
@@ -485,77 +532,60 @@ pub fn apply_wg_client(
     maybe_assign(
         &mut args.dns_capture,
         &wg_client.dns_capture,
-        should_override(matches, "dns_capture"),
+        should_apply("dns_capture"),
     );
     maybe_assign(
         &mut args.allowed_ips,
         &wg_client.allowed_ips,
-        should_override(matches, "allowed_ips"),
+        should_apply("allowed_ips"),
     );
     maybe_assign(
         &mut args.excluded_ips,
         &wg_client.excluded_ips,
-        should_override(matches, "excluded_ips"),
+        should_apply("excluded_ips"),
     );
     maybe_assign(
         &mut args.exclude_lan,
         &wg_client.exclude_lan,
-        should_override(matches, "exclude_lan"),
+        should_apply("exclude_lan"),
     );
-    maybe_assign(&mut args.up, &wg_client.up, should_override(matches, "up"));
-    maybe_assign(
-        &mut args.down,
-        &wg_client.down,
-        should_override(matches, "down"),
-    );
+    maybe_assign(&mut args.up, &wg_client.up, should_apply("up"));
+    maybe_assign(&mut args.down, &wg_client.down, should_apply("down"));
     maybe_assign(
         &mut args.print_hooks,
         &wg_client.print_hooks,
-        should_override(matches, "print_hooks"),
+        should_apply("print_hooks"),
     );
     maybe_assign(
         &mut args.dry_run,
         &wg_client.dry_run,
-        should_override(matches, "dry_run"),
+        should_apply("dry_run"),
     );
 }
 
-pub fn apply_wg_server(
+fn apply_wg_server_config(
     args: &mut WgServerArgs,
-    config: &FileConfig,
-    matches: &ArgMatches,
-    _base_dir: &Path,
+    wg_server: &WgServerConfig,
+    should_apply: impl Fn(&str) -> bool,
 ) {
-    let Some(wg_server) = &config.wg_server else {
-        return;
-    };
-
-    maybe_assign(
-        &mut args.listen,
-        &wg_server.listen,
-        should_override(matches, "listen"),
-    );
+    maybe_assign(&mut args.listen, &wg_server.listen, should_apply("listen"));
     maybe_assign(
         &mut args.private_key,
         &wg_server.private_key,
-        should_override(matches, "private_key"),
+        should_apply("private_key"),
     );
     maybe_assign(
         &mut args.peer_public_key,
         &wg_server.peer_public_key,
-        should_override(matches, "peer_public_key"),
+        should_apply("peer_public_key"),
     );
-    maybe_assign(
-        &mut args.device,
-        &wg_server.device,
-        should_override(matches, "device"),
-    );
-    if should_override(matches, "tunnel_ip")
+    maybe_assign(&mut args.device, &wg_server.device, should_apply("device"));
+    if should_apply("tunnel_ip")
         && let Some(tunnel_ip) = wg_server.tunnel_ip
     {
         args.tunnel_ip = tunnel_ip;
     }
-    if should_override(matches, "peer_tunnel_ip")
+    if should_apply("peer_tunnel_ip")
         && let Some(peer_tunnel_ip) = wg_server.peer_tunnel_ip
     {
         args.peer_tunnel_ip = peer_tunnel_ip;
@@ -563,33 +593,25 @@ pub fn apply_wg_server(
     maybe_assign(
         &mut args.peer_allowed_ips,
         &wg_server.peer_allowed_ips,
-        should_override(matches, "peer_allowed_ips"),
+        should_apply("peer_allowed_ips"),
     );
-    maybe_assign(
-        &mut args.mtu,
-        &wg_server.mtu,
-        should_override(matches, "mtu"),
-    );
+    maybe_assign(&mut args.mtu, &wg_server.mtu, should_apply("mtu"));
     maybe_assign_optional(
         &mut args.nat_out_interface,
         &wg_server.nat_out_interface,
-        should_override(matches, "nat_out_interface"),
+        should_apply("nat_out_interface"),
     );
-    maybe_assign(&mut args.up, &wg_server.up, should_override(matches, "up"));
-    maybe_assign(
-        &mut args.down,
-        &wg_server.down,
-        should_override(matches, "down"),
-    );
+    maybe_assign(&mut args.up, &wg_server.up, should_apply("up"));
+    maybe_assign(&mut args.down, &wg_server.down, should_apply("down"));
     maybe_assign(
         &mut args.print_hooks,
         &wg_server.print_hooks,
-        should_override(matches, "print_hooks"),
+        should_apply("print_hooks"),
     );
     maybe_assign(
         &mut args.dry_run,
         &wg_server.dry_run,
-        should_override(matches, "dry_run"),
+        should_apply("dry_run"),
     );
 }
 
@@ -660,8 +682,10 @@ fn resolve_path(base_dir: &Path, path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileConfig, maybe_assign_optional, resolve_path};
+    use super::{FileConfig, load, maybe_assign_optional, resolve_path};
+    use std::fs;
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn yaml_parse_smoke() {
@@ -678,35 +702,35 @@ client:
   system_proxy: true
   system_proxy_services:
     - Wi-Fi
+  wg:
+    endpoint: 198.51.100.10:51820
+    tunnel_ip: 10.8.0.2
+    peer_tunnel_ip: 10.8.0.1
+    dns: 1.1.1.1
+    dns_capture: true
+    excluded_ips:
+      - 192.168.0.0/16
+    exclude_lan: true
+    up:
+      - ip route replace 203.0.113.0/24 dev pipitwg0
+    print_hooks: true
+    dry_run: true
 tun:
   device: auto
   helper_cmd: tun2proxy-bin --tun {device} --proxy socks5://{socks}
   dns_upstream: 1.1.1.1:53
   print_hooks: true
   dry_run: true
-wg_client:
-  endpoint: 198.51.100.10:51820
-  tunnel_ip: 10.8.0.2
-  peer_tunnel_ip: 10.8.0.1
-  dns: 1.1.1.1
-  dns_capture: true
-  excluded_ips:
-    - 192.168.0.0/16
-  exclude_lan: true
-  up:
-    - ip route replace 203.0.113.0/24 dev pipitwg0
-  print_hooks: true
-  dry_run: true
-wg_server:
-  listen: 0.0.0.0:51820
-  tunnel_ip: 10.8.0.1
-  peer_tunnel_ip: 10.8.0.2
-  nat_out_interface: en0
-  down:
-    - ip link set dev pipitwg0 down || true
-  dry_run: true
 server:
   listen: 0.0.0.0:1443
+  wg:
+    listen: 0.0.0.0:51820
+    tunnel_ip: 10.8.0.1
+    peer_tunnel_ip: 10.8.0.2
+    nat_out_interface: en0
+    down:
+      - ip link set dev pipitwg0 down || true
+    dry_run: true
 "#;
         let parsed: FileConfig = serde_yaml::from_str(raw).unwrap();
         assert_eq!(parsed.log.as_deref(), Some("debug"));
@@ -755,60 +779,85 @@ server:
         assert_eq!(parsed.tun.as_ref().and_then(|cfg| cfg.dry_run), Some(true));
         assert_eq!(
             parsed
-                .wg_client
+                .client
                 .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
                 .and_then(|cfg| cfg.endpoint.as_deref()),
             Some("198.51.100.10:51820")
         );
         assert_eq!(
-            parsed.wg_client.as_ref().and_then(|cfg| cfg.dns),
+            parsed
+                .client
+                .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
+                .and_then(|cfg| cfg.dns),
             Some("1.1.1.1".parse().unwrap())
         );
         assert_eq!(
-            parsed.wg_client.as_ref().and_then(|cfg| cfg.dns_capture),
-            Some(true)
-        );
-        assert_eq!(
-            parsed.wg_client.as_ref().and_then(|cfg| cfg.print_hooks),
+            parsed
+                .client
+                .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
+                .and_then(|cfg| cfg.dns_capture),
             Some(true)
         );
         assert_eq!(
             parsed
-                .wg_client
+                .client
                 .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
+                .and_then(|cfg| cfg.print_hooks),
+            Some(true)
+        );
+        assert_eq!(
+            parsed
+                .client
+                .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
                 .and_then(|cfg| cfg.excluded_ips.as_ref())
                 .cloned(),
             Some(vec!["192.168.0.0/16".to_owned()])
         );
         assert_eq!(
-            parsed.wg_client.as_ref().and_then(|cfg| cfg.exclude_lan),
+            parsed
+                .client
+                .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
+                .and_then(|cfg| cfg.exclude_lan),
             Some(true)
         );
         assert_eq!(
             parsed
-                .wg_client
+                .client
                 .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
                 .and_then(|cfg| cfg.up.as_ref())
                 .map(|items| items.len()),
             Some(1)
         );
         assert_eq!(
             parsed
-                .wg_server
+                .server
                 .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
                 .and_then(|cfg| cfg.nat_out_interface.as_deref()),
             Some("en0")
         );
         assert_eq!(
             parsed
-                .wg_server
+                .server
                 .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
                 .and_then(|cfg| cfg.down.as_ref())
                 .map(|items| items.len()),
             Some(1)
         );
         assert_eq!(
-            parsed.wg_server.as_ref().and_then(|cfg| cfg.dry_run),
+            parsed
+                .server
+                .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
+                .and_then(|cfg| cfg.dry_run),
             Some(true)
         );
     }
@@ -826,5 +875,35 @@ server:
         let config = Some("example.com".to_owned());
         maybe_assign_optional(&mut slot, &config, true);
         assert_eq!(slot.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn load_rejects_deprecated_top_level_wg_sections() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "pipit-deprecated-wg-config-{}-{suffix}.yaml",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"
+wg_client:
+  endpoint: 198.51.100.10:51820
+"#,
+        )
+        .unwrap();
+
+        let err = load(&path).expect_err("deprecated top-level wg_client should fail");
+        let _ = fs::remove_file(&path);
+
+        let message = err.to_string();
+        assert!(
+            message.contains("deprecated top-level `wg_client`"),
+            "{message}"
+        );
+        assert!(message.contains("client.wg"), "{message}");
     }
 }

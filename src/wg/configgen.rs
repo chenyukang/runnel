@@ -40,8 +40,20 @@ pub struct WgConfigArgs {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct GeneratedWgConfig {
-    wg_client: GeneratedWgClientConfig,
-    wg_server: GeneratedWgServerConfig,
+    client: GeneratedWgClientSection,
+    server: GeneratedWgServerSection,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct GeneratedWgClientSection {
+    mode: &'static str,
+    wg: GeneratedWgClientConfig,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct GeneratedWgServerSection {
+    mode: &'static str,
+    wg: GeneratedWgServerConfig,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -113,33 +125,39 @@ fn generate_config(args: &WgConfigArgs) -> Result<GeneratedWgConfig> {
     let listen = server_listen_from_endpoint(server_endpoint);
 
     Ok(GeneratedWgConfig {
-        wg_client: GeneratedWgClientConfig {
-            endpoint: server_endpoint.to_string(),
-            private_key: client_keys.private_key,
-            peer_public_key: server_keys.public_key,
-            tunnel_ip: args.client_tunnel_ip,
-            peer_tunnel_ip: args.server_tunnel_ip,
-            mtu: args.mtu,
-            persistent_keepalive_secs: args.persistent_keepalive_secs,
-            dns: args.dns,
-            dns_capture: args.dns_capture,
-            allowed_ips,
-            excluded_ips: normalize_allowed_ips(
-                "wg config client exclude",
-                &args.excluded_ips,
-                &[],
-            )?,
-            exclude_lan: args.exclude_lan,
+        client: GeneratedWgClientSection {
+            mode: "wg",
+            wg: GeneratedWgClientConfig {
+                endpoint: server_endpoint.to_string(),
+                private_key: client_keys.private_key,
+                peer_public_key: server_keys.public_key,
+                tunnel_ip: args.client_tunnel_ip,
+                peer_tunnel_ip: args.server_tunnel_ip,
+                mtu: args.mtu,
+                persistent_keepalive_secs: args.persistent_keepalive_secs,
+                dns: args.dns,
+                dns_capture: args.dns_capture,
+                allowed_ips,
+                excluded_ips: normalize_allowed_ips(
+                    "wg config client exclude",
+                    &args.excluded_ips,
+                    &[],
+                )?,
+                exclude_lan: args.exclude_lan,
+            },
         },
-        wg_server: GeneratedWgServerConfig {
-            listen,
-            private_key: server_keys.private_key,
-            peer_public_key: client_keys.public_key,
-            tunnel_ip: args.server_tunnel_ip,
-            peer_tunnel_ip: args.client_tunnel_ip,
-            mtu: args.mtu,
-            peer_allowed_ips,
-            nat_out_interface: args.nat_out_interface.clone(),
+        server: GeneratedWgServerSection {
+            mode: "wg",
+            wg: GeneratedWgServerConfig {
+                listen,
+                private_key: server_keys.private_key,
+                peer_public_key: client_keys.public_key,
+                tunnel_ip: args.server_tunnel_ip,
+                peer_tunnel_ip: args.client_tunnel_ip,
+                mtu: args.mtu,
+                peer_allowed_ips,
+                nat_out_interface: args.nat_out_interface.clone(),
+            },
         },
     })
 }
@@ -182,32 +200,36 @@ mod tests {
         };
 
         let generated = generate_config(&args).unwrap();
-        assert_eq!(generated.wg_client.endpoint, "198.51.100.10:51820");
-        assert_eq!(generated.wg_server.listen, "0.0.0.0:51820");
-        assert_eq!(generated.wg_client.allowed_ips, vec!["0.0.0.0/0"]);
-        assert_eq!(generated.wg_server.peer_allowed_ips, vec!["10.8.0.2/32"]);
+        assert_eq!(generated.client.mode, "wg");
+        assert_eq!(generated.server.mode, "wg");
+        assert_eq!(generated.client.wg.endpoint, "198.51.100.10:51820");
+        assert_eq!(generated.server.wg.listen, "0.0.0.0:51820");
+        assert_eq!(generated.client.wg.allowed_ips, vec!["0.0.0.0/0"]);
+        assert_eq!(generated.server.wg.peer_allowed_ips, vec!["10.8.0.2/32"]);
         assert_eq!(
-            generated.wg_client.peer_public_key,
-            public_key_from_private_key(&generated.wg_server.private_key).unwrap()
+            generated.client.wg.peer_public_key,
+            public_key_from_private_key(&generated.server.wg.private_key).unwrap()
         );
         assert_eq!(
-            generated.wg_server.peer_public_key,
-            public_key_from_private_key(&generated.wg_client.private_key).unwrap()
+            generated.server.wg.peer_public_key,
+            public_key_from_private_key(&generated.client.wg.private_key).unwrap()
         );
 
         let yaml = serde_yaml::to_string(&generated).unwrap();
         let parsed: FileConfig = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(
             parsed
-                .wg_client
+                .client
                 .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
                 .and_then(|cfg| cfg.endpoint.as_deref()),
             Some("198.51.100.10:51820")
         );
         assert_eq!(
             parsed
-                .wg_server
+                .server
                 .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
                 .and_then(|cfg| cfg.nat_out_interface.as_deref()),
             Some("eth0")
         );
@@ -232,12 +254,12 @@ mod tests {
         };
 
         let generated = generate_config(&args).unwrap();
-        assert_eq!(generated.wg_client.allowed_ips, vec!["203.0.113.0/24"]);
-        assert_eq!(generated.wg_client.excluded_ips, vec!["192.168.0.0/16"]);
-        assert!(generated.wg_client.exclude_lan);
-        assert_eq!(generated.wg_server.peer_allowed_ips, vec!["10.9.0.0/24"]);
-        assert_eq!(generated.wg_client.mtu, 1280);
-        assert_eq!(generated.wg_client.persistent_keepalive_secs, 30);
+        assert_eq!(generated.client.wg.allowed_ips, vec!["203.0.113.0/24"]);
+        assert_eq!(generated.client.wg.excluded_ips, vec!["192.168.0.0/16"]);
+        assert!(generated.client.wg.exclude_lan);
+        assert_eq!(generated.server.wg.peer_allowed_ips, vec!["10.9.0.0/24"]);
+        assert_eq!(generated.client.wg.mtu, 1280);
+        assert_eq!(generated.client.wg.persistent_keepalive_secs, 30);
     }
 
     #[test]
@@ -259,9 +281,9 @@ mod tests {
         };
 
         let generated = generate_config(&args).unwrap();
-        assert_eq!(generated.wg_client.allowed_ips, vec!["::/0"]);
-        assert_eq!(generated.wg_server.listen, "[::]:51820");
-        assert_eq!(generated.wg_server.peer_allowed_ips, vec!["fd00:8::2/128"]);
+        assert_eq!(generated.client.wg.allowed_ips, vec!["::/0"]);
+        assert_eq!(generated.server.wg.listen, "[::]:51820");
+        assert_eq!(generated.server.wg.peer_allowed_ips, vec!["fd00:8::2/128"]);
     }
 
     #[test]

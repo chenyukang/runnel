@@ -154,6 +154,7 @@ async fn start_client(
         system_proxy_services: Vec::new(),
         tun_dns_redirect_ip: None,
         tun_dns_upstream: None,
+        wg: Default::default(),
     };
 
     let client_handle = tokio::spawn(async move {

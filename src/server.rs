@@ -2,7 +2,7 @@ use crate::{
     auth::{AuthProof, ReplayProtector},
     http,
     mode::ProxyMode,
-    netlog, tls, traffic, udp,
+    netlog, tls, traffic, udp, wg,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -62,15 +62,22 @@ pub struct ServerArgs {
     pub fallback_timeout_secs: u64,
     #[arg(long, default_value_t = 1024 * 1024)]
     pub max_fallback_body_size: usize,
+    #[arg(skip)]
+    pub wg: wg::WgServerArgs,
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
+    if matches!(args.mode, ProxyMode::Wg) {
+        return wg::run_server(args.wg).await;
+    }
+
     args.validate_required()?;
 
     match args.mode {
         ProxyMode::NativeHttp | ProxyMode::NativeMux => {}
         ProxyMode::DazeAshe | ProxyMode::DazeBaboon => return crate::daze::run_server(args).await,
         ProxyMode::DazeCzar => return crate::czar::run_server(args).await,
+        ProxyMode::Wg => unreachable!("wg mode is dispatched before native server startup"),
     }
 
     let cert = args

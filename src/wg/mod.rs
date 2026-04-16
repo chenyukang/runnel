@@ -183,6 +183,7 @@ pub(crate) fn default_client_excluded_lan_ips() -> Vec<String> {
         "169.254.0.0/16".to_owned(),
         "fc00::/7".to_owned(),
         "fe80::/10".to_owned(),
+        "ff00::/8".to_owned(),
     ]
 }
 

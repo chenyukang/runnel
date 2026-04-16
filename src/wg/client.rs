@@ -56,11 +56,36 @@ pub struct WgClientArgs {
     pub dry_run: bool,
 }
 
+impl Default for WgClientArgs {
+    fn default() -> Self {
+        Self {
+            bind: "0.0.0.0:0".to_owned(),
+            endpoint: String::new(),
+            private_key: String::new(),
+            peer_public_key: String::new(),
+            device: "auto".to_owned(),
+            tunnel_ip: "10.8.0.2".parse().expect("valid default WG client IP"),
+            peer_tunnel_ip: "10.8.0.1".parse().expect("valid default WG peer IP"),
+            mtu: DEFAULT_TUNNEL_MTU,
+            persistent_keepalive_secs: None,
+            dns: None,
+            dns_capture: false,
+            allowed_ips: Vec::new(),
+            excluded_ips: Vec::new(),
+            exclude_lan: false,
+            up: Vec::new(),
+            down: Vec::new(),
+            print_hooks: false,
+            dry_run: false,
+        }
+    }
+}
+
 pub async fn run(args: WgClientArgs) -> Result<()> {
     let runtime = args.resolve()?;
     if args.dns.is_some() && !args.dns_capture {
         warn!(
-            "wg DNS capture is disabled; TUI Recent Domains requires --dns-capture or wg_client.dns_capture: true"
+            "wg DNS capture is disabled; TUI Recent Domains requires --dns-capture or client.wg.dns_capture: true"
         );
     }
     if !args.dry_run {
