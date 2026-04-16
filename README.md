@@ -1,21 +1,17 @@
 # Pipit
 
-Pipit is a compact Rust proxy and tunnel toolbox. Its recommended path is WG
-mode: a WireGuard-style UDP tunnel built on `boringtun`. It also keeps classic
-SOCKS and native/daze transports available for app-level proxying and debugging.
+Pipit is a compact Rust proxy and tunnel toolbox. It support a WireGuard-style UDP tunnel built on `boringtun`, and also keeps classic SOCKS and native/daze transports available for app-level proxying.
 
 The project intentionally keeps the moving parts visible:
 
-- `pipit client` runs the recommended WG client when `client.mode: wg`, or
+- `pipit client` runs the WG client when `client.mode: wg`, or
   exposes a local SOCKS5 proxy for native/daze modes.
+  - `pipit tun` optionally captures local IP traffic through the classic native-http client path.
 - `pipit server` accepts one of several client/server modes.
-- `pipit tun` optionally captures local IP traffic through the classic
-  native-http client path.
-- `client.mode: wg` / `server.mode: wg` create a WireGuard-style UDP tunnel.
 - config files, daemon mode, status checks, telemetry sockets, and TUI dashboards
   are available from the same binary.
 
-## Mental Model
+## Modes
 
 Pipit has two separate concerns. Keeping them separate makes the modes easier
 to reason about:
@@ -30,12 +26,12 @@ These are the `--mode` values shared by `pipit client` and `pipit server`.
 
 | Mode | Shape | Best for | Main tradeoff |
 | --- | --- | --- | --- |
+| `wg` | WireGuard-style UDP via `boringtun` | Recommended full-tunnel or split-tunnel mode with real UDP tunnel semantics | Usually needs root or network privileges; automatic true dual-stack still needs more schema work |
 | `native-http` | TLS + HTTP-looking per-connection tunnel | Classic SOCKS proxy, compatibility path, UDP ASSOCIATE support | One upstream TCP/TLS connection per SOCKS connection |
 | `native-mux` | One long-lived TLS session with logical streams | Many short-lived TCP connections | A single session carries many streams |
 | `daze-ashe` | Raw TCP daze-style encrypted stream | Minimal alternate transport | No TLS camouflage |
 | `daze-baboon` | HTTP-looking request, then daze-style stream | Daze-style handshake hidden behind a normal-looking request | More specialized than `native-http` |
 | `daze-czar` | Raw TCP multiplexed daze-style session | Daze-style multiplexing | More stateful than `daze-ashe` |
-| `wg` | WireGuard-style UDP via `boringtun` | Recommended full-tunnel or split-tunnel mode with real UDP tunnel semantics | Usually needs root or network privileges; automatic true dual-stack still needs more schema work |
 
 ### Client Traffic Intake
 
@@ -46,33 +42,45 @@ also creates its own TUN-based traffic intake.
 
 | Intake | Entry point | What it captures | Current implementation status |
 | --- | --- | --- | --- |
+| WG TUN | `pipit client` with `client.mode: wg` | System IP traffic routed into the WireGuard-style TUN device | Works with `server.mode: wg`; uses UDP transport via `boringtun` and does not use SOCKS or `pipit tun` |
 | SOCKS | `pipit client` with native/daze modes | Apps explicitly configured for `socks5://127.0.0.1:1080` | Works with `native-http`, `native-mux`, and `daze-*` |
 | macOS system proxy | `pipit client --system-proxy` | Apps that honor the macOS SOCKS proxy setting | Works with the normal SOCKS client path |
 | TUN | `pipit tun` | System IP traffic routed into a local TUN device | Architecturally a client-side intake mode; currently implemented only with `native-http` because DNS/UDP handling relies on SOCKS `UDP ASSOCIATE` |
-| WG TUN | `pipit client` with `client.mode: wg` | System IP traffic routed into the WireGuard-style TUN device | Works with `server.mode: wg`; uses UDP transport via `boringtun` and does not use SOCKS or `pipit tun` |
 
-So `pipit tun` is not a competing server transport. It answers “should the
-native/daze client capture system traffic?” while `native-http`, `native-mux`,
-and `daze-*` answer “how does the client connect to the server?” Today the
-implementation only allows `pipit tun` + `native-http`; broader combinations
-need transport support for the traffic semantics that TUN requires.
+```mermaid
+flowchart TD
+    App["Client apps<br/>browser, curl, ssh, system services"]
 
-### WG As Mode And Intake
+    subgraph ClientHost["Client host"]
+        direction TB
+        App -->|"App proxy setting"| Socks["SOCKS listener<br/>pipit client"]
+        App -->|"OS route"| ClientTun["Client TUN device<br/>pipit tun"]
+        App -->|"OS route / default route"| WgTun["WG TUN device<br/>client.mode: wg"]
 
-`wg` is a client/server mode, configured under `client.wg` and `server.wg`.
-Unlike the native/daze modes, it does not expose a local SOCKS listener. The WG
-client creates its own TUN device and sends encrypted UDP packets directly to
-the WG server endpoint.
+        ClientTun --> Tun2Proxy["tun2proxy<br/>packet to SOCKS flows"]
+        Tun2Proxy --> Socks
+        Socks --> Policy["SOCKS routing policy<br/>proxy / direct / rule"]
+        Policy -->|"proxy"| ClientTransport["pipit client transport<br/>native-http / native-mux / daze-*"]
 
-New configs should use `client.mode: wg` and `server.mode: wg`.
+        WgTun --> BoringTunClient["boringtun engine<br/>encrypt packets"]
+        BoringTunClient --> WgUdp["UDP WireGuard packets<br/>usually UDP 51820"]
+    end
 
-In practice:
+    ClientTransport -->|"TCP/TLS or daze transport"| Internet["Internet"]
+    WgUdp --> Internet
+    Internet -->|"native/daze"| ServerSocket
+    Internet -->|"WG UDP"| ServerTun
 
-- Start with `client.mode: wg` / `server.mode: wg` for the recommended full-tunnel or split-tunnel path.
-- Use classic `client` + `server --mode native-http` when you specifically want a local SOCKS proxy.
-- Add `--system-proxy` if you want macOS apps to use the local SOCKS proxy automatically.
-- Use `pipit tun` only when you want the native-http SOCKS path behind a TUN intake instead of WG.
-- Use `native-mux` or `daze-*` when you specifically want those alternate client/server transport shapes.
+    subgraph ServerHost["Server host"]
+        direction TB
+        ServerSocket["Server-side TCP/UDP socket"]
+        ServerTun["WG TUN device<br/>server.mode: wg"]
+        ServerTun --> ForwardNat["Linux forwarding / NAT"]
+    end
+
+    ServerSocket --> Target["Target service<br/>website, API, SSH, DNS"]
+    ForwardNat --> Target
+```
 
 Sample config files live in [`config/`](./config/). They use documentation-only
 hosts, addresses, and placeholders; bring your own `PIPIT_PASSWORD`, certificates,
