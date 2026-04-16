@@ -3,6 +3,7 @@ use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use pipit::{cert, client, config, server, telemetry, tui, tun, wg};
 use serde::Serialize;
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -12,6 +13,7 @@ use tokio::time::sleep;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 const DAEMON_ENV: &str = "PIPIT_DAEMONIZED";
+const SERVICE_ROLES: &[&str] = &["client", "server", "tun"];
 
 #[derive(Debug, Parser)]
 #[command(
@@ -769,11 +771,16 @@ async fn status_daemon_processes(
 
     #[cfg(unix)]
     {
+        let include_not_running =
+            args.role.is_some() || configured_pid_file.is_some() || configured_socket.is_some();
         let targets =
             resolve_status_targets(log_file, configured_pid_file, configured_socket, args.role)?;
         let mut services = Vec::with_capacity(targets.len());
         for target in targets {
-            services.push(inspect_status_target(target).await?);
+            let service = inspect_status_target(target).await?;
+            if should_show_status_state(&service.state, include_not_running) {
+                services.push(service);
+            }
         }
         let report = StatusReport { services };
         if args.json {
@@ -822,16 +829,164 @@ fn resolve_status_targets(
         }]);
     }
 
-    Ok(["client", "server", "tun", "wg-client", "wg-server"]
+    let defaults = SERVICE_ROLES
+        .iter()
+        .map(|role| default_status_target(log_file, role))
+        .collect::<Result<Vec<_>>>()?;
+    let discovered = discover_status_targets()?;
+    Ok(merge_status_targets(defaults, discovered))
+}
+
+fn default_status_target(log_file: &Path, role: &str) -> Result<StatusTarget> {
+    Ok(StatusTarget {
+        label: role.to_owned(),
+        pid_file: Some(default_pid_path(log_file, role)?),
+        telemetry_socket: Some(default_socket_path(log_file, role)?),
+    })
+}
+
+fn merge_status_targets(
+    defaults: Vec<StatusTarget>,
+    discovered: Vec<StatusTarget>,
+) -> Vec<StatusTarget> {
+    let active_discovered = discovered
         .into_iter()
-        .map(|role| {
-            Ok(StatusTarget {
-                label: role.to_owned(),
-                pid_file: Some(default_pid_path(log_file, role)?),
-                telemetry_socket: Some(default_socket_path(log_file, role)?),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?)
+        .filter(status_target_is_active)
+        .collect::<Vec<_>>();
+
+    let mut seen = BTreeSet::new();
+    let mut merged = Vec::new();
+    for default in defaults {
+        let mut found_active = false;
+        for target in active_discovered
+            .iter()
+            .filter(|target| target.label == default.label)
+        {
+            found_active = true;
+            push_status_target_once(&mut merged, &mut seen, target.clone());
+        }
+        if !found_active {
+            push_status_target_once(&mut merged, &mut seen, default);
+        }
+    }
+    for target in active_discovered {
+        push_status_target_once(&mut merged, &mut seen, target);
+    }
+
+    merged
+}
+
+fn push_status_target_once(
+    targets: &mut Vec<StatusTarget>,
+    seen: &mut BTreeSet<(String, Option<PathBuf>, Option<PathBuf>)>,
+    target: StatusTarget,
+) {
+    let key = status_target_key(&target);
+    if seen.insert(key) {
+        targets.push(target);
+    }
+}
+
+fn status_target_is_active(target: &StatusTarget) -> bool {
+    status_target_has_live_pid(target) || status_target_has_connectable_socket(target)
+}
+
+fn status_target_has_live_pid(target: &StatusTarget) -> bool {
+    let Some(path) = &target.pid_file else {
+        return false;
+    };
+    let Ok(pid) = read_pid_file(path) else {
+        return false;
+    };
+    process_exists(pid).unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn status_target_has_connectable_socket(target: &StatusTarget) -> bool {
+    let Some(path) = &target.telemetry_socket else {
+        return false;
+    };
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn status_target_has_connectable_socket(_target: &StatusTarget) -> bool {
+    false
+}
+
+fn status_target_key(target: &StatusTarget) -> (String, Option<PathBuf>, Option<PathBuf>) {
+    (
+        target.label.clone(),
+        target.pid_file.clone(),
+        target.telemetry_socket.clone(),
+    )
+}
+
+fn discover_status_targets() -> Result<Vec<StatusTarget>> {
+    let mut dirs = vec![
+        std::env::current_dir().context("failed to read current directory")?,
+        std::env::temp_dir(),
+    ];
+    #[cfg(unix)]
+    dirs.push(PathBuf::from("/tmp"));
+
+    let mut seen_dirs = BTreeSet::new();
+    let mut seen_targets = BTreeSet::new();
+    let mut targets = Vec::new();
+    for dir in dirs {
+        let dir = dir.canonicalize().unwrap_or(dir);
+        if seen_dirs.insert(dir.clone()) {
+            discover_status_targets_in_dir(&dir, &mut seen_targets, &mut targets)?;
+        }
+    }
+    Ok(targets)
+}
+
+fn discover_status_targets_in_dir(
+    dir: &Path,
+    seen_targets: &mut BTreeSet<(String, PathBuf)>,
+    targets: &mut Vec<StatusTarget>,
+) -> Result<()> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(());
+    };
+
+    for entry in entries {
+        let entry = entry.with_context(|| format!("failed to read {}", dir.display()))?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some((stem, role)) = parse_sidecar_file_name(file_name) else {
+            continue;
+        };
+        let key = (role.to_owned(), dir.join(stem));
+        if !seen_targets.insert(key) {
+            continue;
+        }
+
+        let pid_file = dir.join(format!("{stem}.{role}.pid"));
+        let telemetry_socket = dir.join(format!("{stem}.{role}.sock"));
+        targets.push(StatusTarget {
+            label: role.to_owned(),
+            pid_file: pid_file.exists().then_some(pid_file),
+            telemetry_socket: telemetry_socket.exists().then_some(telemetry_socket),
+        });
+    }
+
+    Ok(())
+}
+
+fn parse_sidecar_file_name(file_name: &str) -> Option<(&str, &'static str)> {
+    for role in SERVICE_ROLES {
+        for ext in ["pid", "sock"] {
+            let suffix = format!(".{role}.{ext}");
+            if let Some(stem) = file_name.strip_suffix(&suffix) {
+                return Some((stem, *role));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -938,7 +1093,16 @@ fn classify_service_state(
     "not-running"
 }
 
+fn should_show_status_state(state: &str, include_not_running: bool) -> bool {
+    include_not_running || state != "not-running"
+}
+
 fn print_status_report(report: &StatusReport) {
+    if report.services.is_empty() {
+        println!("no running services");
+        return;
+    }
+
     for (index, service) in report.services.iter().enumerate() {
         if index > 0 {
             println!();
@@ -1206,7 +1370,7 @@ impl Drop for PidFileGuard {
 mod tests {
     use super::{
         Commands, RuntimeStatus, ServiceRole, classify_service_state, command_role,
-        resolve_status_targets, run_utility_command,
+        resolve_status_targets, run_utility_command, should_show_status_state,
     };
     use pipit::wg;
     use std::path::Path;
@@ -1218,16 +1382,20 @@ mod tests {
             .iter()
             .map(|target| target.label.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            labels,
-            vec!["client", "server", "tun", "wg-client", "wg-server"]
-        );
-        assert!(targets.iter().all(|target| target.pid_file.is_some()));
-        assert!(
-            targets
-                .iter()
-                .all(|target| target.telemetry_socket.is_some())
-        );
+        assert!(labels.contains(&"client"));
+        assert!(labels.contains(&"server"));
+        assert!(labels.contains(&"tun"));
+        assert!(!labels.contains(&"wg-client"));
+        assert!(!labels.contains(&"wg-server"));
+    }
+
+    #[test]
+    fn status_hides_not_running_services_by_default() {
+        assert!(!should_show_status_state("not-running", false));
+        assert!(should_show_status_state("running", false));
+        assert!(should_show_status_state("degraded", false));
+        assert!(should_show_status_state("stale", false));
+        assert!(should_show_status_state("not-running", true));
     }
 
     #[test]
