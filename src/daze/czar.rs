@@ -124,8 +124,28 @@ impl CzarClient {
     }
 
     async fn open_stream(&self) -> Result<DuplexStream> {
-        let session = self.ensure_session().await?;
-        let stream_id = take_stream_id(&session.ids).await?;
+        let mut retried = false;
+        loop {
+            let session = self.ensure_session().await?;
+            let Some(stream_id) = take_stream_id(&session.ids).await else {
+                if retried {
+                    bail!("czar session ran out of stream ids");
+                }
+                let mut current = self.session.lock().await;
+                *current = None;
+                retried = true;
+                continue;
+            };
+
+            return self.open_stream_with_id(session, stream_id).await;
+        }
+    }
+
+    async fn open_stream_with_id(
+        &self,
+        session: ClientSession,
+        stream_id: u8,
+    ) -> Result<DuplexStream> {
         let (user_stream, mux_stream) = duplex(STREAM_BUFFER_SIZE);
         let (event_tx, event_rx) = mpsc::channel(STREAM_CHANNEL_SIZE);
 
@@ -140,7 +160,6 @@ impl CzarClient {
             event_rx,
             session.frame_tx.clone(),
             session.streams.clone(),
-            Some(session.ids.clone()),
         ));
 
         if session
@@ -470,7 +489,6 @@ async fn run_server_session<R, W>(
                                 event_rx,
                                 frame_tx.clone(),
                                 streams.clone(),
-                                None,
                             ));
                             if accept_tx.send(user_stream).await.is_err() {
                                 bail!("failed to accept incoming czar stream");
@@ -519,7 +537,6 @@ async fn run_stream_bridge(
     mut event_rx: mpsc::Receiver<StreamEvent>,
     frame_tx: mpsc::Sender<CzarFrame>,
     streams: Arc<Mutex<HashMap<u8, mpsc::Sender<StreamEvent>>>>,
-    ids: Option<Arc<Mutex<Vec<u8>>>>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let uplink_tx = frame_tx.clone();
@@ -584,23 +601,12 @@ async fn run_stream_bridge(
         let mut map = streams.lock().await;
         map.remove(&stream_id);
     }
-
-    if let Some(ids) = ids {
-        let mut ids = ids.lock().await;
-        if !ids.contains(&stream_id) {
-            ids.push(stream_id);
-        }
-    }
 }
 
 async fn cleanup_client_stream(session: &ClientSession, stream_id: u8) {
     {
         let mut streams = session.streams.lock().await;
         streams.remove(&stream_id);
-    }
-    let mut ids = session.ids.lock().await;
-    if !ids.contains(&stream_id) {
-        ids.push(stream_id);
     }
 }
 
@@ -634,9 +640,9 @@ async fn close_session(
     }
 }
 
-async fn take_stream_id(ids: &Arc<Mutex<Vec<u8>>>) -> Result<u8> {
+async fn take_stream_id(ids: &Arc<Mutex<Vec<u8>>>) -> Option<u8> {
     let mut ids = ids.lock().await;
-    ids.pop().context("czar session ran out of stream ids")
+    ids.pop()
 }
 
 async fn read_frame<R>(reader: &mut R) -> Result<CzarFrame>

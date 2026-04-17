@@ -39,3 +39,7 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[[bench]]
+name = "mode_perf"
+harness = false

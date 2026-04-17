@@ -200,7 +200,7 @@ WG mode notes:
 - TUI can show aggregate WG traffic; Recent Domains require `--dns-capture`.
 - IPv4-only and IPv6-only automatic hooks are supported. True dual-stack still
   needs a schema extension with separate IPv4 and IPv6 tunnel address pairs.
-- More detail lives in [`docs/wg-mode-quickstart.md`](./docs/wg-mode-quickstart.md).
+- More detail lives in [`docs/wg.md`](./docs/wg.md).
 
 ## Optional: SOCKS Proxy
 
@@ -442,7 +442,7 @@ Limit the affected network services by repeating `--system-proxy-service`.
 ## Architecture Notes
 
 - Overall architecture: [`docs/arch.md`](./docs/arch.md)
-- WG mode quickstart: [`docs/wg-mode-quickstart.md`](./docs/wg-mode-quickstart.md)
+- WG mode quickstart: [`docs/wg.md`](./docs/wg.md)
 
 ## Development
 

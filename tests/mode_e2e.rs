@@ -203,6 +203,28 @@ async fn daze_czar_mode_round_trip_works() {
     assert_mode_round_trip(ProxyMode::DazeCzar).await.unwrap();
 }
 
+#[tokio::test]
+async fn daze_czar_mode_survives_repeated_requests_on_one_session() {
+    let _guard = test_lock().lock().await;
+    let env = start_env(ProxyMode::DazeCzar).await.unwrap();
+
+    for _ in 0..32 {
+        let body = timeout(
+            Duration::from_secs(5),
+            fetch_via_socks_path(env.socks_port, env.target_port, "/"),
+        )
+        .await
+        .context("timed out waiting for repeated Czar SOCKS round trip")
+        .unwrap()
+        .unwrap();
+        assert!(
+            body.ends_with(b"ok"),
+            "unexpected response body: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
 async fn assert_mode_round_trip(mode: ProxyMode) -> Result<()> {
     let env = start_env(mode).await?;
     let body = timeout(
