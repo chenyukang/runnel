@@ -1,8 +1,9 @@
 use super::{
     DEFAULT_TUNNEL_MTU, WgRuntimeConfig, create_device_handle, default_client_allowed_ips_for,
-    dns::start_dns_capture,
+    dns::{DomainRuleEngine, start_dns_capture},
     hooks::{
-        HookGuard, effective_hook_plan, log_plan_lines, plan_client_hooks, print_plan, run_hooks,
+        DynamicRouteManager, HookGuard, effective_hook_plan, log_plan_lines, plan_client_hooks,
+        print_plan, run_hooks,
     },
     normalize_allowed_ips, parse_key, parse_socket_addr,
     preflight::{WgPreflightRole, check as check_preflight},
@@ -16,12 +17,13 @@ use boringtun::noise::TunnResult;
 use clap::Args;
 use std::{
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{net::UdpSocket, time::timeout};
 use tracing::{info, warn};
 
-use crate::system_proxy;
+use crate::{proxy::route::RouteRuleConfig, system_proxy};
 
 const HANDSHAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -56,6 +58,8 @@ pub struct WgClientArgs {
     pub proxy_ips: Vec<String>,
     #[arg(skip)]
     pub direct_ips: Vec<String>,
+    #[arg(skip)]
+    pub domain_rules: RouteRuleConfig,
     #[arg(long)]
     pub up: Vec<String>,
     #[arg(long)]
@@ -84,6 +88,7 @@ impl Default for WgClientArgs {
             dns_capture: false,
             proxy_ips: Vec::new(),
             direct_ips: Vec::new(),
+            domain_rules: RouteRuleConfig::default(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -136,16 +141,25 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
         &args.up,
         &args.down,
     );
+    let domain_route_manager = if domain_rules_need_dns_capture(&args.domain_rules) {
+        Some(Arc::new(DynamicRouteManager::for_client(&runtime)?))
+    } else {
+        None
+    };
+    let domain_rules = domain_route_manager
+        .as_ref()
+        .map(|manager| DomainRuleEngine::new(args.domain_rules.clone(), Arc::clone(manager)));
     run_hooks(&plan.up)?;
 
     // Keep the device alive until we receive a shutdown signal. The guard is declared
     // after the handle so cleanup hooks run before the device file descriptor closes.
     let _cleanup = HookGuard::new("wg-client", plan.down);
     let _dns_capture = match (args.dns_capture, args.dns) {
-        (true, Some(dns)) => Some(start_dns_capture(dns).await?),
+        (true, Some(dns)) => Some(start_dns_capture(dns, domain_rules).await?),
         (true, None) => bail!("wg client --dns-capture requires --dns as the upstream resolver"),
         (false, _) => None,
     };
+    let _domain_route_manager = domain_route_manager;
     let _dns_guard = match (args.dns, args.dns_capture) {
         (Some(_), true) => system_proxy::maybe_activate_tun_dns(&["127.0.0.1".to_owned()])?,
         (Some(dns), false) => system_proxy::maybe_activate_tun_dns(&[dns.to_string()])?,
@@ -283,6 +297,14 @@ fn plan_lines(
     ));
     lines.push(format!("  dns_capture: {}", args.dns_capture));
     lines.push(format!(
+        "  domain_rules: {}",
+        if domain_rules_need_dns_capture(&args.domain_rules) {
+            "dns-capture"
+        } else {
+            "disabled"
+        }
+    ));
+    lines.push(format!(
         "  handshake_probe: {}",
         if args.skip_handshake_probe {
             "disabled"
@@ -326,6 +348,18 @@ impl WgClientArgs {
         }
         if self.dns_capture && self.dns.is_none() {
             bail!("wg client --dns-capture requires --dns as the upstream resolver");
+        }
+        if domain_rules_need_dns_capture(&self.domain_rules) {
+            if self.dns.is_none() {
+                bail!(
+                    "wg client domain_rules require client.wg.dns because WG domain routing is driven by DNS capture"
+                );
+            }
+            if !self.dns_capture {
+                bail!(
+                    "wg client domain_rules require client.wg.dns_capture: true because WG cannot route by domain without DNS capture"
+                );
+            }
         }
         Ok(())
     }
@@ -376,9 +410,14 @@ impl WgClientArgs {
     }
 }
 
+fn domain_rules_need_dns_capture(domain_rules: &RouteRuleConfig) -> bool {
+    !domain_rules.direct.is_empty() || !domain_rules.block.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{WgClientArgs, plan_lines, probe_server_handshake};
+    use crate::proxy::route::RouteRuleConfig;
     use crate::wg::{
         HANDSHAKE_BUFFER_SIZE, WgRuntimeConfig, default_client_allowed_ips,
         default_server_allowed_ips, hooks::HookPlan,
@@ -410,6 +449,7 @@ mod tests {
             dns_capture: false,
             proxy_ips: Vec::new(),
             direct_ips: Vec::new(),
+            domain_rules: RouteRuleConfig::default(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -443,6 +483,7 @@ mod tests {
             dns_capture: false,
             proxy_ips: vec!["203.0.113.0/24".to_owned()],
             direct_ips: Vec::new(),
+            domain_rules: RouteRuleConfig::default(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -470,6 +511,7 @@ mod tests {
             dns_capture: false,
             proxy_ips: Vec::new(),
             direct_ips: vec!["100.64.0.0/10".to_owned()],
+            domain_rules: RouteRuleConfig::default(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -497,6 +539,7 @@ mod tests {
             dns_capture: true,
             proxy_ips: Vec::new(),
             direct_ips: Vec::new(),
+            domain_rules: RouteRuleConfig::default(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -524,6 +567,7 @@ mod tests {
             dns_capture: true,
             proxy_ips: vec!["203.0.113.0/24".to_owned()],
             direct_ips: Vec::new(),
+            domain_rules: RouteRuleConfig::default(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: true,

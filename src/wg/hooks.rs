@@ -1,9 +1,10 @@
 use anyhow::{Context, Result, bail};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     process::Command,
+    sync::Mutex,
 };
 use tracing::{info, warn};
 
@@ -24,6 +25,12 @@ pub(crate) struct HookPlan {
 pub(crate) struct HookGuard {
     label: &'static str,
     hooks: Vec<String>,
+}
+
+pub(crate) struct DynamicRouteManager {
+    route: RouteInfo,
+    tunnel: TunnelPair,
+    direct_hosts: Mutex<BTreeMap<IpAddr, String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,11 +61,68 @@ impl TunnelPair {
             Self::V6 { .. } => "IPv6",
         }
     }
+
+    fn supports_ip(self, ip: IpAddr) -> bool {
+        matches!(
+            (self, ip),
+            (Self::V4 { .. }, IpAddr::V4(_)) | (Self::V6 { .. }, IpAddr::V6(_))
+        )
+    }
 }
 
 impl HookGuard {
     pub(crate) fn new(label: &'static str, hooks: Vec<String>) -> Self {
         Self { label, hooks }
+    }
+}
+
+impl DynamicRouteManager {
+    pub(crate) fn for_client(runtime: &WgRuntimeConfig) -> Result<Self> {
+        let endpoint_ip = runtime
+            .endpoint_ip()
+            .context("wg client endpoint is required to build dynamic domain routes")?;
+        let route = detect_egress_route(endpoint_ip)?;
+        let tunnel = ensure_tunnel_pair(
+            runtime.tunnel_ip,
+            runtime.peer_tunnel_ip,
+            "wg client tunnel_ip",
+            "wg client peer_tunnel_ip",
+        )?;
+        Ok(Self {
+            route,
+            tunnel,
+            direct_hosts: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    pub(crate) fn add_direct_host(&self, domain: &str, ip: IpAddr) -> Result<bool> {
+        if !self.tunnel.supports_ip(ip) {
+            return Ok(false);
+        }
+        let mut direct_hosts = self.direct_hosts.lock().expect("dynamic route mutex");
+        if direct_hosts.contains_key(&ip) {
+            return Ok(false);
+        }
+        run_domain_route_hook(domain, ip, &direct_host_add_command(ip, &self.route))?;
+        direct_hosts.insert(ip, domain.to_owned());
+        Ok(true)
+    }
+}
+
+impl Drop for DynamicRouteManager {
+    fn drop(&mut self) {
+        let hosts = self
+            .direct_hosts
+            .get_mut()
+            .expect("dynamic route mutex")
+            .iter()
+            .map(|(ip, domain)| (*ip, domain.clone()))
+            .collect::<Vec<_>>();
+        for (ip, domain) in hosts.into_iter().rev() {
+            if let Err(err) = run_domain_route_hook(&domain, ip, &direct_host_delete_command(ip)) {
+                warn!(host = %ip, error = %err, "wg dynamic direct route cleanup failed");
+            }
+        }
     }
 }
 
@@ -75,15 +139,31 @@ impl Drop for HookGuard {
 
 pub(crate) fn run_hooks(hooks: &[String]) -> Result<()> {
     for hook in hooks {
-        info!(hook = %hook, "running wg hook");
-        let status = Command::new("/bin/sh")
-            .arg("-lc")
-            .arg(hook)
-            .status()
-            .with_context(|| format!("failed to spawn wg hook: {hook}"))?;
-        if !status.success() {
-            bail!("wg hook failed with status {status}: {hook}");
+        run_hook(hook, None, None)?;
+    }
+    Ok(())
+}
+
+fn run_domain_route_hook(domain: &str, ip: IpAddr, hook: &str) -> Result<()> {
+    run_hook(hook, Some(domain), Some(ip))
+}
+
+fn run_hook(hook: &str, domain: Option<&str>, ip: Option<IpAddr>) -> Result<()> {
+    match (domain, ip) {
+        (Some(domain), Some(ip)) => {
+            info!(hook = %hook, domain = %domain, ip = %ip, "running wg hook")
         }
+        (Some(domain), None) => info!(hook = %hook, domain = %domain, "running wg hook"),
+        (None, Some(ip)) => info!(hook = %hook, ip = %ip, "running wg hook"),
+        (None, None) => info!(hook = %hook, "running wg hook"),
+    }
+    let status = Command::new("/bin/sh")
+        .arg("-lc")
+        .arg(hook)
+        .status()
+        .with_context(|| format!("failed to spawn wg hook: {hook}"))?;
+    if !status.success() {
+        bail!("wg hook failed with status {status}: {hook}");
     }
     Ok(())
 }
@@ -567,6 +647,16 @@ fn macos_delete_host_route_command(endpoint: IpAddr) -> String {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn direct_host_add_command(ip: IpAddr, route: &RouteInfo) -> String {
+    macos_bypass_route(ip, route)
+}
+
+#[cfg(target_os = "macos")]
+fn direct_host_delete_command(ip: IpAddr) -> String {
+    macos_delete_host_route_command(ip)
+}
+
 #[cfg(target_os = "linux")]
 fn linux_address_add_command(device: &str, tunnel: TunnelPair) -> String {
     match tunnel {
@@ -634,6 +724,26 @@ fn linux_delete_host_route_command(endpoint: IpAddr) -> String {
     } else {
         format!("ip route del {endpoint}/32 >/dev/null 2>&1 || true")
     }
+}
+
+#[cfg(target_os = "linux")]
+fn direct_host_add_command(ip: IpAddr, route: &RouteInfo) -> String {
+    linux_bypass_route(ip, route)
+}
+
+#[cfg(target_os = "linux")]
+fn direct_host_delete_command(ip: IpAddr) -> String {
+    linux_delete_host_route_command(ip)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn direct_host_add_command(ip: IpAddr, _route: &RouteInfo) -> String {
+    format!("true # dynamic direct route for {ip} is unsupported on this OS")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn direct_host_delete_command(ip: IpAddr) -> String {
+    format!("true # dynamic direct route cleanup for {ip} is unsupported on this OS")
 }
 
 fn detect_egress_route(target: IpAddr) -> Result<RouteInfo> {

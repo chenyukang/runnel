@@ -146,8 +146,36 @@ local IPv6 ranges direct, add `fc00::/7`, `fe80::/10`, and `ff00::/8` under
 `ip_rules.direct`.
 
 For WG, `ip_rules.direct` becomes local-route exclusions from the default
-tunnel route. `domain_rules` and `ip_rules.block` are parsed, but WG cannot
-enforce them yet without DNS-driven dynamic routes or firewall/blackhole hooks.
+tunnel route. `ip_rules.block` is parsed, but WG cannot enforce it yet without
+firewall or blackhole-route hooks.
+
+WG domain rules are DNS driven. Configure them under `client:` and set a WG DNS
+upstream:
+
+```yaml
+client:
+  mode: wg
+  domain_rules:
+    direct:
+      - "*.qq.com"
+      - "*.cn"
+    block:
+      - "*.xxx.com"
+  wg:
+    dns: 1.1.1.1
+    dns_capture: true
+```
+
+`domain_rules.direct` routes resolved A/AAAA host IPs outside the tunnel.
+`domain_rules.block` replies NXDOMAIN from the local DNS capture listener.
+If `domain_rules` are configured with `client.wg.dns`, config
+loading enables `dns_capture` automatically.
+
+Because this is DNS based, it only applies to DNS queries that pass through the
+local capture listener. DoH/DoT, browser private DNS, cached answers, or direct
+IP connections will not trigger domain routing. CDN/shared IP answers can also
+affect other domains that resolve to the same host IP while the client is
+running.
 
 ## DNS Domain Capture
 
@@ -163,8 +191,8 @@ client:
 ```
 
 This starts a local UDP DNS forwarder on `127.0.0.1:53`, points macOS DNS at
-`127.0.0.1`, records query names, and forwards packets to the configured `dns`
-upstream through the tunnel.
+`127.0.0.1`, records query names, applies WG domain rules when configured, and
+forwards packets to the configured `dns` upstream through the tunnel.
 
 ## Minimal Connectivity Smoke
 

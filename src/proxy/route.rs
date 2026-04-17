@@ -326,6 +326,14 @@ fn matches_any(patterns: &[String], host: &str) -> Result<bool> {
     Ok(false)
 }
 
+pub(crate) fn matches_domain_rules(patterns: &[String], host: &str) -> Result<bool> {
+    matches_any(patterns, host)
+}
+
+pub(crate) fn validate_domain_rule_entries(label: &str, patterns: &[String]) -> Result<()> {
+    validate_domain_patterns(label, patterns)
+}
+
 fn normalize_domain(value: &str) -> String {
     value.trim_end_matches('.').to_ascii_lowercase()
 }

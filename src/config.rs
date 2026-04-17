@@ -686,12 +686,37 @@ fn apply_common_route_rules_to_wg(
     }
 
     if !domain_rules.is_empty() {
-        warn!(
-            "client.domain_rules are currently enforced by SOCKS modes only; wg domain split requires DNS-driven dynamic routes"
-        );
+        route::validate_domain_rule_entries("client.domain_rules.direct", &domain_rules.direct)?;
+        route::validate_domain_rule_entries("client.domain_rules.proxy", &domain_rules.proxy)?;
+        route::validate_domain_rule_entries("client.domain_rules.block", &domain_rules.block)?;
+        args.domain_rules
+            .direct
+            .extend(domain_rules.direct.iter().cloned());
+        args.domain_rules
+            .proxy
+            .extend(domain_rules.proxy.iter().cloned());
+        args.domain_rules
+            .block
+            .extend(domain_rules.block.iter().cloned());
+
+        if wg_domain_rules_need_dns_capture(domain_rules) && args.dns.is_none() {
+            bail!(
+                "client.domain_rules require client.wg.dns in wg mode because domain routing is driven by DNS capture"
+            );
+        }
+        if wg_domain_rules_need_dns_capture(domain_rules) && !args.dns_capture {
+            warn!(
+                "enabling client.wg.dns_capture because client.domain_rules are configured for wg mode"
+            );
+            args.dns_capture = true;
+        }
     }
 
     Ok(())
+}
+
+fn wg_domain_rules_need_dns_capture(domain_rules: &RouteRuleConfig) -> bool {
+    !domain_rules.direct.is_empty() || !domain_rules.block.is_empty()
 }
 
 fn merged_route_rules(
@@ -1236,6 +1261,59 @@ telemetry-sock: /tmp/pipit.sock
 
         assert_eq!(args.direct_ips, vec!["128.33.0.0/16"]);
         assert_eq!(args.proxy_ips, vec!["203.0.113.0/24"]);
+    }
+
+    #[test]
+    fn common_domain_rules_enable_wg_dns_capture() {
+        let mut args = WgClientArgs {
+            dns: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+            dns_capture: false,
+            ..Default::default()
+        };
+        let domain_rules = RouteRuleConfig {
+            direct: vec!["*.qq.com".to_owned()],
+            proxy: Vec::new(),
+            block: vec!["*.xxx.com".to_owned()],
+        };
+        let ip_rules = RouteRuleConfig::default();
+
+        apply_common_route_rules_to_wg(&mut args, &domain_rules, &ip_rules).unwrap();
+
+        assert!(args.dns_capture);
+        assert_eq!(args.domain_rules.direct, vec!["*.qq.com"]);
+        assert_eq!(args.domain_rules.block, vec!["*.xxx.com"]);
+    }
+
+    #[test]
+    fn common_domain_rules_require_wg_dns_upstream() {
+        let mut args = WgClientArgs::default();
+        let domain_rules = RouteRuleConfig {
+            direct: vec!["*.qq.com".to_owned()],
+            proxy: Vec::new(),
+            block: Vec::new(),
+        };
+        let ip_rules = RouteRuleConfig::default();
+
+        let err = apply_common_route_rules_to_wg(&mut args, &domain_rules, &ip_rules)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("client.wg.dns"), "{err}");
+    }
+
+    #[test]
+    fn common_proxy_only_domain_rules_do_not_require_wg_dns_capture() {
+        let mut args = WgClientArgs::default();
+        let domain_rules = RouteRuleConfig {
+            direct: Vec::new(),
+            proxy: vec!["*.example.com".to_owned()],
+            block: Vec::new(),
+        };
+        let ip_rules = RouteRuleConfig::default();
+
+        apply_common_route_rules_to_wg(&mut args, &domain_rules, &ip_rules).unwrap();
+
+        assert!(!args.dns_capture);
+        assert_eq!(args.domain_rules.proxy, vec!["*.example.com"]);
     }
 
     #[test]

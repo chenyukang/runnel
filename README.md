@@ -355,8 +355,11 @@ Native HTTP, native mux, and Daze client modes use the same rule engine. `tun`
 currently forces `client.filter: proxy` to avoid direct-route loops, so direct
 rules are not used there, but block rules still apply. WG mode can map common
 `ip_rules.direct` entries to WG route exclusions while keeping proxy as the
-default route; WG domain rules and block rules need DNS-driven dynamic routes
-or firewall hooks and are not enforced yet.
+default route. WG also supports `domain_rules` through DNS capture:
+`domain_rules.direct` installs dynamic direct host routes for resolved A/AAAA
+records, `domain_rules.block` returns NXDOMAIN, and `domain_rules.proxy` keeps
+the default tunnel behavior. WG `ip_rules.block` still needs firewall or
+blackhole-route hooks and is not enforced yet.
 
 ## Config Files
 

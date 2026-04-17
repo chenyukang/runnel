@@ -533,6 +533,7 @@ async fn run_child_role(role: &str) -> Result<()> {
                     dns_capture: false,
                     proxy_ips: vec![host_cidr(server_tunnel_ip)],
                     direct_ips: Vec::new(),
+                    domain_rules: Default::default(),
                     up: Vec::new(),
                     down: Vec::new(),
                     print_hooks: false,

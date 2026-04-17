@@ -437,17 +437,7 @@ impl DashboardApp {
             return;
         }
 
-        let mut suffix = String::new();
-        if let Some(target) = event.fields.get("target") {
-            suffix.push_str(" ");
-            suffix.push_str(target);
-        } else if let Some(error) = event.fields.get("error") {
-            suffix.push_str(" ");
-            suffix.push_str(error);
-        } else if let Some(listen) = event.fields.get("listen") {
-            suffix.push_str(" ");
-            suffix.push_str(listen);
-        }
+        let suffix = recent_event_suffix(event);
 
         self.recent_events.push_front(format!(
             "{} [{}] {}{}",
@@ -457,6 +447,24 @@ impl DashboardApp {
             suffix
         ));
         self.recent_events.truncate(RECENT_EVENTS);
+    }
+}
+
+fn recent_event_suffix(event: &TraceEvent) -> String {
+    if let Some(target) = event.fields.get("target") {
+        return format!(" {target}");
+    }
+    if let Some(error) = event.fields.get("error") {
+        return format!(" {error}");
+    }
+    if let Some(listen) = event.fields.get("listen") {
+        return format!(" {listen}");
+    }
+    match (event.fields.get("domain"), event.fields.get("ip")) {
+        (Some(domain), Some(ip)) => format!(" {domain} -> {ip}"),
+        (Some(domain), None) => format!(" {domain}"),
+        (None, Some(ip)) => format!(" {ip}"),
+        (None, None) => String::new(),
     }
 }
 
@@ -1162,6 +1170,32 @@ mod tests {
         assert_eq!(app.recent_targets.len(), 1);
         assert_eq!(app.recent_targets[0].link, "dns://example.com");
         assert_eq!(app.recent_targets[0].route, "wg-dns");
+    }
+
+    #[test]
+    fn recent_event_shows_domain_and_ip_fields() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        });
+
+        app.ingest(trace_event(
+            "INFO",
+            "running wg hook",
+            &[("domain", "baidu.com"), ("ip", "110.242.74.102")],
+        ));
+
+        assert_eq!(app.recent_events.len(), 1);
+        assert!(
+            app.recent_events[0].contains("baidu.com -> 110.242.74.102"),
+            "{}",
+            app.recent_events[0]
+        );
     }
 
     #[test]
