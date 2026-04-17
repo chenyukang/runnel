@@ -88,6 +88,18 @@ example `/dev/net/tun`, `ip`, `sysctl`, and `iptables` on Linux, and `ifconfig`,
 `route`, and `networksetup` on macOS. `dry_run: true` still skips privileged
 preflight so plans can be inspected as a normal user.
 
+The client also sends a short WireGuard handshake probe before creating the
+device. If the server is unreachable or either side has the wrong WG key, the
+client fails early with a startup error instead of silently installing routes.
+Set `client.wg.skip_handshake_probe: true` only when you intentionally need to
+start before the server is reachable.
+
+The server cannot actively probe a client because it normally starts first and
+does not know the client's UDP endpoint. Instead, it watches the WireGuard
+handshake state after startup and logs a warning if no successful handshake is
+observed within 30 seconds. Set `server.wg.handshake_watchdog_secs: 0` to
+disable that warning for intentionally idle servers.
+
 ## Split Tunnel And Exclusions
 
 Only proxy specific CIDRs:

@@ -1,10 +1,10 @@
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::telemetry;
 
-use super::{WgDeviceStats, read_device_stats};
+use super::{WgDeviceStats, read_device_stats, read_last_handshake_age};
 
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -40,6 +40,46 @@ pub(crate) fn start_stats_poller(role: &'static str, socket_path: PathBuf) {
                         "wg stats poll task failed"
                     );
                 }
+            }
+        }
+    });
+}
+
+pub(crate) fn start_handshake_watchdog(role: &'static str, socket_path: PathBuf, delay: Duration) {
+    if delay.is_zero() {
+        return;
+    }
+
+    let _ = tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let path = socket_path.clone();
+        let sample = tokio::task::spawn_blocking(move || read_last_handshake_age(&path)).await;
+
+        match sample {
+            Ok(Ok(Some(_))) => {}
+            Ok(Ok(None)) => {
+                warn!(
+                    role,
+                    uapi_socket = %socket_path.display(),
+                    delay_secs = delay.as_secs(),
+                    "wg server has not observed a successful handshake yet; if the client is already trying to connect, check endpoint reachability and WG keys"
+                );
+            }
+            Ok(Err(error)) => {
+                debug!(
+                    role,
+                    uapi_socket = %socket_path.display(),
+                    error = %error,
+                    "failed to poll wg handshake watchdog"
+                );
+            }
+            Err(error) => {
+                debug!(
+                    role,
+                    uapi_socket = %socket_path.display(),
+                    error = %error,
+                    "wg handshake watchdog task failed"
+                );
             }
         }
     });

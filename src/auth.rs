@@ -11,6 +11,10 @@ use std::{
 
 type HmacSha256 = Hmac<Sha256>;
 
+pub const AUTH_FAILURE_BODY: &str =
+    "authentication failed; check that client and server passwords match\n";
+pub const AUTH_FAILURE_HINT: &str = "client and server passwords may not match";
+
 #[derive(Clone, Debug)]
 pub struct AuthProof {
     pub timestamp: i64,

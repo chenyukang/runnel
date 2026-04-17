@@ -55,6 +55,11 @@ pub(crate) fn read_device_stats(socket_path: &Path) -> Result<WgDeviceStats> {
     parse_device_stats(&response)
 }
 
+pub(crate) fn read_last_handshake_age(socket_path: &Path) -> Result<Option<Duration>> {
+    let response = send_get_request(socket_path)?;
+    parse_last_handshake_age(&response)
+}
+
 fn send_set_request(socket_path: &Path, body: &str) -> Result<()> {
     let mut last_error = None;
     for _ in 0..20 {
@@ -134,6 +139,19 @@ fn parse_device_stats(response: &str) -> Result<WgDeviceStats> {
     Ok(stats)
 }
 
+fn parse_last_handshake_age(response: &str) -> Result<Option<Duration>> {
+    parse_errno(response)?;
+
+    let mut age = None;
+    for line in response.lines() {
+        if let Some(value) = line.strip_prefix("last_handshake_time_sec=") {
+            let current = Duration::from_secs(parse_stat(value, "last_handshake_time_sec")?);
+            age = Some(age.map_or(current, |previous: Duration| previous.min(current)));
+        }
+    }
+    Ok(age)
+}
+
 fn parse_stat(value: &str, field: &str) -> Result<u64> {
     value
         .parse::<u64>()
@@ -156,9 +174,15 @@ fn parse_errno(response: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{WgDeviceStats, build_set_request, control_socket_path, parse_device_stats};
+    use super::{
+        WgDeviceStats, build_set_request, control_socket_path, parse_device_stats,
+        parse_last_handshake_age,
+    };
     use crate::wg::{WgRuntimeConfig, default_client_allowed_ips, default_server_allowed_ips};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        time::Duration,
+    };
 
     #[test]
     fn control_socket_path_uses_wireguard_run_dir() {
@@ -225,6 +249,8 @@ mod tests {
 own_public_key=aaaa
 listen_port=51820
 public_key=bbbb
+last_handshake_time_sec=7
+last_handshake_time_nsec=123
 allowed_ip=10.8.0.2/32
 rx_bytes=123
 tx_bytes=456
@@ -239,6 +265,42 @@ errno=0
                 tx_bytes: 456,
             }
         );
+    }
+
+    #[test]
+    fn parses_last_handshake_age_from_uapi_get_response() {
+        let response = "\
+public_key=bbbb
+last_handshake_time_sec=12
+last_handshake_time_nsec=123
+rx_bytes=10
+tx_bytes=20
+public_key=cccc
+last_handshake_time_sec=5
+last_handshake_time_nsec=456
+rx_bytes=30
+tx_bytes=40
+errno=0
+
+";
+
+        assert_eq!(
+            parse_last_handshake_age(response).unwrap(),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn missing_last_handshake_age_means_no_successful_handshake_yet() {
+        let response = "\
+public_key=bbbb
+rx_bytes=0
+tx_bytes=0
+errno=0
+
+";
+
+        assert_eq!(parse_last_handshake_age(response).unwrap(), None);
     }
 
     #[test]

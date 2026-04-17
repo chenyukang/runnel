@@ -188,6 +188,13 @@ sudo ./scripts/pipit-wg-smoke.sh --role client --config pipit.wg.yaml --start
 WG mode notes:
 
 - Startup preflight checks privileges and platform tools before hooks run.
+- The WG client sends a short startup handshake probe before creating the
+  device, so unreachable endpoints or mismatched WG keys fail with a clear
+  error. Use `client.wg.skip_handshake_probe: true` only when starting before
+  the server is reachable is intentional.
+- The WG server watches for a first successful handshake and warns after 30s if
+  none is observed; set `server.wg.handshake_watchdog_secs: 0` for intentionally
+  idle servers.
 - Linux server NAT defaults to IPv4 `iptables` masquerade.
 - macOS client DNS capture uses a local UDP DNS forwarder on `127.0.0.1:53`.
 - TUI can show aggregate WG traffic; Recent Domains require `--dns-capture`.

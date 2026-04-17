@@ -1,5 +1,5 @@
 use crate::{
-    auth::{AuthProof, ReplayProtector},
+    auth::{AUTH_FAILURE_BODY, AUTH_FAILURE_HINT, AuthProof, ReplayProtector},
     client::ClientArgs,
     http, netlog, route,
     route::RouteDecision,
@@ -230,16 +230,30 @@ impl MuxClient {
         .await
         .context("mux session response timed out")??;
 
-        let (is_http1, status, reason) =
-            http::parse_tunnel_response(&head).context("invalid mux session response")?;
-        if !is_http1 {
+        let response = http::parse_response_head(&head).context("invalid mux session response")?;
+        if !response.is_http1 {
             bail!("mux server returned an unsupported HTTP version");
         }
-        if status != 200 {
+        if response.status != 200 {
+            let detail = http::read_response_body_text(
+                &mut tunnel,
+                &body_prefix,
+                response.content_length,
+                self.max_header_size,
+            )
+            .await;
+            if let Some(detail) = detail {
+                bail!(
+                    "mux server refused session with status {} {}: {}",
+                    response.status,
+                    response.reason,
+                    detail
+                );
+            }
             bail!(
                 "mux server refused session with status {} {}",
-                status,
-                reason
+                response.status,
+                response.reason
             );
         }
 
@@ -447,9 +461,13 @@ where
 {
     if request_head.chunked {
         stream
-            .write_all(&http::build_error_response(404, "Not Found", "not found\n"))
+            .write_all(&http::build_error_response(
+                401,
+                "Unauthorized",
+                AUTH_FAILURE_BODY,
+            ))
             .await?;
-        return Ok(());
+        bail!("mux authentication failed; {AUTH_FAILURE_HINT}");
     }
 
     let body_length = match request_head.content_length {
@@ -492,20 +510,21 @@ where
         signature: payload.signature,
     };
 
-    if replay
-        .validate(
-            &args.password,
-            "POST",
-            &args.mux_path,
-            SESSION_AUTH_TARGET,
-            &proof,
-        )
-        .is_err()
-    {
+    if let Err(err) = replay.validate(
+        &args.password,
+        "POST",
+        &args.mux_path,
+        SESSION_AUTH_TARGET,
+        &proof,
+    ) {
         stream
-            .write_all(&http::build_error_response(404, "Not Found", "not found\n"))
+            .write_all(&http::build_error_response(
+                401,
+                "Unauthorized",
+                AUTH_FAILURE_BODY,
+            ))
             .await?;
-        return Ok(());
+        bail!("mux authentication failed: {err}; {AUTH_FAILURE_HINT}");
     }
 
     stream.write_all(&http::build_tunnel_established()).await?;

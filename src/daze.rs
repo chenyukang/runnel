@@ -1,6 +1,12 @@
 use crate::{
-    client::ClientArgs, http, mode::ProxyMode, netlog, route, route::RouteDecision,
-    server::ServerArgs, socks5, telemetry, traffic,
+    auth::{AUTH_FAILURE_BODY, AUTH_FAILURE_HINT},
+    client::ClientArgs,
+    http,
+    mode::ProxyMode,
+    netlog, route,
+    route::RouteDecision,
+    server::ServerArgs,
+    socks5, telemetry, traffic,
 };
 use anyhow::{Context, Result, bail};
 use md5::Context as Md5Context;
@@ -142,8 +148,9 @@ async fn handle_client_connection(
     .context("server connect timed out")??;
     upstream.set_nodelay(true)?;
 
-    let (upload, download) =
-        client_establish_ashe(&mut upstream, &args.password, &target_string).await?;
+    let (upload, download) = client_establish_ashe(&mut upstream, &args.password, &target_string)
+        .await
+        .with_context(|| format!("daze-ashe handshake failed; {AUTH_FAILURE_HINT}"))?;
 
     socks5::send_success(&mut inbound).await?;
     let stats = relay_rc4(
@@ -327,25 +334,40 @@ async fn handle_baboon_client_connection(
     let request = build_baboon_request(&args.password, &args.server);
     upstream.write_all(request.as_bytes()).await?;
 
-    let (head, _) = timeout(
+    let (head, body_prefix) = timeout(
         Duration::from_secs(args.handshake_timeout_secs),
         http::read_head(&mut upstream, args.max_header_size),
     )
     .await
     .context("baboon response timed out")??;
-    let (is_http1, status, reason) =
-        http::parse_tunnel_response(&head).context("invalid baboon response")?;
-    if !is_http1 || status != 200 {
+    let response = http::parse_response_head(&head).context("invalid baboon response")?;
+    if !response.is_http1 || response.status != 200 {
+        let detail = http::read_response_body_text(
+            &mut upstream,
+            &body_prefix,
+            response.content_length,
+            args.max_header_size,
+        )
+        .await;
         let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
+        if let Some(detail) = detail {
+            bail!(
+                "daze-baboon server refused sync with status {} {}: {}",
+                response.status,
+                response.reason,
+                detail
+            );
+        }
         bail!(
             "daze-baboon server refused sync with status {} {}",
-            status,
-            reason
+            response.status,
+            response.reason
         );
     }
 
-    let (upload, download) =
-        client_establish_ashe(&mut upstream, &args.password, &target_string).await?;
+    let (upload, download) = client_establish_ashe(&mut upstream, &args.password, &target_string)
+        .await
+        .with_context(|| format!("daze-baboon ashe handshake failed; {AUTH_FAILURE_HINT}"))?;
 
     socks5::send_success(&mut inbound).await?;
     let stats = relay_rc4(
@@ -397,10 +419,18 @@ async fn handle_baboon_server_connection(
         }
     };
 
-    if request.method == "POST"
-        && request.path == BABOON_PATH
-        && validate_baboon_request(&request, &args.password)
-    {
+    if request.method == "POST" && request.path == BABOON_PATH {
+        if !validate_baboon_request(&request, &args.password) {
+            inbound
+                .write_all(&http::build_error_response(
+                    401,
+                    "Unauthorized",
+                    AUTH_FAILURE_BODY,
+                ))
+                .await?;
+            bail!("daze-baboon authentication failed; {AUTH_FAILURE_HINT}");
+        }
+
         inbound
             .write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: keep-alive\r\n\r\n",
@@ -479,7 +509,10 @@ where
     stream.write_all(&open).await?;
 
     let mut code = [0_u8; 1];
-    stream.read_exact(&mut code).await?;
+    stream
+        .read_exact(&mut code)
+        .await
+        .with_context(|| format!("daze-ashe response read failed; {AUTH_FAILURE_HINT}"))?;
     dec.apply_keystream(&mut code);
     if code[0] != 0 {
         bail!("daze-ashe server refused target");
@@ -517,7 +550,8 @@ where
     .context("daze-ashe timestamp read timed out")??;
     dec.apply_keystream(&mut ts);
     let timestamp = u64::from_be_bytes(ts) as i64;
-    validate_timestamp(timestamp)?;
+    validate_timestamp(timestamp)
+        .with_context(|| format!("daze-ashe authentication failed; {AUTH_FAILURE_HINT}"))?;
 
     let mut open_head = [0_u8; 2];
     timeout(
@@ -528,7 +562,7 @@ where
     .context("daze-ashe request read timed out")??;
     dec.apply_keystream(&mut open_head);
     if open_head[0] != ASHE_NET_TCP {
-        bail!("only tcp is supported in daze-ashe mode");
+        bail!("daze-ashe authentication failed or unsupported request type; {AUTH_FAILURE_HINT}");
     }
 
     let addr_len = open_head[1] as usize;
@@ -540,7 +574,8 @@ where
     .await
     .context("daze-ashe address read timed out")??;
     dec.apply_keystream(&mut address);
-    let target = String::from_utf8(address).context("daze-ashe address is not valid UTF-8")?;
+    let target = String::from_utf8(address)
+        .with_context(|| format!("daze-ashe address decode failed; {AUTH_FAILURE_HINT}"))?;
 
     if !args.allow_private_targets && is_private_literal_target(&target) {
         bail!("literal private IP targets are disabled by default");
@@ -966,6 +1001,8 @@ impl Rc4State {
 mod tests {
     use super::*;
     use crate::http;
+    use crate::wg::WgServerArgs;
+    use tokio::io::duplex;
 
     #[test]
     fn rc4_round_trip() {
@@ -984,5 +1021,44 @@ mod tests {
         let parsed = http::parse_request(request.as_bytes()).expect("request should parse");
         assert!(validate_baboon_request(&parsed, "secret"));
         assert!(!validate_baboon_request(&parsed, "wrong-secret"));
+    }
+
+    #[tokio::test]
+    async fn ashe_password_mismatch_reports_auth_hint() {
+        let (mut client_io, mut server_io) = duplex(1024);
+        let server_args = ServerArgs {
+            listen: "127.0.0.1:0".to_owned(),
+            cert: None,
+            key: None,
+            mode: ProxyMode::DazeAshe,
+            password: "server-secret".to_owned(),
+            path: "/connect".to_owned(),
+            mux_path: "/mux".to_owned(),
+            auth_window_secs: 120,
+            handshake_timeout_secs: 1,
+            connect_timeout_secs: 10,
+            max_header_size: 16 * 1024,
+            max_tunnel_body_size: 8 * 1024,
+            allow_private_targets: true,
+            fallback_url: "https://www.qq.com".to_owned(),
+            fallback_timeout_secs: 15,
+            max_fallback_body_size: 1024 * 1024,
+            wg: WgServerArgs::default(),
+        };
+
+        let server_task =
+            tokio::spawn(async move { server_accept_ashe(&mut server_io, &server_args).await });
+        let client_err =
+            match client_establish_ashe(&mut client_io, "client-secret", "example.com:80").await {
+                Ok(_) => panic!("wrong password should fail client handshake"),
+                Err(err) => err.to_string(),
+            };
+        let server_err = match server_task.await.unwrap() {
+            Ok(_) => panic!("wrong password should fail server handshake"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(client_err.contains(AUTH_FAILURE_HINT), "{client_err}");
+        assert!(server_err.contains(AUTH_FAILURE_HINT), "{server_err}");
     }
 }

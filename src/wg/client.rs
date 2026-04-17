@@ -8,10 +8,16 @@ use super::{
 use anyhow::{Context, Result, bail};
 use boringtun::noise::TunnResult;
 use clap::Args;
-use std::net::IpAddr;
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
+use tokio::{net::UdpSocket, time::timeout};
 use tracing::{info, warn};
 
 use crate::system_proxy;
+
+const HANDSHAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, Args)]
 pub struct WgClientArgs {
@@ -54,6 +60,8 @@ pub struct WgClientArgs {
     pub print_hooks: bool,
     #[arg(long)]
     pub dry_run: bool,
+    #[arg(long)]
+    pub skip_handshake_probe: bool,
 }
 
 impl Default for WgClientArgs {
@@ -77,6 +85,7 @@ impl Default for WgClientArgs {
             down: Vec::new(),
             print_hooks: false,
             dry_run: false,
+            skip_handshake_probe: false,
         }
     }
 }
@@ -109,6 +118,10 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
         if args.dry_run {
             return Ok(());
         }
+    }
+
+    if !args.skip_handshake_probe {
+        probe_server_handshake(&runtime, HANDSHAKE_PROBE_TIMEOUT).await?;
     }
 
     let (_device_handle, actual_device) = create_device_handle(&args.device)?;
@@ -149,6 +162,79 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
     );
 
     wait_for_shutdown_signal().await
+}
+
+async fn probe_server_handshake(
+    runtime: &WgRuntimeConfig,
+    timeout_duration: Duration,
+) -> Result<()> {
+    let endpoint = runtime.endpoint.context("wg client endpoint missing")?;
+    let socket = UdpSocket::bind(probe_bind_addr(runtime.bind, endpoint))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to bind wg client handshake probe socket for {}",
+                runtime.bind
+            )
+        })?;
+    let mut tunnel = runtime.new_tunnel(1);
+    let mut send_buf = [0u8; super::HANDSHAKE_BUFFER_SIZE];
+    let packet = match tunnel.format_handshake_initiation(&mut send_buf, false) {
+        TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+        TunnResult::Done => return Ok(()),
+        TunnResult::Err(err) => {
+            return Err(anyhow::anyhow!(
+                "failed to build WG handshake probe packet: {err:?}"
+            ));
+        }
+        TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
+            bail!("WG handshake probe unexpectedly produced a tunnel packet");
+        }
+    };
+
+    socket
+        .send_to(&packet, endpoint)
+        .await
+        .with_context(|| format!("failed to send WG handshake probe to {endpoint}"))?;
+
+    let mut recv_buf = [0u8; super::HANDSHAKE_BUFFER_SIZE];
+    let mut decap_buf = [0u8; super::HANDSHAKE_BUFFER_SIZE];
+    let probe = async {
+        loop {
+            let (len, addr) = socket.recv_from(&mut recv_buf).await?;
+            if addr != endpoint {
+                continue;
+            }
+            match tunnel.decapsulate(Some(endpoint.ip()), &recv_buf[..len], &mut decap_buf) {
+                TunnResult::WriteToNetwork(packet) => {
+                    socket.send_to(packet, endpoint).await.with_context(|| {
+                        format!("failed to send WG handshake probe keepalive to {endpoint}")
+                    })?;
+                    return Ok(());
+                }
+                TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
+                    return Ok(());
+                }
+                TunnResult::Done | TunnResult::Err(_) => continue,
+            }
+        }
+    };
+
+    match timeout(timeout_duration, probe).await {
+        Ok(result) => result,
+        Err(_) => bail!(
+            "wg client handshake probe timed out after {}s; endpoint may be unreachable or WG keys may not match. Pass --skip-handshake-probe or set client.wg.skip_handshake_probe: true to start without probing.",
+            timeout_duration.as_secs()
+        ),
+    }
+}
+
+fn probe_bind_addr(bind: SocketAddr, endpoint: SocketAddr) -> SocketAddr {
+    let port = bind.port();
+    match endpoint {
+        SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], port)),
+        SocketAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port)),
+    }
 }
 
 fn plan_lines(
@@ -193,6 +279,14 @@ fn plan_lines(
             .unwrap_or_else(|| "-".to_owned())
     ));
     lines.push(format!("  dns_capture: {}", args.dns_capture));
+    lines.push(format!(
+        "  handshake_probe: {}",
+        if args.skip_handshake_probe {
+            "disabled"
+        } else {
+            "enabled"
+        }
+    ));
     lines.push("  up hooks:".to_owned());
     if plan.up.is_empty() {
         lines.push("    - (none)".to_owned());
@@ -284,10 +378,21 @@ impl WgClientArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{WgClientArgs, plan_lines};
-    use crate::wg::hooks::HookPlan;
+    use super::{WgClientArgs, plan_lines, probe_server_handshake};
+    use crate::wg::{
+        HANDSHAKE_BUFFER_SIZE, WgRuntimeConfig, default_client_allowed_ips,
+        default_server_allowed_ips, hooks::HookPlan,
+    };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use boringtun::{
+        noise::TunnResult,
+        x25519::{PublicKey, StaticSecret},
+    };
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        time::Duration,
+    };
+    use tokio::{net::UdpSocket, task::JoinHandle};
 
     #[test]
     fn client_args_resolve_runtime() {
@@ -310,6 +415,7 @@ mod tests {
             down: Vec::new(),
             print_hooks: false,
             dry_run: true,
+            skip_handshake_probe: false,
         };
 
         let runtime = args.resolve().unwrap();
@@ -343,6 +449,7 @@ mod tests {
             down: Vec::new(),
             print_hooks: false,
             dry_run: true,
+            skip_handshake_probe: false,
         };
 
         let runtime = args.resolve().unwrap();
@@ -370,6 +477,7 @@ mod tests {
             down: Vec::new(),
             print_hooks: false,
             dry_run: true,
+            skip_handshake_probe: false,
         };
 
         let runtime = args.resolve().unwrap();
@@ -398,6 +506,7 @@ mod tests {
             down: Vec::new(),
             print_hooks: false,
             dry_run: true,
+            skip_handshake_probe: false,
         };
 
         let err = args.resolve().unwrap_err().to_string();
@@ -425,6 +534,7 @@ mod tests {
             down: Vec::new(),
             print_hooks: true,
             dry_run: true,
+            skip_handshake_probe: false,
         };
 
         let runtime = args.resolve().unwrap();
@@ -445,5 +555,108 @@ mod tests {
                 .iter()
                 .any(|line| line == "    - ip route replace 203.0.113.0/24 dev pipitwg0")
         );
+    }
+
+    #[tokio::test]
+    async fn handshake_probe_succeeds_when_keys_match() {
+        let client_private = [0x11u8; 32];
+        let server_private = [0x22u8; 32];
+        let client_public = public_key(client_private);
+        let server_public = public_key(server_private);
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = server_socket.local_addr().unwrap();
+        let server_task = spawn_handshake_responder(
+            server_socket,
+            server_runtime(endpoint.port(), server_private, client_public),
+        );
+
+        let client_runtime = client_runtime(endpoint, client_private, server_public);
+
+        probe_server_handshake(&client_runtime, Duration::from_secs(1))
+            .await
+            .unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handshake_probe_reports_friendly_error_when_wg_keys_do_not_match() {
+        let client_private = [0x11u8; 32];
+        let server_private = [0x22u8; 32];
+        let wrong_server_private = [0x33u8; 32];
+        let client_public = public_key(client_private);
+        let wrong_server_public = public_key(wrong_server_private);
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = server_socket.local_addr().unwrap();
+        let server_task = spawn_handshake_responder(
+            server_socket,
+            server_runtime(endpoint.port(), server_private, client_public),
+        );
+
+        let client_runtime = client_runtime(endpoint, client_private, wrong_server_public);
+        let err = probe_server_handshake(&client_runtime, Duration::from_millis(100))
+            .await
+            .expect_err("mismatched WG keys should fail the startup probe")
+            .to_string();
+
+        assert!(err.contains("WG keys may not match"), "{err}");
+        server_task.await.unwrap();
+    }
+
+    fn spawn_handshake_responder(socket: UdpSocket, runtime: WgRuntimeConfig) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut tunnel = runtime.new_tunnel(2);
+            let mut recv_buf = [0u8; HANDSHAKE_BUFFER_SIZE];
+            let mut send_buf = [0u8; HANDSHAKE_BUFFER_SIZE];
+            let Ok((len, addr)) = socket.recv_from(&mut recv_buf).await else {
+                return;
+            };
+            if let TunnResult::WriteToNetwork(packet) =
+                tunnel.decapsulate(Some(addr.ip()), &recv_buf[..len], &mut send_buf)
+            {
+                let _ = socket.send_to(packet, addr).await;
+            }
+        })
+    }
+
+    fn client_runtime(
+        endpoint: SocketAddr,
+        private_key: [u8; 32],
+        peer_public_key: [u8; 32],
+    ) -> WgRuntimeConfig {
+        WgRuntimeConfig {
+            bind: SocketAddr::from(([0, 0, 0, 0], 0)),
+            endpoint: Some(endpoint),
+            tunnel_ip: IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2)),
+            peer_tunnel_ip: IpAddr::V4(Ipv4Addr::new(10, 8, 0, 1)),
+            mtu: 1420,
+            persistent_keepalive_secs: Some(25),
+            private_key,
+            peer_public_key,
+            peer_allowed_ips: default_client_allowed_ips(),
+            excluded_ips: Vec::new(),
+        }
+    }
+
+    fn server_runtime(
+        listen_port: u16,
+        private_key: [u8; 32],
+        peer_public_key: [u8; 32],
+    ) -> WgRuntimeConfig {
+        WgRuntimeConfig {
+            bind: SocketAddr::from(([0, 0, 0, 0], listen_port)),
+            endpoint: None,
+            tunnel_ip: IpAddr::V4(Ipv4Addr::new(10, 8, 0, 1)),
+            peer_tunnel_ip: IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2)),
+            mtu: 1420,
+            persistent_keepalive_secs: None,
+            private_key,
+            peer_public_key,
+            peer_allowed_ips: default_server_allowed_ips(IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2))),
+            excluded_ips: Vec::new(),
+        }
+    }
+
+    fn public_key(private_key: [u8; 32]) -> [u8; 32] {
+        *PublicKey::from(&StaticSecret::from(private_key)).as_bytes()
     }
 }

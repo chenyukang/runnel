@@ -2,12 +2,15 @@ use super::{
     DEFAULT_TUNNEL_MTU, HookGuard, WgPreflightRole, WgRuntimeConfig, apply_device_config,
     control_socket_path, create_device_handle, default_server_allowed_ips, effective_hook_plan,
     log_plan_lines, normalize_allowed_ips, parse_key, parse_socket_addr, plan_server_hooks,
-    print_plan, select_device_name, start_stats_poller, wait_for_shutdown_signal,
+    print_plan, select_device_name, start_handshake_watchdog, start_stats_poller,
+    wait_for_shutdown_signal,
 };
 use anyhow::{Result, bail};
 use clap::Args;
-use std::net::IpAddr;
+use std::{net::IpAddr, time::Duration};
 use tracing::info;
+
+const DEFAULT_HANDSHAKE_WATCHDOG_SECS: u64 = 30;
 
 #[derive(Clone, Debug, Args)]
 pub struct WgServerArgs {
@@ -39,6 +42,8 @@ pub struct WgServerArgs {
     pub print_hooks: bool,
     #[arg(long)]
     pub dry_run: bool,
+    #[arg(long, default_value_t = DEFAULT_HANDSHAKE_WATCHDOG_SECS)]
+    pub handshake_watchdog_secs: u64,
 }
 
 impl Default for WgServerArgs {
@@ -57,6 +62,7 @@ impl Default for WgServerArgs {
             down: Vec::new(),
             print_hooks: false,
             dry_run: false,
+            handshake_watchdog_secs: DEFAULT_HANDSHAKE_WATCHDOG_SECS,
         }
     }
 }
@@ -91,6 +97,11 @@ pub async fn run(args: WgServerArgs) -> Result<()> {
     let socket_path = control_socket_path(&actual_device);
     apply_device_config(&socket_path, &runtime)?;
     start_stats_poller("wg-server", socket_path.clone());
+    start_handshake_watchdog(
+        "wg-server",
+        socket_path.clone(),
+        Duration::from_secs(args.handshake_watchdog_secs),
+    );
     let plan = effective_hook_plan(
         plan_server_hooks(&actual_device, &runtime, args.nat_out_interface.as_deref())?,
         &args.up,
@@ -138,6 +149,10 @@ fn plan_lines(
     lines.push(format!(
         "  nat_out_interface: {}",
         args.nat_out_interface.as_deref().unwrap_or("-")
+    ));
+    lines.push(format!(
+        "  handshake_watchdog_secs: {}",
+        args.handshake_watchdog_secs
     ));
     lines.push("  up hooks:".to_owned());
     if plan.up.is_empty() {
@@ -218,6 +233,7 @@ mod tests {
             down: Vec::new(),
             print_hooks: false,
             dry_run: true,
+            handshake_watchdog_secs: super::DEFAULT_HANDSHAKE_WATCHDOG_SECS,
         };
 
         let runtime = args.resolve().unwrap();
@@ -243,6 +259,7 @@ mod tests {
             down: Vec::new(),
             print_hooks: false,
             dry_run: true,
+            handshake_watchdog_secs: super::DEFAULT_HANDSHAKE_WATCHDOG_SECS,
         };
 
         let runtime = args.resolve().unwrap();

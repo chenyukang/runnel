@@ -12,7 +12,7 @@ use crate::{
     route::FilterMode,
     server::ServerArgs,
     tun::TunArgs,
-    wg::{WgClientArgs, WgServerArgs},
+    wg::{WgClientArgs, WgServerArgs, public_key_from_private_key},
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -119,6 +119,7 @@ pub struct WgClientConfig {
     pub down: Option<Vec<String>>,
     pub print_hooks: Option<bool>,
     pub dry_run: Option<bool>,
+    pub skip_handshake_probe: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -137,6 +138,7 @@ pub struct WgServerConfig {
     pub down: Option<Vec<String>>,
     pub print_hooks: Option<bool>,
     pub dry_run: Option<bool>,
+    pub handshake_watchdog_secs: Option<u64>,
 }
 
 pub fn load(path: &Path) -> Result<(FileConfig, PathBuf)> {
@@ -219,9 +221,9 @@ pub fn apply_client(
     config: &FileConfig,
     matches: &ArgMatches,
     base_dir: &Path,
-) {
+) -> Result<()> {
     let Some(client) = &config.client else {
-        return;
+        return Ok(());
     };
 
     maybe_assign(
@@ -316,6 +318,7 @@ pub fn apply_client(
     if let Some(wg) = &client.wg {
         apply_wg_client_config(&mut args.wg, wg, |_| true);
     }
+    validate_active_client_credentials(args, config)
 }
 
 pub fn apply_server(
@@ -323,9 +326,9 @@ pub fn apply_server(
     config: &FileConfig,
     matches: &ArgMatches,
     base_dir: &Path,
-) {
+) -> Result<()> {
     let Some(server) = &config.server else {
-        return;
+        return Ok(());
     };
 
     maybe_assign(
@@ -413,13 +416,19 @@ pub fn apply_server(
     if let Some(wg) = &server.wg {
         apply_wg_server_config(&mut args.wg, wg, |_| true);
     }
+    validate_active_server_credentials(args, config)
 }
 
-pub fn apply_tun(args: &mut TunArgs, config: &FileConfig, matches: &ArgMatches, base_dir: &Path) {
-    apply_client(&mut args.client, config, matches, base_dir);
+pub fn apply_tun(
+    args: &mut TunArgs,
+    config: &FileConfig,
+    matches: &ArgMatches,
+    base_dir: &Path,
+) -> Result<()> {
+    apply_client(&mut args.client, config, matches, base_dir)?;
 
     let Some(tun) = &config.tun else {
-        return;
+        return Ok(());
     };
 
     maybe_assign(
@@ -459,6 +468,7 @@ pub fn apply_tun(args: &mut TunArgs, config: &FileConfig, matches: &ArgMatches, 
         &tun.dry_run,
         should_override(matches, "dry_run"),
     );
+    Ok(())
 }
 
 pub fn apply_wg_client(
@@ -466,15 +476,16 @@ pub fn apply_wg_client(
     config: &FileConfig,
     _matches: &ArgMatches,
     _base_dir: &Path,
-) {
+) -> Result<()> {
     let Some(client) = &config.client else {
-        return;
+        return Ok(());
     };
     let Some(wg_client) = &client.wg else {
-        return;
+        return Ok(());
     };
 
     apply_wg_client_config(args, wg_client, |id| should_override(_matches, id));
+    validate_wg_client_pair(args, config.server.as_ref())
 }
 
 pub fn apply_wg_server(
@@ -482,15 +493,16 @@ pub fn apply_wg_server(
     config: &FileConfig,
     _matches: &ArgMatches,
     _base_dir: &Path,
-) {
+) -> Result<()> {
     let Some(server) = &config.server else {
-        return;
+        return Ok(());
     };
     let Some(wg_server) = &server.wg else {
-        return;
+        return Ok(());
     };
 
     apply_wg_server_config(args, wg_server, |id| should_override(_matches, id));
+    validate_wg_server_pair(args, config.client.as_ref())
 }
 
 fn apply_wg_client_config(
@@ -568,6 +580,11 @@ fn apply_wg_client_config(
         &wg_client.dry_run,
         should_apply("dry_run"),
     );
+    maybe_assign(
+        &mut args.skip_handshake_probe,
+        &wg_client.skip_handshake_probe,
+        should_apply("skip_handshake_probe"),
+    );
 }
 
 fn apply_wg_server_config(
@@ -620,6 +637,129 @@ fn apply_wg_server_config(
         &wg_server.dry_run,
         should_apply("dry_run"),
     );
+    maybe_assign(
+        &mut args.handshake_watchdog_secs,
+        &wg_server.handshake_watchdog_secs,
+        should_apply("handshake_watchdog_secs"),
+    );
+}
+
+fn validate_active_client_credentials(args: &ClientArgs, config: &FileConfig) -> Result<()> {
+    if matches!(args.effective_mode()?, ProxyMode::Wg) {
+        return validate_wg_client_pair(&args.wg, config.server.as_ref());
+    }
+
+    let Some(server) = &config.server else {
+        return Ok(());
+    };
+    if matches!(server.mode.unwrap_or(ProxyMode::NativeHttp), ProxyMode::Wg) {
+        return Ok(());
+    }
+    validate_password_pair(
+        "client password",
+        &args.password,
+        "server.password",
+        server.password.as_deref(),
+    )
+}
+
+fn validate_active_server_credentials(args: &ServerArgs, config: &FileConfig) -> Result<()> {
+    if matches!(args.mode, ProxyMode::Wg) {
+        return validate_wg_server_pair(&args.wg, config.client.as_ref());
+    }
+
+    let Some(client) = &config.client else {
+        return Ok(());
+    };
+    if matches!(client.mode.unwrap_or(ProxyMode::NativeHttp), ProxyMode::Wg) {
+        return Ok(());
+    }
+    validate_password_pair(
+        "server password",
+        &args.password,
+        "client.password",
+        client.password.as_deref(),
+    )
+}
+
+fn validate_password_pair(
+    active_label: &str,
+    active_password: &str,
+    peer_label: &str,
+    peer_password: Option<&str>,
+) -> Result<()> {
+    let Some(peer_password) = peer_password else {
+        return Ok(());
+    };
+    if active_password.trim().is_empty() || peer_password.trim().is_empty() {
+        return Ok(());
+    }
+    if active_password != peer_password {
+        bail!(
+            "{active_label} does not match {peer_label} in the same config; use matching passwords or update one side"
+        );
+    }
+    Ok(())
+}
+
+fn validate_wg_client_pair(args: &WgClientArgs, server: Option<&ServerConfig>) -> Result<()> {
+    let Some(server_wg) = server.and_then(|server| server.wg.as_ref()) else {
+        return Ok(());
+    };
+
+    validate_wg_peer_public_key(
+        "client.wg.peer_public_key",
+        Some(args.peer_public_key.as_str()),
+        "server.wg.private_key",
+        server_wg.private_key.as_deref(),
+    )?;
+    validate_wg_peer_public_key(
+        "server.wg.peer_public_key",
+        server_wg.peer_public_key.as_deref(),
+        "client.wg.private_key",
+        Some(&args.private_key),
+    )
+}
+
+fn validate_wg_server_pair(args: &WgServerArgs, client: Option<&ClientConfig>) -> Result<()> {
+    let Some(client_wg) = client.and_then(|client| client.wg.as_ref()) else {
+        return Ok(());
+    };
+
+    validate_wg_peer_public_key(
+        "server.wg.peer_public_key",
+        Some(args.peer_public_key.as_str()),
+        "client.wg.private_key",
+        client_wg.private_key.as_deref(),
+    )?;
+    validate_wg_peer_public_key(
+        "client.wg.peer_public_key",
+        client_wg.peer_public_key.as_deref(),
+        "server.wg.private_key",
+        Some(&args.private_key),
+    )
+}
+
+fn validate_wg_peer_public_key(
+    peer_public_label: &str,
+    peer_public_key: Option<&str>,
+    private_label: &str,
+    private_key: Option<&str>,
+) -> Result<()> {
+    let Some(peer_public_key) = peer_public_key.map(str::trim).filter(|key| !key.is_empty()) else {
+        return Ok(());
+    };
+    let Some(private_key) = private_key.map(str::trim).filter(|key| !key.is_empty()) else {
+        return Ok(());
+    };
+    let expected = public_key_from_private_key(private_key)
+        .with_context(|| format!("failed to verify {peer_public_label} against {private_label}"))?;
+    if peer_public_key != expected {
+        bail!(
+            "{peer_public_label} does not match {private_label} in the same config; regenerate the WG config or set matching keys"
+        );
+    }
+    Ok(())
 }
 
 pub fn apply_cert(args: &mut CertArgs, config: &FileConfig, matches: &ArgMatches, base_dir: &Path) {
@@ -689,8 +829,20 @@ fn resolve_path(base_dir: &Path, path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileConfig, load, maybe_assign_optional, resolve_path};
+    use super::{
+        ClientConfig, FileConfig, ServerConfig, WgServerConfig, load, maybe_assign_optional,
+        resolve_path, validate_active_client_credentials, validate_active_server_credentials,
+        validate_wg_client_pair,
+    };
+    use crate::{
+        client::ClientArgs,
+        mode::ProxyMode,
+        route::FilterMode,
+        server::ServerArgs,
+        wg::{WgClientArgs, WgServerArgs, public_key_from_private_key},
+    };
     use std::fs;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -722,6 +874,7 @@ client:
       - ip route replace 203.0.113.0/24 dev pipitwg0
     print_hooks: true
     dry_run: true
+    skip_handshake_probe: true
 tun:
   device: auto
   helper_cmd: tun2proxy-bin --tun {device} --proxy socks5://{socks}
@@ -738,6 +891,7 @@ server:
     down:
       - ip link set dev pipitwg0 down || true
     dry_run: true
+    handshake_watchdog_secs: 0
 "#;
         let parsed: FileConfig = serde_yaml::from_str(raw).unwrap();
         assert_eq!(parsed.log.as_deref(), Some("debug"));
@@ -821,6 +975,14 @@ server:
                 .client
                 .as_ref()
                 .and_then(|cfg| cfg.wg.as_ref())
+                .and_then(|cfg| cfg.skip_handshake_probe),
+            Some(true)
+        );
+        assert_eq!(
+            parsed
+                .client
+                .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
                 .and_then(|cfg| cfg.excluded_ips.as_ref())
                 .cloned(),
             Some(vec!["192.168.0.0/16".to_owned()])
@@ -866,6 +1028,14 @@ server:
                 .and_then(|cfg| cfg.wg.as_ref())
                 .and_then(|cfg| cfg.dry_run),
             Some(true)
+        );
+        assert_eq!(
+            parsed
+                .server
+                .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
+                .and_then(|cfg| cfg.handshake_watchdog_secs),
+            Some(0)
         );
     }
 
@@ -918,6 +1088,78 @@ telemetry-sock: /tmp/pipit.sock
     }
 
     #[test]
+    fn active_client_password_mismatch_reports_startup_error() {
+        let args = client_args("client-secret", ProxyMode::NativeHttp);
+        let config = FileConfig {
+            server: Some(ServerConfig {
+                password: Some("server-secret".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_active_client_credentials(&args, &config)
+            .expect_err("password mismatch should fail before network startup")
+            .to_string();
+        assert!(err.contains("client password"), "{err}");
+        assert!(err.contains("server.password"), "{err}");
+        assert!(err.contains("same config"), "{err}");
+    }
+
+    #[test]
+    fn active_server_password_mismatch_reports_startup_error() {
+        let args = server_args("server-secret", ProxyMode::DazeBaboon);
+        let config = FileConfig {
+            client: Some(ClientConfig {
+                mode: Some(ProxyMode::DazeBaboon),
+                password: Some("client-secret".to_owned()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_active_server_credentials(&args, &config)
+            .expect_err("password mismatch should fail before network startup")
+            .to_string();
+        assert!(err.contains("server password"), "{err}");
+        assert!(err.contains("client.password"), "{err}");
+        assert!(err.contains("same config"), "{err}");
+    }
+
+    #[test]
+    fn wg_peer_public_key_mismatch_reports_startup_error() {
+        let client_private = key([0x11; 32]);
+        let server_private = key([0x22; 32]);
+        let client_public = public_key_from_private_key(&client_private).unwrap();
+        let wrong_server_public = public_key_from_private_key(&key([0x33; 32])).unwrap();
+
+        let args = WgClientArgs {
+            private_key: client_private,
+            peer_public_key: wrong_server_public,
+            ..Default::default()
+        };
+        let config = FileConfig {
+            server: Some(ServerConfig {
+                mode: Some(ProxyMode::Wg),
+                wg: Some(WgServerConfig {
+                    private_key: Some(server_private),
+                    peer_public_key: Some(client_public),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_wg_client_pair(&args, config.server.as_ref())
+            .expect_err("WG peer key mismatch should fail before network startup")
+            .to_string();
+        assert!(err.contains("client.wg.peer_public_key"), "{err}");
+        assert!(err.contains("server.wg.private_key"), "{err}");
+        assert!(err.contains("regenerate the WG config"), "{err}");
+    }
+
+    #[test]
     fn load_rejects_deprecated_top_level_wg_sections() {
         let suffix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -945,5 +1187,57 @@ wg_client:
             "{message}"
         );
         assert!(message.contains("client.wg"), "{message}");
+    }
+
+    fn client_args(password: &str, mode: ProxyMode) -> ClientArgs {
+        ClientArgs {
+            listen: "127.0.0.1:1080".to_owned(),
+            server: "127.0.0.1:1443".to_owned(),
+            server_name: None,
+            ca_cert: None,
+            mode,
+            password: password.to_owned(),
+            path: "/connect".to_owned(),
+            mux_path: "/mux".to_owned(),
+            mux: false,
+            filter: FilterMode::Proxy,
+            rule_file: None,
+            cidr_file: None,
+            user_agent: "Mozilla/5.0".to_owned(),
+            handshake_timeout_secs: 10,
+            connect_timeout_secs: 10,
+            max_header_size: 8 * 1024,
+            system_proxy: false,
+            system_proxy_services: Vec::new(),
+            tun_dns_redirect_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            tun_dns_upstream: None,
+            wg: WgClientArgs::default(),
+        }
+    }
+
+    fn server_args(password: &str, mode: ProxyMode) -> ServerArgs {
+        ServerArgs {
+            listen: "0.0.0.0:1443".to_owned(),
+            cert: None,
+            key: None,
+            mode,
+            password: password.to_owned(),
+            path: "/connect".to_owned(),
+            mux_path: "/mux".to_owned(),
+            auth_window_secs: 120,
+            handshake_timeout_secs: 10,
+            connect_timeout_secs: 10,
+            max_header_size: 16 * 1024,
+            max_tunnel_body_size: 8 * 1024,
+            allow_private_targets: false,
+            fallback_url: "https://www.qq.com".to_owned(),
+            fallback_timeout_secs: 15,
+            max_fallback_body_size: 1024 * 1024,
+            wg: WgServerArgs::default(),
+        }
+    }
+
+    fn key(bytes: [u8; 32]) -> String {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
     }
 }

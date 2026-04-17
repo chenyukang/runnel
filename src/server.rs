@@ -1,5 +1,5 @@
 use crate::{
-    auth::{AuthProof, ReplayProtector},
+    auth::{AUTH_FAILURE_BODY, AUTH_FAILURE_HINT, AuthProof, ReplayProtector},
     http,
     mode::ProxyMode,
     netlog, tls, traffic, udp, wg,
@@ -323,11 +323,15 @@ where
         signature: payload.signature,
     };
 
-    if replay
-        .validate(&args.password, "POST", &args.path, &target, &proof)
-        .is_err()
-    {
-        return Ok(None);
+    if let Err(err) = replay.validate(&args.password, "POST", &args.path, &target, &proof) {
+        stream
+            .write_all(&http::build_error_response(
+                401,
+                "Unauthorized",
+                AUTH_FAILURE_BODY,
+            ))
+            .await?;
+        bail!("native-http authentication failed: {err}; {AUTH_FAILURE_HINT}");
     }
 
     Ok(Some(AuthorizedTunnel {
@@ -588,4 +592,71 @@ fn is_private_v6(addr: Ipv6Addr) -> bool {
         || addr.is_unique_local()
         || addr.is_unicast_link_local()
         || addr.is_unspecified()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wg::WgServerArgs;
+    use tokio::io::{AsyncReadExt, duplex};
+
+    #[tokio::test]
+    async fn tunnel_auth_failure_writes_unauthorized_response() {
+        let proof = AuthProof::sign("client-secret", "POST", "/connect", "example.com:443")
+            .expect("proof should sign");
+        let payload = http::TunnelPayload {
+            target: "example.com:443".to_owned(),
+            transport: http::TunnelTransport::Tcp,
+            timestamp: proof.timestamp,
+            nonce: proof.nonce,
+            signature: proof.signature,
+        };
+        let body = serde_json::to_vec(&payload).expect("payload should serialize");
+        let args = ServerArgs {
+            listen: "127.0.0.1:0".to_owned(),
+            cert: None,
+            key: None,
+            mode: ProxyMode::NativeHttp,
+            password: "server-secret".to_owned(),
+            path: "/connect".to_owned(),
+            mux_path: "/mux".to_owned(),
+            auth_window_secs: 120,
+            handshake_timeout_secs: 10,
+            connect_timeout_secs: 10,
+            max_header_size: 16 * 1024,
+            max_tunnel_body_size: 8 * 1024,
+            allow_private_targets: false,
+            fallback_url: "https://www.qq.com".to_owned(),
+            fallback_timeout_secs: 15,
+            max_fallback_body_size: 1024 * 1024,
+            wg: WgServerArgs::default(),
+        };
+        let replay = ReplayProtector::new(Duration::from_secs(args.auth_window_secs));
+        let (mut server_io, mut client_io) = duplex(4096);
+
+        let err = authorize_tunnel_request(
+            &mut server_io,
+            http::TunnelRequestHead {
+                content_length: Some(body.len()),
+                chunked: false,
+            },
+            &body,
+            &args,
+            &replay,
+        )
+        .await
+        .expect_err("wrong password should reject tunnel auth")
+        .to_string();
+        assert!(err.contains(AUTH_FAILURE_HINT), "{err}");
+        drop(server_io);
+
+        let mut response = Vec::new();
+        client_io.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 401 Unauthorized"),
+            "{response}"
+        );
+        assert!(response.contains(AUTH_FAILURE_BODY.trim()), "{response}");
+    }
 }

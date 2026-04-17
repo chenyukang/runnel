@@ -279,19 +279,19 @@ async fn main() -> Result<()> {
         if let Some((name, sub_matches)) = matches.subcommand() {
             match (&mut cli.command, name) {
                 (Commands::Client(args), "client") => {
-                    config::apply_client(args, &file_config, sub_matches, &base_dir);
+                    config::apply_client(args, &file_config, sub_matches, &base_dir)?;
                 }
                 (Commands::Server(args), "server") => {
-                    config::apply_server(args, &file_config, sub_matches, &base_dir);
+                    config::apply_server(args, &file_config, sub_matches, &base_dir)?;
                 }
                 (Commands::Tun(args), "tun") => {
-                    config::apply_tun(args, &file_config, sub_matches, &base_dir);
+                    config::apply_tun(args, &file_config, sub_matches, &base_dir)?;
                 }
                 (Commands::WgClient(args), "wg-client") => {
-                    config::apply_wg_client(args, &file_config, sub_matches, &base_dir);
+                    config::apply_wg_client(args, &file_config, sub_matches, &base_dir)?;
                 }
                 (Commands::WgServer(args), "wg-server") => {
-                    config::apply_wg_server(args, &file_config, sub_matches, &base_dir);
+                    config::apply_wg_server(args, &file_config, sub_matches, &base_dir)?;
                 }
                 (Commands::WgConfig(_), "wg-config")
                 | (Commands::WgKeygen(_), "wg-keygen")
