@@ -43,6 +43,8 @@ pipit wg-config \
   --server-tunnel-ip 10.8.0.1 \
   --dns 1.1.1.1 \
   --dns-capture \
-  --exclude-lan \
+  --direct-ip "10.*" \
+  --direct-ip "172.16.0.0/12" \
+  --direct-ip "192.168.*" \
   --nat-out-interface eth0
 ```

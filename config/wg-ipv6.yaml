@@ -9,6 +9,11 @@ tui: true
 
 client:
   mode: wg
+  ip_rules:
+    direct:
+      - "fc00::/7"
+      - "fe80::/10"
+      - "ff00::/8"
   wg:
     endpoint: "[SERVER-IPv6]:51820"
     private_key: REPLACE_WITH_CLIENT_PRIVATE_KEY
@@ -19,9 +24,6 @@ client:
     persistent_keepalive_secs: 25
     dns: 2606:4700:4700::1111
     dns_capture: true
-    allowed_ips:
-      - ::/0
-    exclude_lan: true
 
 server:
   mode: wg

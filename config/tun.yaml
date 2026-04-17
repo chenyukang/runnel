@@ -16,6 +16,18 @@ client:
   user_agent: Mozilla/5.0
   handshake_timeout_secs: 10
   connect_timeout_secs: 10
+  domain_rules:
+    direct:
+      - "*.qq.com"
+      - "*.cn"
+    block:
+      - "*.xxx.com"
+  ip_rules:
+    direct:
+      - "128.33.*"
+      - "0.3.0.2/16"
+    block:
+      - "12.9.*.0"
 
 tun:
   device: auto
@@ -23,4 +35,3 @@ tun:
   helper_ready_delay_ms: 1200
   print_hooks: false
   dry_run: false
-

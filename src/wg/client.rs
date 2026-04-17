@@ -1,6 +1,5 @@
 use super::{
     DEFAULT_TUNNEL_MTU, WgRuntimeConfig, create_device_handle, default_client_allowed_ips_for,
-    default_client_excluded_lan_ips,
     dns::start_dns_capture,
     hooks::{
         HookGuard, effective_hook_plan, log_plan_lines, plan_client_hooks, print_plan, run_hooks,
@@ -53,12 +52,10 @@ pub struct WgClientArgs {
     pub dns: Option<IpAddr>,
     #[arg(long)]
     pub dns_capture: bool,
-    #[arg(long = "allowed-ip")]
-    pub allowed_ips: Vec<String>,
-    #[arg(long = "exclude-ip")]
-    pub excluded_ips: Vec<String>,
-    #[arg(long)]
-    pub exclude_lan: bool,
+    #[arg(skip)]
+    pub proxy_ips: Vec<String>,
+    #[arg(skip)]
+    pub direct_ips: Vec<String>,
     #[arg(long)]
     pub up: Vec<String>,
     #[arg(long)]
@@ -85,9 +82,8 @@ impl Default for WgClientArgs {
             persistent_keepalive_secs: None,
             dns: None,
             dns_capture: false,
-            allowed_ips: Vec::new(),
-            excluded_ips: Vec::new(),
-            exclude_lan: false,
+            proxy_ips: Vec::new(),
+            direct_ips: Vec::new(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -268,11 +264,11 @@ fn plan_lines(
     lines.push(format!("  tunnel_ip: {}", runtime.tunnel_ip));
     lines.push(format!("  peer_tunnel_ip: {}", runtime.peer_tunnel_ip));
     lines.push(format!(
-        "  allowed_ips: {}",
+        "  tunnel_routes: {}",
         runtime.peer_allowed_ips.join(", ")
     ));
     lines.push(format!(
-        "  excluded_ips: {}",
+        "  ip_rules.direct: {}",
         if runtime.excluded_ips.is_empty() {
             "-".to_owned()
         } else {
@@ -347,10 +343,10 @@ impl WgClientArgs {
             peer_public_key: parse_key("wg client peer_public_key", &self.peer_public_key)?,
             peer_allowed_ips: normalize_allowed_ips(
                 "wg client",
-                &self.allowed_ips,
+                &self.proxy_ips,
                 &default_client_allowed_ips_for(self.tunnel_ip),
             )?,
-            excluded_ips: self.normalized_excluded_ips()?,
+            excluded_ips: self.normalized_direct_ips()?,
         };
         runtime.validate("wg client")?;
 
@@ -372,14 +368,11 @@ impl WgClientArgs {
         Ok(runtime)
     }
 
-    fn normalized_excluded_ips(&self) -> Result<Vec<String>> {
-        let mut excluded = normalize_allowed_ips("wg client exclude", &self.excluded_ips, &[])?;
-        if self.exclude_lan {
-            excluded.extend(default_client_excluded_lan_ips());
-        }
-        excluded.sort();
-        excluded.dedup();
-        Ok(excluded)
+    fn normalized_direct_ips(&self) -> Result<Vec<String>> {
+        let mut direct = normalize_allowed_ips("wg client direct", &self.direct_ips, &[])?;
+        direct.sort();
+        direct.dedup();
+        Ok(direct)
     }
 }
 
@@ -415,9 +408,8 @@ mod tests {
             persistent_keepalive_secs: Some(25),
             dns: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
             dns_capture: false,
-            allowed_ips: Vec::new(),
-            excluded_ips: Vec::new(),
-            exclude_lan: false,
+            proxy_ips: Vec::new(),
+            direct_ips: Vec::new(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -436,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn client_args_preserve_custom_allowed_ips() {
+    fn client_args_preserve_custom_proxy_ips() {
         let args = WgClientArgs {
             bind: "0.0.0.0:0".to_owned(),
             endpoint: "198.51.100.10:51820".to_owned(),
@@ -449,9 +441,8 @@ mod tests {
             persistent_keepalive_secs: Some(25),
             dns: None,
             dns_capture: false,
-            allowed_ips: vec!["203.0.113.0/24".to_owned()],
-            excluded_ips: Vec::new(),
-            exclude_lan: false,
+            proxy_ips: vec!["203.0.113.0/24".to_owned()],
+            direct_ips: Vec::new(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -464,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn client_args_collect_excluded_ips_and_lan_excludes() {
+    fn client_args_collect_direct_ips() {
         let args = WgClientArgs {
             bind: "0.0.0.0:0".to_owned(),
             endpoint: "198.51.100.10:51820".to_owned(),
@@ -477,9 +468,8 @@ mod tests {
             persistent_keepalive_secs: Some(25),
             dns: None,
             dns_capture: false,
-            allowed_ips: Vec::new(),
-            excluded_ips: vec!["100.64.0.0/10".to_owned()],
-            exclude_lan: true,
+            proxy_ips: Vec::new(),
+            direct_ips: vec!["100.64.0.0/10".to_owned()],
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -489,7 +479,6 @@ mod tests {
 
         let runtime = args.resolve().unwrap();
         assert!(runtime.excluded_ips.contains(&"100.64.0.0/10".to_owned()));
-        assert!(runtime.excluded_ips.contains(&"192.168.0.0/16".to_owned()));
     }
 
     #[test]
@@ -506,9 +495,8 @@ mod tests {
             persistent_keepalive_secs: Some(25),
             dns: None,
             dns_capture: true,
-            allowed_ips: Vec::new(),
-            excluded_ips: Vec::new(),
-            exclude_lan: false,
+            proxy_ips: Vec::new(),
+            direct_ips: Vec::new(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -534,9 +522,8 @@ mod tests {
             persistent_keepalive_secs: Some(25),
             dns: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
             dns_capture: true,
-            allowed_ips: vec!["203.0.113.0/24".to_owned()],
-            excluded_ips: Vec::new(),
-            exclude_lan: false,
+            proxy_ips: vec!["203.0.113.0/24".to_owned()],
+            direct_ips: Vec::new(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: true,

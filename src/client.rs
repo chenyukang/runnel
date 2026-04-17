@@ -55,6 +55,10 @@ pub struct ClientArgs {
     pub rule_file: Option<PathBuf>,
     #[arg(long)]
     pub cidr_file: Option<PathBuf>,
+    #[arg(skip)]
+    pub domain_rules: route::RouteRuleConfig,
+    #[arg(skip)]
+    pub ip_rules: route::RouteRuleConfig,
     #[arg(long, default_value = "Mozilla/5.0")]
     pub user_agent: String,
     #[arg(long, default_value_t = 10)]

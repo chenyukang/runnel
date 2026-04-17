@@ -161,18 +161,6 @@ pub(crate) fn default_client_allowed_ips_for(tunnel_ip: IpAddr) -> Vec<String> {
     }]
 }
 
-pub(crate) fn default_client_excluded_lan_ips() -> Vec<String> {
-    vec![
-        "10.0.0.0/8".to_owned(),
-        "172.16.0.0/12".to_owned(),
-        "192.168.0.0/16".to_owned(),
-        "169.254.0.0/16".to_owned(),
-        "fc00::/7".to_owned(),
-        "fe80::/10".to_owned(),
-        "ff00::/8".to_owned(),
-    ]
-}
-
 pub(crate) fn default_server_allowed_ips(peer_tunnel_ip: IpAddr) -> Vec<String> {
     vec![match peer_tunnel_ip {
         IpAddr::V4(ip) => format!("{ip}/32"),

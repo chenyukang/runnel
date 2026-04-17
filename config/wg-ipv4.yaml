@@ -9,6 +9,27 @@ tui: true
 
 client:
   mode: wg
+  ip_rules:
+    direct:
+      - "10.*"
+      - "172.16.*"
+      - "172.17.*"
+      - "172.18.*"
+      - "172.19.*"
+      - "172.20.*"
+      - "172.21.*"
+      - "172.22.*"
+      - "172.23.*"
+      - "172.24.*"
+      - "172.25.*"
+      - "172.26.*"
+      - "172.27.*"
+      - "172.28.*"
+      - "172.29.*"
+      - "172.30.*"
+      - "172.31.*"
+      - "192.168.*"
+      - "169.254.*"
   wg:
     endpoint: SERVER-IP:51820
     private_key: REPLACE_WITH_CLIENT_PRIVATE_KEY
@@ -19,9 +40,6 @@ client:
     persistent_keepalive_secs: 25
     dns: 1.1.1.1
     dns_capture: true
-    allowed_ips:
-      - 0.0.0.0/0
-    exclude_lan: true
 
 server:
   mode: wg

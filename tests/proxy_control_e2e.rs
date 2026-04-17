@@ -146,6 +146,8 @@ async fn start_client(
         filter,
         rule_file,
         cidr_file: None,
+        domain_rules: Default::default(),
+        ip_rules: Default::default(),
         user_agent: "pipit-test".to_owned(),
         handshake_timeout_secs: 10,
         connect_timeout_secs: 1,

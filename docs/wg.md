@@ -18,7 +18,9 @@ pipit wg-config \
   --server-tunnel-ip 10.8.0.1 \
   --dns 1.1.1.1 \
   --dns-capture \
-  --exclude-lan \
+  --direct-ip "10.*" \
+  --direct-ip "172.16.0.0/12" \
+  --direct-ip "192.168.*" \
   --nat-out-interface eth0 > pipit.wg.yaml
 ```
 
@@ -100,17 +102,15 @@ handshake state after startup and logs a warning if no successful handshake is
 observed within 30 seconds. Set `server.wg.handshake_watchdog_secs: 0` to
 disable that warning for intentionally idle servers.
 
-## Split Tunnel And Exclusions
+## Split Tunnel Rules
 
-Only proxy specific CIDRs:
+WG mode uses the same `ip_rules` shape as other client modes. Put routing rules
+under `client:`, not under `client.wg`. Proxy is the default, so a minimal WG
+client does not need any route rules:
 
 ```yaml
 client:
   mode: wg
-  wg:
-    allowed_ips:
-      - 203.0.113.0/24
-      - 198.18.0.2/32
 ```
 
 Full tunnel but keep private LAN routes local:
@@ -118,33 +118,36 @@ Full tunnel but keep private LAN routes local:
 ```yaml
 client:
   mode: wg
-  wg:
-    allowed_ips:
-      - 0.0.0.0/0
-    exclude_lan: true
+  ip_rules:
+    direct:
+      - "10.*"
+      - "172.16.*"
+      - "172.17.*"
+      - "172.18.*"
+      - "172.19.*"
+      - "172.20.*"
+      - "172.21.*"
+      - "172.22.*"
+      - "172.23.*"
+      - "172.24.*"
+      - "172.25.*"
+      - "172.26.*"
+      - "172.27.*"
+      - "172.28.*"
+      - "172.29.*"
+      - "172.30.*"
+      - "172.31.*"
+      - "192.168.*"
+      - "169.254.*"
 ```
 
-Full tunnel but exclude explicit CIDRs:
+For IPv6-only tunnel addresses, the default proxy route is IPv6. To keep common
+local IPv6 ranges direct, add `fc00::/7`, `fe80::/10`, and `ff00::/8` under
+`ip_rules.direct`.
 
-```yaml
-client:
-  mode: wg
-  wg:
-    allowed_ips:
-      - 0.0.0.0/0
-    excluded_ips:
-      - 192.168.0.0/16
-      - 100.64.0.0/10
-```
-
-`exclude_lan` currently excludes `10.0.0.0/8`, `172.16.0.0/12`,
-`192.168.0.0/16`, and `169.254.0.0/16` from the client-side auto routes.
-
-For IPv6-only tunnel addresses, the default client allowed route becomes
-`::/0`, internally installed as `::/1` and `8000::/1`. `exclude_lan` also
-excludes `fc00::/7`, `fe80::/10`, and `ff00::/8` for IPv6 routes. Mixing IPv4
-tunnel addresses with IPv6 `allowed_ips` or IPv6 tunnel addresses with IPv4
-`allowed_ips` requires explicit custom hooks for now.
+For WG, `ip_rules.direct` becomes local-route exclusions from the default
+tunnel route. `domain_rules` and `ip_rules.block` are parsed, but WG cannot
+enforce them yet without DNS-driven dynamic routes or firewall/blackhole hooks.
 
 ## DNS Domain Capture
 

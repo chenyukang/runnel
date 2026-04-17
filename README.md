@@ -115,7 +115,9 @@ running the command:
   --server-tunnel-ip 10.8.0.1 \
   --dns 1.1.1.1 \
   --dns-capture \
-  --exclude-lan \
+  --direct-ip "10.*" \
+  --direct-ip "172.16.0.0/12" \
+  --direct-ip "192.168.*" \
   --nat-out-interface eth0 > pipit.wg.yaml
 ```
 
@@ -285,6 +287,35 @@ Important limits:
 The SOCKS client can decide per target whether to connect directly, proxy
 remotely, or block.
 
+Inline YAML rules are the preferred format:
+
+```yaml
+client:
+  mode: native-http
+  domain_rules:
+    direct:
+      - "*.qq.com"
+      - "*.cn"
+    block:
+      - "*.xxx.com"
+  ip_rules:
+    direct:
+      - "128.33.*"
+      - "0.3.0.2/16"
+    block:
+      - "12.9.*.0"
+```
+
+`domain_rules` use case-insensitive glob matching. A pattern like `*.qq.com`
+matches both `qq.com` and subdomains such as `img.qq.com`. `ip_rules` accept
+CIDRs, IP literals, and IPv4 wildcards: `128.33.*` becomes `128.33.0.0/16`,
+`128.33.2.*` becomes `128.33.2.0/24`, and `12.9.*.0` expands to the matching
+host routes. Inline rules automatically enable `client.filter: rule` unless
+`client.filter` is explicitly set. Put rule blocks under `client:` because they
+describe client-side routing behavior. Quote wildcard patterns in YAML because
+unquoted `*` starts a YAML alias. If `client.filter` is explicitly set to
+`proxy` or `direct`, only `block` rules are still honored.
+
 ```bash
 PIPIT_PASSWORD='replace-me' ./target/release/pipit client \
   --mode native-http \
@@ -319,6 +350,13 @@ L 192.168.0.0/16
 R 1.1.1.0/24
 B 203.0.113.0/24
 ```
+
+Native HTTP, native mux, and Daze client modes use the same rule engine. `tun`
+currently forces `client.filter: proxy` to avoid direct-route loops, so direct
+rules are not used there, but block rules still apply. WG mode can map common
+`ip_rules.direct` entries to WG route exclusions while keeping proxy as the
+default route; WG domain rules and block rules need DNS-driven dynamic routes
+or firewall hooks and are not enforced yet.
 
 ## Config Files
 

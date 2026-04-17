@@ -4,12 +4,13 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgMatches, parser::ValueSource};
 use serde::Deserialize;
 use serde_yaml::Value;
+use tracing::warn;
 
 use crate::{
     cert::CertArgs,
     client::ClientArgs,
     mode::ProxyMode,
-    proxy::route::FilterMode,
+    proxy::route::{self, FilterMode, RouteRuleConfig},
     server::ServerArgs,
     tun::TunArgs,
     wg::{client::WgClientArgs, keys::public_key_from_private_key, server::WgServerArgs},
@@ -24,6 +25,8 @@ pub struct FileConfig {
     pub pid_file: Option<PathBuf>,
     pub tui: Option<bool>,
     pub daemon: Option<bool>,
+    pub domain_rules: Option<RouteRuleConfig>,
+    pub ip_rules: Option<RouteRuleConfig>,
     pub client: Option<ClientConfig>,
     pub server: Option<ServerConfig>,
     pub tun: Option<TunConfig>,
@@ -45,6 +48,8 @@ pub struct ClientConfig {
     pub filter: Option<FilterMode>,
     pub rule_file: Option<PathBuf>,
     pub cidr_file: Option<PathBuf>,
+    pub domain_rules: Option<RouteRuleConfig>,
+    pub ip_rules: Option<RouteRuleConfig>,
     pub user_agent: Option<String>,
     pub handshake_timeout_secs: Option<u64>,
     pub connect_timeout_secs: Option<u64>,
@@ -112,9 +117,6 @@ pub struct WgClientConfig {
     pub persistent_keepalive_secs: Option<u16>,
     pub dns: Option<std::net::IpAddr>,
     pub dns_capture: Option<bool>,
-    pub allowed_ips: Option<Vec<String>>,
-    pub excluded_ips: Option<Vec<String>>,
-    pub exclude_lan: Option<bool>,
     pub up: Option<Vec<String>>,
     pub down: Option<Vec<String>>,
     pub print_hooks: Option<bool>,
@@ -285,6 +287,13 @@ pub fn apply_client(
         should_override(matches, "cidr_file"),
         base_dir,
     );
+    let domain_rules = merged_route_rules(&config.domain_rules, &client.domain_rules);
+    let ip_rules = merged_route_rules(&config.ip_rules, &client.ip_rules);
+    args.domain_rules = domain_rules.clone();
+    args.ip_rules = ip_rules.clone();
+    if should_enable_rule_mode_for_inline_rules(args, client, matches, &domain_rules, &ip_rules) {
+        args.filter = FilterMode::Rule;
+    }
     maybe_assign(
         &mut args.user_agent,
         &client.user_agent,
@@ -317,6 +326,9 @@ pub fn apply_client(
     );
     if let Some(wg) = &client.wg {
         apply_wg_client_config(&mut args.wg, wg, |_| true);
+    }
+    if matches!(args.effective_mode()?, ProxyMode::Wg) {
+        apply_common_route_rules_to_wg(&mut args.wg, &domain_rules, &ip_rules)?;
     }
     validate_active_client_credentials(args, config)
 }
@@ -485,6 +497,9 @@ pub fn apply_wg_client(
     };
 
     apply_wg_client_config(args, wg_client, |id| should_override(_matches, id));
+    let domain_rules = merged_route_rules(&config.domain_rules, &client.domain_rules);
+    let ip_rules = merged_route_rules(&config.ip_rules, &client.ip_rules);
+    apply_common_route_rules_to_wg(args, &domain_rules, &ip_rules)?;
     validate_wg_client_pair(args, config.server.as_ref())
 }
 
@@ -552,21 +567,6 @@ fn apply_wg_client_config(
         &mut args.dns_capture,
         &wg_client.dns_capture,
         should_apply("dns_capture"),
-    );
-    maybe_assign(
-        &mut args.allowed_ips,
-        &wg_client.allowed_ips,
-        should_apply("allowed_ips"),
-    );
-    maybe_assign(
-        &mut args.excluded_ips,
-        &wg_client.excluded_ips,
-        should_apply("excluded_ips"),
-    );
-    maybe_assign(
-        &mut args.exclude_lan,
-        &wg_client.exclude_lan,
-        should_apply("exclude_lan"),
     );
     maybe_assign(&mut args.up, &wg_client.up, should_apply("up"));
     maybe_assign(&mut args.down, &wg_client.down, should_apply("down"));
@@ -642,6 +642,77 @@ fn apply_wg_server_config(
         &wg_server.handshake_watchdog_secs,
         should_apply("handshake_watchdog_secs"),
     );
+}
+
+fn should_enable_rule_mode_for_inline_rules(
+    args: &ClientArgs,
+    client: &ClientConfig,
+    matches: &ArgMatches,
+    domain_rules: &RouteRuleConfig,
+    ip_rules: &RouteRuleConfig,
+) -> bool {
+    if !matches!(args.filter, FilterMode::Proxy) || client.filter.is_some() {
+        return false;
+    }
+    if !should_override(matches, "filter") {
+        return false;
+    }
+    !domain_rules.is_empty() || !ip_rules.is_empty()
+}
+
+fn apply_common_route_rules_to_wg(
+    args: &mut WgClientArgs,
+    domain_rules: &RouteRuleConfig,
+    ip_rules: &RouteRuleConfig,
+) -> Result<()> {
+    if !ip_rules.is_empty() {
+        let direct = route::parse_ip_rule_entries("client.ip_rules.direct", &ip_rules.direct)?;
+        append_unique(
+            &mut args.direct_ips,
+            direct.into_iter().map(|rule| rule.to_string()),
+        );
+
+        let proxy = route::parse_ip_rule_entries("client.ip_rules.proxy", &ip_rules.proxy)?;
+        append_unique(
+            &mut args.proxy_ips,
+            proxy.into_iter().map(|rule| rule.to_string()),
+        );
+
+        if !ip_rules.block.is_empty() {
+            warn!(
+                "client.ip_rules.block is not enforced by wg mode yet; use SOCKS modes for rule-level blocking"
+            );
+        }
+    }
+
+    if !domain_rules.is_empty() {
+        warn!(
+            "client.domain_rules are currently enforced by SOCKS modes only; wg domain split requires DNS-driven dynamic routes"
+        );
+    }
+
+    Ok(())
+}
+
+fn merged_route_rules(
+    global: &Option<RouteRuleConfig>,
+    local: &Option<RouteRuleConfig>,
+) -> RouteRuleConfig {
+    let mut merged = global.clone().unwrap_or_default();
+    if let Some(local) = local {
+        merged.direct.extend(local.direct.iter().cloned());
+        merged.proxy.extend(local.proxy.iter().cloned());
+        merged.block.extend(local.block.iter().cloned());
+    }
+    merged
+}
+
+fn append_unique(target: &mut Vec<String>, values: impl IntoIterator<Item = String>) {
+    for value in values {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
 }
 
 fn validate_active_client_credentials(args: &ClientArgs, config: &FileConfig) -> Result<()> {
@@ -830,14 +901,14 @@ fn resolve_path(base_dir: &Path, path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientConfig, FileConfig, ServerConfig, WgServerConfig, load, maybe_assign_optional,
-        resolve_path, validate_active_client_credentials, validate_active_server_credentials,
-        validate_wg_client_pair,
+        ClientConfig, FileConfig, ServerConfig, WgServerConfig, apply_common_route_rules_to_wg,
+        load, maybe_assign_optional, resolve_path, validate_active_client_credentials,
+        validate_active_server_credentials, validate_wg_client_pair,
     };
     use crate::{
         client::ClientArgs,
         mode::ProxyMode,
-        proxy::route::FilterMode,
+        proxy::route::{FilterMode, RouteRuleConfig},
         server::ServerArgs,
         wg::{client::WgClientArgs, keys::public_key_from_private_key, server::WgServerArgs},
     };
@@ -854,10 +925,28 @@ telemetry_sock: run/pipit.sock
 pid_file: run/pipit.pid
 tui: true
 daemon: true
+domain_rules:
+  block:
+    - "*.global.test"
+ip_rules:
+  direct:
+    - "10.*"
 client:
   server: 127.0.0.1:1443
   mode: native-mux
   rule_file: rules/rule.ls
+  domain_rules:
+    direct:
+      - "*.qq.com"
+      - "*.cn"
+    block:
+      - "*.xxx.com"
+  ip_rules:
+    direct:
+      - "128.33.*"
+      - "0.3.0.2/16"
+    block:
+      - "12.9.*.0"
   system_proxy: true
   system_proxy_services:
     - Wi-Fi
@@ -867,9 +956,6 @@ client:
     peer_tunnel_ip: 10.8.0.1
     dns: 1.1.1.1
     dns_capture: true
-    excluded_ips:
-      - 192.168.0.0/16
-    exclude_lan: true
     up:
       - ip route replace 203.0.113.0/24 dev pipitwg0
     print_hooks: true
@@ -903,12 +989,39 @@ server:
         assert_eq!(parsed.tui, Some(true));
         assert_eq!(parsed.daemon, Some(true));
         assert_eq!(
+            parsed
+                .domain_rules
+                .as_ref()
+                .map(|rules| rules.block.clone()),
+            Some(vec!["*.global.test".to_owned()])
+        );
+        assert_eq!(
+            parsed.ip_rules.as_ref().map(|rules| rules.direct.clone()),
+            Some(vec!["10.*".to_owned()])
+        );
+        assert_eq!(
             parsed.client.as_ref().and_then(|cfg| cfg.server.as_deref()),
             Some("127.0.0.1:1443")
         );
         assert_eq!(
             parsed.client.as_ref().and_then(|cfg| cfg.system_proxy),
             Some(true)
+        );
+        assert_eq!(
+            parsed
+                .client
+                .as_ref()
+                .and_then(|cfg| cfg.domain_rules.as_ref())
+                .map(|rules| rules.direct.clone()),
+            Some(vec!["*.qq.com".to_owned(), "*.cn".to_owned()])
+        );
+        assert_eq!(
+            parsed
+                .client
+                .as_ref()
+                .and_then(|cfg| cfg.ip_rules.as_ref())
+                .map(|rules| rules.direct.clone()),
+            Some(vec!["128.33.*".to_owned(), "0.3.0.2/16".to_owned()])
         );
         assert_eq!(
             parsed
@@ -976,23 +1089,6 @@ server:
                 .as_ref()
                 .and_then(|cfg| cfg.wg.as_ref())
                 .and_then(|cfg| cfg.skip_handshake_probe),
-            Some(true)
-        );
-        assert_eq!(
-            parsed
-                .client
-                .as_ref()
-                .and_then(|cfg| cfg.wg.as_ref())
-                .and_then(|cfg| cfg.excluded_ips.as_ref())
-                .cloned(),
-            Some(vec!["192.168.0.0/16".to_owned()])
-        );
-        assert_eq!(
-            parsed
-                .client
-                .as_ref()
-                .and_then(|cfg| cfg.wg.as_ref())
-                .and_then(|cfg| cfg.exclude_lan),
             Some(true)
         );
         assert_eq!(
@@ -1127,6 +1223,22 @@ telemetry-sock: /tmp/pipit.sock
     }
 
     #[test]
+    fn common_ip_rules_map_to_wg_route_fields() {
+        let mut args = WgClientArgs::default();
+        let domain_rules = RouteRuleConfig::default();
+        let ip_rules = RouteRuleConfig {
+            direct: vec!["128.33.*".to_owned()],
+            proxy: vec!["203.0.113.0/24".to_owned()],
+            block: Vec::new(),
+        };
+
+        apply_common_route_rules_to_wg(&mut args, &domain_rules, &ip_rules).unwrap();
+
+        assert_eq!(args.direct_ips, vec!["128.33.0.0/16"]);
+        assert_eq!(args.proxy_ips, vec!["203.0.113.0/24"]);
+    }
+
+    #[test]
     fn wg_peer_public_key_mismatch_reports_startup_error() {
         let client_private = key([0x11; 32]);
         let server_private = key([0x22; 32]);
@@ -1203,6 +1315,8 @@ wg_client:
             filter: FilterMode::Proxy,
             rule_file: None,
             cidr_file: None,
+            domain_rules: Default::default(),
+            ip_rules: Default::default(),
             user_agent: "Mozilla/5.0".to_owned(),
             handshake_timeout_secs: 10,
             connect_timeout_secs: 10,

@@ -2,7 +2,7 @@ use super::{socks5, socks5::TargetAddr, traffic};
 use crate::client::ClientArgs;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
@@ -15,6 +15,8 @@ use tokio::{
     sync::Mutex,
     time::timeout,
 };
+
+const IPV4_WILDCARD_EXPANSION_LIMIT: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -29,6 +31,24 @@ pub enum RouteDecision {
     Direct,
     Remote,
     Block,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RouteRuleConfig {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub direct: Vec<String>,
+    #[serde(alias = "remote")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub proxy: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub block: Vec<String>,
+}
+
+impl RouteRuleConfig {
+    pub fn is_empty(&self) -> bool {
+        self.direct.is_empty() && self.proxy.is_empty() && self.block.is_empty()
+    }
 }
 
 #[derive(Default)]
@@ -49,8 +69,18 @@ pub struct Router {
 
 impl Router {
     pub fn from_args(args: &ClientArgs) -> Result<Arc<Self>> {
-        let mut table = if matches!(args.filter, FilterMode::Rule) {
-            RuleTable::load(args.rule_file.as_deref(), args.cidr_file.as_deref())?
+        let should_load_inline_rules = !args.domain_rules.is_empty() || !args.ip_rules.is_empty();
+        let mut table = if matches!(args.filter, FilterMode::Rule) || should_load_inline_rules {
+            RuleTable::load(
+                matches!(args.filter, FilterMode::Rule)
+                    .then_some(args.rule_file.as_deref())
+                    .flatten(),
+                matches!(args.filter, FilterMode::Rule)
+                    .then_some(args.cidr_file.as_deref())
+                    .flatten(),
+                &args.domain_rules,
+                &args.ip_rules,
+            )?
         } else {
             RuleTable::default()
         };
@@ -67,8 +97,18 @@ impl Router {
 
     pub async fn decide(&self, target: &TargetAddr) -> Result<RouteDecision> {
         match self.mode {
-            FilterMode::Proxy => Ok(RouteDecision::Remote),
-            FilterMode::Direct => Ok(RouteDecision::Direct),
+            FilterMode::Proxy => {
+                if let Some(decision) = self.table.decide_block_only(target).await? {
+                    return Ok(decision);
+                }
+                Ok(RouteDecision::Remote)
+            }
+            FilterMode::Direct => {
+                if let Some(decision) = self.table.decide_block_only(target).await? {
+                    return Ok(decision);
+                }
+                Ok(RouteDecision::Direct)
+            }
             FilterMode::Rule => self.decide_by_rule(target).await,
         }
     }
@@ -86,7 +126,12 @@ impl Router {
 }
 
 impl RuleTable {
-    fn load(rule_file: Option<&Path>, cidr_file: Option<&Path>) -> Result<Self> {
+    fn load(
+        rule_file: Option<&Path>,
+        cidr_file: Option<&Path>,
+        domain_rules: &RouteRuleConfig,
+        ip_rules: &RouteRuleConfig,
+    ) -> Result<Self> {
         let mut table = Self::default();
         if let Some(path) = rule_file {
             table.load_rule_file(path)?;
@@ -94,7 +139,35 @@ impl RuleTable {
         if let Some(path) = cidr_file {
             table.load_cidr_file(path)?;
         }
+        table.load_domain_rules(domain_rules)?;
+        table.load_ip_rules(ip_rules)?;
         Ok(table)
+    }
+
+    fn load_domain_rules(&mut self, rules: &RouteRuleConfig) -> Result<()> {
+        validate_domain_patterns("client.domain_rules.direct", &rules.direct)?;
+        validate_domain_patterns("client.domain_rules.proxy", &rules.proxy)?;
+        validate_domain_patterns("client.domain_rules.block", &rules.block)?;
+        self.direct_globs.extend(rules.direct.iter().cloned());
+        self.remote_globs.extend(rules.proxy.iter().cloned());
+        self.block_globs.extend(rules.block.iter().cloned());
+        Ok(())
+    }
+
+    fn load_ip_rules(&mut self, rules: &RouteRuleConfig) -> Result<()> {
+        self.direct_cidrs.extend(parse_ip_rule_entries(
+            "client.ip_rules.direct",
+            &rules.direct,
+        )?);
+        self.remote_cidrs.extend(parse_ip_rule_entries(
+            "client.ip_rules.proxy",
+            &rules.proxy,
+        )?);
+        self.block_cidrs.extend(parse_ip_rule_entries(
+            "client.ip_rules.block",
+            &rules.block,
+        )?);
+        Ok(())
     }
 
     fn load_rule_file(&mut self, path: &Path) -> Result<()> {
@@ -142,7 +215,7 @@ impl RuleTable {
             if parts.len() < 2 {
                 continue;
             }
-            let cidr = parts[1].parse::<ipnet::IpNet>().with_context(|| {
+            let cidrs = parse_ip_rule_entry(parts[1]).with_context(|| {
                 format!(
                     "invalid CIDR '{}' at {}:{}",
                     parts[1],
@@ -151,9 +224,9 @@ impl RuleTable {
                 )
             })?;
             match parts[0] {
-                "L" => self.direct_cidrs.push(cidr),
-                "R" => self.remote_cidrs.push(cidr),
-                "B" => self.block_cidrs.push(cidr),
+                "L" => self.direct_cidrs.extend(cidrs),
+                "R" => self.remote_cidrs.extend(cidrs),
+                "B" => self.block_cidrs.extend(cidrs),
                 other => bail!(
                     "invalid CIDR mode '{}' at {}:{}",
                     other,
@@ -190,6 +263,21 @@ impl RuleTable {
 
         Ok(RouteDecision::Remote)
     }
+
+    async fn decide_block_only(&self, target: &TargetAddr) -> Result<Option<RouteDecision>> {
+        let host = target.host_string();
+        if matches_any(&self.block_globs, &host)? {
+            return Ok(Some(RouteDecision::Block));
+        }
+        if self.block_cidrs.is_empty() {
+            return Ok(None);
+        }
+        let addrs = resolve_target_ips(target).await?;
+        if contains_any(&self.block_cidrs, &addrs) {
+            return Ok(Some(RouteDecision::Block));
+        }
+        Ok(None)
+    }
 }
 
 pub async fn relay_direct_socks(
@@ -220,10 +308,17 @@ pub async fn relay_direct_socks(
 }
 
 fn matches_any(patterns: &[String], host: &str) -> Result<bool> {
+    let host = normalize_domain(host);
     for pattern in patterns {
-        if glob::Pattern::new(pattern)
+        let pattern = normalize_domain(pattern);
+        if let Some(suffix) = pattern.strip_prefix("*.")
+            && (host == suffix || host.ends_with(&format!(".{suffix}")))
+        {
+            return Ok(true);
+        }
+        if glob::Pattern::new(&pattern)
             .with_context(|| format!("invalid glob pattern '{pattern}'"))?
-            .matches(host)
+            .matches(&host)
         {
             return Ok(true);
         }
@@ -231,10 +326,160 @@ fn matches_any(patterns: &[String], host: &str) -> Result<bool> {
     Ok(false)
 }
 
+fn normalize_domain(value: &str) -> String {
+    value.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn validate_domain_patterns(label: &str, patterns: &[String]) -> Result<()> {
+    for pattern in patterns {
+        glob::Pattern::new(&normalize_domain(pattern))
+            .with_context(|| format!("invalid glob pattern in {label}: '{pattern}'"))?;
+    }
+    Ok(())
+}
+
 fn contains_any(cidrs: &[ipnet::IpNet], addrs: &[IpAddr]) -> bool {
     addrs
         .iter()
         .any(|addr| cidrs.iter().any(|cidr| cidr.contains(addr)))
+}
+
+pub fn parse_ip_rule_entries(label: &str, entries: &[String]) -> Result<Vec<ipnet::IpNet>> {
+    let mut cidrs = Vec::new();
+    for entry in entries {
+        cidrs.extend(
+            parse_ip_rule_entry(entry)
+                .with_context(|| format!("invalid IP rule in {label}: '{entry}'"))?,
+        );
+    }
+    Ok(cidrs)
+}
+
+fn parse_ip_rule_entry(entry: &str) -> Result<Vec<ipnet::IpNet>> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        bail!("IP rule cannot be empty");
+    }
+    if entry.contains('*') {
+        return parse_ipv4_wildcard_rule(entry);
+    }
+    if let Ok(ip) = entry.parse::<IpAddr>() {
+        let prefix = match ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        return Ok(vec![
+            ipnet::IpNet::new(ip, prefix).expect("host route prefix is valid"),
+        ]);
+    }
+    let net = entry
+        .parse::<ipnet::IpNet>()
+        .with_context(|| format!("expected CIDR, IP literal, or IPv4 wildcard, got {entry}"))?;
+    Ok(vec![truncate_net(net)])
+}
+
+fn parse_ipv4_wildcard_rule(entry: &str) -> Result<Vec<ipnet::IpNet>> {
+    if entry.contains('/') || entry.contains(':') {
+        bail!("IPv4 wildcard rules cannot contain CIDR prefixes or IPv6 separators");
+    }
+
+    let parts = entry.split('.').collect::<Vec<_>>();
+    if parts.is_empty() || parts.len() > 4 {
+        bail!("IPv4 wildcard must contain between 1 and 4 octets");
+    }
+
+    let mut pattern = [None; 4];
+    let mut has_concrete_after_wildcard = false;
+    let mut saw_wildcard = false;
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            bail!("IPv4 wildcard contains an empty octet");
+        }
+        if *part == "*" {
+            saw_wildcard = true;
+            continue;
+        }
+        if saw_wildcard {
+            has_concrete_after_wildcard = true;
+        }
+        pattern[index] = Some(
+            part.parse::<u8>()
+                .with_context(|| format!("IPv4 wildcard octet '{part}' is not in 0..=255"))?,
+        );
+    }
+
+    if has_concrete_after_wildcard && parts.len() != 4 {
+        bail!("non-suffix IPv4 wildcards must contain exactly 4 octets");
+    }
+
+    if is_suffix_wildcard(&pattern) {
+        let concrete = pattern.iter().filter(|part| part.is_some()).count();
+        let mut octets = [0u8; 4];
+        for (index, part) in pattern.iter().enumerate() {
+            if let Some(part) = part {
+                octets[index] = *part;
+            }
+        }
+        let prefix = u8::try_from(concrete * 8).expect("prefix is at most 32");
+        let net = ipnet::Ipv4Net::new(Ipv4Addr::from(octets), prefix)
+            .with_context(|| format!("invalid IPv4 wildcard rule {entry}"))?;
+        return Ok(vec![ipnet::IpNet::V4(net.trunc())]);
+    }
+
+    let wildcard_count = pattern.iter().filter(|part| part.is_none()).count();
+    let expansion_count = 256usize
+        .checked_pow(u32::try_from(wildcard_count).expect("wildcard count fits"))
+        .context("IPv4 wildcard expansion overflowed")?;
+    if expansion_count > IPV4_WILDCARD_EXPANSION_LIMIT {
+        bail!(
+            "IPv4 wildcard expands to {expansion_count} host routes, above limit {IPV4_WILDCARD_EXPANSION_LIMIT}"
+        );
+    }
+
+    let mut routes = Vec::with_capacity(expansion_count);
+    expand_ipv4_wildcard(&pattern, 0, [0u8; 4], &mut routes);
+    Ok(routes)
+}
+
+fn is_suffix_wildcard(pattern: &[Option<u8>; 4]) -> bool {
+    let Some(first_wildcard) = pattern.iter().position(Option::is_none) else {
+        return false;
+    };
+    pattern[first_wildcard..].iter().all(Option::is_none)
+}
+
+fn expand_ipv4_wildcard(
+    pattern: &[Option<u8>; 4],
+    index: usize,
+    mut octets: [u8; 4],
+    routes: &mut Vec<ipnet::IpNet>,
+) {
+    if index == octets.len() {
+        routes.push(ipnet::IpNet::V4(
+            ipnet::Ipv4Net::new(Ipv4Addr::from(octets), 32).expect("host IPv4 route is valid"),
+        ));
+        return;
+    }
+
+    match pattern[index] {
+        Some(octet) => {
+            octets[index] = octet;
+            expand_ipv4_wildcard(pattern, index + 1, octets, routes);
+        }
+        None => {
+            for octet in 0..=u8::MAX {
+                octets[index] = octet;
+                expand_ipv4_wildcard(pattern, index + 1, octets, routes);
+            }
+        }
+    }
+}
+
+fn truncate_net(net: ipnet::IpNet) -> ipnet::IpNet {
+    match net {
+        ipnet::IpNet::V4(net) => ipnet::IpNet::V4(net.trunc()),
+        ipnet::IpNet::V6(net) => ipnet::IpNet::V6(net.trunc()),
+    }
 }
 
 async fn resolve_target_ips(target: &TargetAddr) -> Result<Vec<IpAddr>> {
@@ -319,6 +564,124 @@ mod tests {
                 .expect("rule decision"),
             RouteDecision::Remote
         );
+    }
+
+    #[tokio::test]
+    async fn inline_rules_support_domain_and_ip_rules() {
+        let domain_rules = RouteRuleConfig {
+            direct: vec!["*.qq.com".to_owned()],
+            proxy: Vec::new(),
+            block: vec!["*.xxx.com".to_owned()],
+        };
+        let ip_rules = RouteRuleConfig {
+            direct: vec!["128.33.*".to_owned()],
+            proxy: Vec::new(),
+            block: vec!["12.9.*.0".to_owned()],
+        };
+        let table = RuleTable::load(None, None, &domain_rules, &ip_rules).unwrap();
+
+        assert_eq!(
+            table
+                .decide(&TargetAddr::Domain("qq.com".to_owned(), 80))
+                .await
+                .expect("apex wildcard decision"),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            table
+                .decide(&TargetAddr::Domain("img.qq.com".to_owned(), 80))
+                .await
+                .expect("subdomain wildcard decision"),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            table
+                .decide(&TargetAddr::Domain("ads.xxx.com".to_owned(), 80))
+                .await
+                .expect("block decision"),
+            RouteDecision::Block
+        );
+        assert_eq!(
+            table
+                .decide(&TargetAddr::Ip(Ipv4Addr::new(128, 33, 42, 7).into(), 443))
+                .await
+                .expect("wildcard IP decision"),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            table
+                .decide(&TargetAddr::Ip(Ipv4Addr::new(12, 9, 42, 0).into(), 443))
+                .await
+                .expect("block IP decision"),
+            RouteDecision::Block
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_filter_still_honors_block_rules() {
+        let table = RuleTable::load(
+            None,
+            None,
+            &RouteRuleConfig {
+                direct: vec!["*.qq.com".to_owned()],
+                proxy: Vec::new(),
+                block: vec!["*.xxx.com".to_owned()],
+            },
+            &RouteRuleConfig::default(),
+        )
+        .unwrap();
+        let router = Router {
+            mode: FilterMode::Proxy,
+            table,
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        assert_eq!(
+            router
+                .decide(&TargetAddr::Domain("img.qq.com".to_owned(), 80))
+                .await
+                .expect("direct rule is ignored in proxy mode"),
+            RouteDecision::Remote
+        );
+        assert_eq!(
+            router
+                .decide(&TargetAddr::Domain("ads.xxx.com".to_owned(), 80))
+                .await
+                .expect("block rule is honored in proxy mode"),
+            RouteDecision::Block
+        );
+    }
+
+    #[test]
+    fn ip_rule_wildcard_expands_to_cidr() {
+        assert_eq!(
+            parse_ip_rule_entry("128.33.*").unwrap(),
+            vec!["128.33.0.0/16".parse::<ipnet::IpNet>().unwrap()]
+        );
+        assert_eq!(
+            parse_ip_rule_entry("128.33.2.*").unwrap(),
+            vec!["128.33.2.0/24".parse::<ipnet::IpNet>().unwrap()]
+        );
+        let expanded = parse_ip_rule_entry("12.9.*.0").unwrap();
+        assert_eq!(expanded.len(), 256);
+        assert_eq!(
+            expanded.first(),
+            Some(&"12.9.0.0/32".parse::<ipnet::IpNet>().unwrap())
+        );
+        assert_eq!(
+            expanded.last(),
+            Some(&"12.9.255.0/32".parse::<ipnet::IpNet>().unwrap())
+        );
+        assert_eq!(
+            parse_ip_rule_entry("0.3.0.2/16").unwrap(),
+            vec!["0.3.0.0/16".parse::<ipnet::IpNet>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn ip_rule_wildcard_rejects_invalid_octet() {
+        let err = parse_ip_rule_entry("128.332.*").unwrap_err().to_string();
+        assert!(err.contains("0..=255"), "{err}");
     }
 
     #[test]
