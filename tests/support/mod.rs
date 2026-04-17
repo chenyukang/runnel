@@ -138,11 +138,11 @@ pub async fn fetch_tls_http_path(
     path: &str,
     ca_cert: &Path,
 ) -> Result<Vec<u8>> {
-    let connector = TlsConnector::from(pipit::tls::load_client_config(Some(ca_cert))?);
+    let connector = TlsConnector::from(pipit::proxy::tls::load_client_config(Some(ca_cert))?);
     let socket = TcpStream::connect(addr)
         .await
         .with_context(|| format!("failed to connect to {addr}"))?;
-    let tls_server_name = pipit::tls::server_name(server_name)?;
+    let tls_server_name = pipit::proxy::tls::server_name(server_name)?;
     let mut stream = connector
         .connect(tls_server_name, socket)
         .await

@@ -1,6 +1,12 @@
 use crate::{
-    auth::AuthProof, http, mode::ProxyMode, netlog, route, route::FilterMode, route::RouteDecision,
-    socks5, system_proxy, tls, traffic, udp_assoc, wg,
+    mode::ProxyMode,
+    proxy::{
+        auth::AuthProof,
+        http, mux, netlog, route,
+        route::{FilterMode, RouteDecision},
+        socks5, tls, traffic, udp_assoc,
+    },
+    system_proxy, wg,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -66,7 +72,7 @@ pub struct ClientArgs {
     #[arg(skip)]
     pub tun_dns_upstream: Option<SocketAddr>,
     #[arg(skip)]
-    pub wg: wg::WgClientArgs,
+    pub wg: wg::client::WgClientArgs,
 }
 
 pub async fn run(args: ClientArgs) -> Result<()> {
@@ -79,7 +85,7 @@ pub async fn run_embedded(args: ClientArgs) -> Result<()> {
 
 async fn run_with_signal_handling(args: ClientArgs, handle_signals: bool) -> Result<()> {
     if matches!(args.effective_mode()?, ProxyMode::Wg) {
-        return wg::run_client(args.wg).await;
+        return wg::client::run(args.wg).await;
     }
 
     args.validate_required()?;
@@ -88,9 +94,10 @@ async fn run_with_signal_handling(args: ClientArgs, handle_signals: bool) -> Res
     let run_client = async move {
         match args.effective_mode()? {
             ProxyMode::NativeHttp => run_native_http(args).await,
-            ProxyMode::NativeMux => crate::mux::run_client(args).await,
-            ProxyMode::DazeAshe | ProxyMode::DazeBaboon => crate::daze::run_client(args).await,
-            ProxyMode::DazeCzar => crate::czar::run_client(args).await,
+            ProxyMode::NativeMux => mux::run_client(args).await,
+            ProxyMode::DazeAshe | ProxyMode::DazeBaboon | ProxyMode::DazeCzar => {
+                crate::daze::run_client(args).await
+            }
             ProxyMode::Wg => unreachable!("wg mode is dispatched before SOCKS client startup"),
         }
     };

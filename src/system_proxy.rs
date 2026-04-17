@@ -6,7 +6,7 @@ use tracing::{info, warn};
 
 use crate::client::ClientArgs;
 #[cfg(target_os = "macos")]
-use crate::tls;
+use crate::proxy::tls;
 
 #[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]

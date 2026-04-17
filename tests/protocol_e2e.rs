@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use pipit::{
     client::{self, ClientArgs},
     mode::ProxyMode,
-    route::FilterMode,
+    proxy::{route::FilterMode, tls},
     server::{self, ServerArgs},
 };
 use std::{fs, path::PathBuf, sync::OnceLock, time::Duration};
@@ -231,7 +231,7 @@ async fn start_server(
     cert_path: Option<PathBuf>,
     key_path: Option<PathBuf>,
 ) -> Result<ProtocolEnv> {
-    let server_port = pipit::tls::split_host_port(&server_args.listen)?.1;
+    let server_port = tls::split_host_port(&server_args.listen)?.1;
     let server_handle = tokio::spawn(async move {
         let _ = server::run(server_args).await;
     });
@@ -240,7 +240,7 @@ async fn start_server(
 
     let mut client_handle = None;
     if let Some(client_args) = client_args {
-        let socks_port = pipit::tls::split_host_port(&client_args.listen)
+        let socks_port = tls::split_host_port(&client_args.listen)
             .context("failed to parse client listen address")?
             .1;
         let handle = tokio::spawn(async move {

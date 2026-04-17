@@ -4,7 +4,7 @@ use anyhow::Result;
 use pipit::{
     client::{self, ClientArgs},
     mode::ProxyMode,
-    route::FilterMode,
+    proxy::route::FilterMode,
 };
 use std::{fs, path::PathBuf, sync::OnceLock, time::Duration};
 use support::{

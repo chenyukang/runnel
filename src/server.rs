@@ -1,8 +1,10 @@
 use crate::{
-    auth::{AUTH_FAILURE_BODY, AUTH_FAILURE_HINT, AuthProof, ReplayProtector},
-    http,
     mode::ProxyMode,
-    netlog, tls, traffic, udp, wg,
+    proxy::{
+        auth::{AUTH_FAILURE_BODY, AUTH_FAILURE_HINT, AuthProof, ReplayProtector},
+        http, mux, netlog, tls, traffic, udp,
+    },
+    wg,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -63,20 +65,21 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = 1024 * 1024)]
     pub max_fallback_body_size: usize,
     #[arg(skip)]
-    pub wg: wg::WgServerArgs,
+    pub wg: wg::server::WgServerArgs,
 }
 
 pub async fn run(args: ServerArgs) -> Result<()> {
     if matches!(args.mode, ProxyMode::Wg) {
-        return wg::run_server(args.wg).await;
+        return wg::server::run(args.wg).await;
     }
 
     args.validate_required()?;
 
     match args.mode {
         ProxyMode::NativeHttp | ProxyMode::NativeMux => {}
-        ProxyMode::DazeAshe | ProxyMode::DazeBaboon => return crate::daze::run_server(args).await,
-        ProxyMode::DazeCzar => return crate::czar::run_server(args).await,
+        ProxyMode::DazeAshe | ProxyMode::DazeBaboon | ProxyMode::DazeCzar => {
+            return crate::daze::run_server(args).await;
+        }
         ProxyMode::Wg => unreachable!("wg mode is dispatched before native server startup"),
     }
 
@@ -168,8 +171,7 @@ async fn handle_connection(
     if matches!(args.mode, ProxyMode::NativeMux)
         && let Some(mux_head) = http::parse_tunnel_request_head(&head, &args.mux_path)?
     {
-        return crate::mux::run_server_session(stream, peer, mux_head, &body_prefix, args, replay)
-            .await;
+        return mux::run_server_session(stream, peer, mux_head, &body_prefix, args, replay).await;
     }
 
     if matches!(args.mode, ProxyMode::NativeHttp)
@@ -597,7 +599,7 @@ fn is_private_v6(addr: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wg::WgServerArgs;
+    use crate::wg::server::WgServerArgs;
     use tokio::io::{AsyncReadExt, duplex};
 
     #[tokio::test]

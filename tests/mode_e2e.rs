@@ -2,9 +2,8 @@ use anyhow::{Context, Result};
 use pipit::{
     client::{self, ClientArgs},
     mode::ProxyMode,
-    route::FilterMode,
+    proxy::{route::FilterMode, socks5},
     server::{self, ServerArgs},
-    socks5,
 };
 use rcgen::generate_simple_self_signed;
 use std::{

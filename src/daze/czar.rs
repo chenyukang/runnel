@@ -1,10 +1,8 @@
+use super::wire::{client_establish_ashe, relay_rc4, server_accept_ashe};
 use crate::{
     client::ClientArgs,
-    daze::{client_establish_ashe, relay_rc4, server_accept_ashe},
-    netlog, route,
-    route::RouteDecision,
+    proxy::{netlog, route, route::RouteDecision, socks5, traffic},
     server::ServerArgs,
-    socks5, traffic,
 };
 use anyhow::{Context, Result, bail};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};

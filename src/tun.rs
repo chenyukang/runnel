@@ -23,8 +23,8 @@ use tracing::{debug, error, info, warn};
 use crate::{
     client::{self, ClientArgs},
     mode::ProxyMode,
-    route::FilterMode,
-    system_proxy, tls,
+    proxy::{route::FilterMode, tls},
+    system_proxy,
 };
 
 #[cfg(test)]
@@ -1475,7 +1475,7 @@ mod tests {
         default_down_hooks, default_server_bypass_route, default_up_hooks, is_auto_device,
         parse_macos_route_get, parse_tun_dns_upstream, plan_lines, print_plan, shell_envs,
     };
-    use crate::{client::ClientArgs, mode::ProxyMode, route::FilterMode};
+    use crate::{client::ClientArgs, mode::ProxyMode, proxy::route::FilterMode};
     use std::path::PathBuf;
 
     #[test]

@@ -1,10 +1,10 @@
-mod client;
-mod configgen;
+pub mod client;
+pub mod configgen;
 mod dns;
 mod hooks;
-mod keys;
+pub mod keys;
 mod preflight;
-mod server;
+pub mod server;
 mod stats;
 mod uapi;
 
@@ -17,24 +17,6 @@ use boringtun::{
 };
 use ipnet::IpNet;
 use std::net::{IpAddr, SocketAddr};
-
-pub use client::{WgClientArgs, run as run_client};
-pub use configgen::{WgConfigArgs, run_config};
-pub use keys::{WgKeygenArgs, WgPubkeyArgs, run_keygen, run_pubkey};
-pub use server::{WgServerArgs, run as run_server};
-
-pub(crate) use dns::start_dns_capture;
-pub(crate) use hooks::{
-    HookGuard, effective_hook_plan, log_plan_lines, plan_client_hooks, plan_server_hooks,
-    print_plan, run_hooks,
-};
-pub(crate) use keys::public_key_from_private_key;
-pub(crate) use preflight::{WgPreflightRole, check as check_preflight};
-pub(crate) use stats::{start_handshake_watchdog, start_stats_poller};
-pub(crate) use uapi::{
-    WgDeviceStats, apply_device_config, control_socket_path, read_device_stats,
-    read_last_handshake_age,
-};
 
 pub(crate) const AUTO_WG_DEVICE: &str = "auto";
 pub(crate) const DEFAULT_TUNNEL_MTU: u16 = 1420;

@@ -1,9 +1,16 @@
 use super::{
-    DEFAULT_TUNNEL_MTU, HookGuard, WgPreflightRole, WgRuntimeConfig, apply_device_config,
-    control_socket_path, create_device_handle, default_client_allowed_ips_for,
-    default_client_excluded_lan_ips, effective_hook_plan, log_plan_lines, normalize_allowed_ips,
-    parse_key, parse_socket_addr, plan_client_hooks, print_plan, select_device_name,
-    start_dns_capture, start_stats_poller, wait_for_shutdown_signal,
+    DEFAULT_TUNNEL_MTU, WgRuntimeConfig, create_device_handle, default_client_allowed_ips_for,
+    default_client_excluded_lan_ips,
+    dns::start_dns_capture,
+    hooks::{
+        HookGuard, effective_hook_plan, log_plan_lines, plan_client_hooks, print_plan, run_hooks,
+    },
+    normalize_allowed_ips, parse_key, parse_socket_addr,
+    preflight::{WgPreflightRole, check as check_preflight},
+    select_device_name,
+    stats::start_stats_poller,
+    uapi::{apply_device_config, control_socket_path},
+    wait_for_shutdown_signal,
 };
 use anyhow::{Context, Result, bail};
 use boringtun::noise::TunnResult;
@@ -98,7 +105,7 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
         );
     }
     if !args.dry_run {
-        super::check_preflight(
+        check_preflight(
             WgPreflightRole::Client,
             args.dns.is_some() || args.dns_capture,
             false,
@@ -133,7 +140,7 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
         &args.up,
         &args.down,
     );
-    super::run_hooks(&plan.up)?;
+    run_hooks(&plan.up)?;
 
     // Keep the device alive until we receive a shutdown signal. The guard is declared
     // after the handle so cleanup hooks run before the device file descriptor closes.

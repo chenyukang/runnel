@@ -49,12 +49,12 @@ enum Commands {
     Client(client::ClientArgs),
     Tun(tun::TunArgs),
     #[command(hide = true)]
-    WgClient(wg::WgClientArgs),
+    WgClient(wg::client::WgClientArgs),
     #[command(hide = true)]
-    WgServer(wg::WgServerArgs),
-    WgConfig(wg::WgConfigArgs),
-    WgKeygen(wg::WgKeygenArgs),
-    WgPubkey(wg::WgPubkeyArgs),
+    WgServer(wg::server::WgServerArgs),
+    WgConfig(wg::configgen::WgConfigArgs),
+    WgKeygen(wg::keys::WgKeygenArgs),
+    WgPubkey(wg::keys::WgPubkeyArgs),
     Cert(cert::CertArgs),
     Tui(TuiArgs),
     Stop(StopArgs),
@@ -354,11 +354,11 @@ async fn main() -> Result<()> {
             Commands::Server(args) => server::run(args).await,
             Commands::Client(args) => client::run(args).await,
             Commands::Tun(args) => tun::run(args).await,
-            Commands::WgClient(args) => wg::run_client(args).await,
-            Commands::WgServer(args) => wg::run_server(args).await,
-            Commands::WgConfig(args) => wg::run_config(args),
-            Commands::WgKeygen(args) => wg::run_keygen(args),
-            Commands::WgPubkey(args) => wg::run_pubkey(args),
+            Commands::WgClient(args) => wg::client::run(args).await,
+            Commands::WgServer(args) => wg::server::run(args).await,
+            Commands::WgConfig(args) => wg::configgen::run_config(args),
+            Commands::WgKeygen(args) => wg::keys::run_keygen(args),
+            Commands::WgPubkey(args) => wg::keys::run_pubkey(args),
             Commands::Cert(args) => cert::run(args),
             Commands::Tui(_) => Ok(()),
             Commands::Stop(_) => Ok(()),
@@ -891,9 +891,9 @@ fn command_role(command: &Commands) -> Option<&'static str> {
 
 fn run_utility_command(command: &Commands) -> Option<Result<()>> {
     match command {
-        Commands::WgConfig(args) => Some(wg::run_config(args.clone())),
-        Commands::WgKeygen(args) => Some(wg::run_keygen(args.clone())),
-        Commands::WgPubkey(args) => Some(wg::run_pubkey(args.clone())),
+        Commands::WgConfig(args) => Some(wg::configgen::run_config(args.clone())),
+        Commands::WgKeygen(args) => Some(wg::keys::run_keygen(args.clone())),
+        Commands::WgPubkey(args) => Some(wg::keys::run_pubkey(args.clone())),
         Commands::Cert(args) => Some(cert::run(args.clone())),
         _ => None,
     }
@@ -1717,7 +1717,7 @@ mod tests {
 
     #[test]
     fn wg_utility_commands_are_not_treated_as_services() {
-        let config = Commands::WgConfig(wg::WgConfigArgs {
+        let config = Commands::WgConfig(wg::configgen::WgConfigArgs {
             server_endpoint: "198.51.100.10:51820".to_owned(),
             client_tunnel_ip: "10.8.0.2".parse().unwrap(),
             server_tunnel_ip: "10.8.0.1".parse().unwrap(),
@@ -1735,11 +1735,11 @@ mod tests {
         assert!(command_role(&config).is_none());
         assert!(run_utility_command(&config).is_some_and(|result| result.is_ok()));
 
-        let keygen = Commands::WgKeygen(wg::WgKeygenArgs { json: false });
+        let keygen = Commands::WgKeygen(wg::keys::WgKeygenArgs { json: false });
         assert!(command_role(&keygen).is_none());
         assert!(run_utility_command(&keygen).is_some());
 
-        let pubkey = Commands::WgPubkey(wg::WgPubkeyArgs {
+        let pubkey = Commands::WgPubkey(wg::keys::WgPubkeyArgs {
             private_key: "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=".to_owned(),
             json: false,
         });

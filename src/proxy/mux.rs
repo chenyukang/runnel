@@ -1,11 +1,10 @@
-use crate::{
+use super::{
     auth::{AUTH_FAILURE_BODY, AUTH_FAILURE_HINT, AuthProof, ReplayProtector},
-    client::ClientArgs,
     http, netlog, route,
     route::RouteDecision,
-    server::ServerArgs,
     socks5, tls,
 };
+use crate::{client::ClientArgs, server::ServerArgs};
 use anyhow::{Context, Result, bail};
 use std::{
     collections::HashMap,

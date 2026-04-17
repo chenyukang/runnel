@@ -9,10 +9,10 @@ use crate::{
     cert::CertArgs,
     client::ClientArgs,
     mode::ProxyMode,
-    route::FilterMode,
+    proxy::route::FilterMode,
     server::ServerArgs,
     tun::TunArgs,
-    wg::{WgClientArgs, WgServerArgs, public_key_from_private_key},
+    wg::{client::WgClientArgs, keys::public_key_from_private_key, server::WgServerArgs},
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -837,9 +837,9 @@ mod tests {
     use crate::{
         client::ClientArgs,
         mode::ProxyMode,
-        route::FilterMode,
+        proxy::route::FilterMode,
         server::ServerArgs,
-        wg::{WgClientArgs, WgServerArgs, public_key_from_private_key},
+        wg::{client::WgClientArgs, keys::public_key_from_private_key, server::WgServerArgs},
     };
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};

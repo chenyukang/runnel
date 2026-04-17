@@ -1,10 +1,10 @@
-use crate::{
-    client::{ClientArgs, establish_remote_tunnel},
+use super::{
     http::TunnelTransport,
     route::{RouteDecision, Router},
     socks5::{self, TargetAddr},
     udp,
 };
+use crate::client::{ClientArgs, establish_remote_tunnel};
 use anyhow::{Context, Result, bail};
 use std::{
     collections::HashMap,

@@ -380,7 +380,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::AuthProof;
+    use crate::proxy::auth::AuthProof;
     use tokio::io::{AsyncWriteExt, duplex};
 
     #[test]

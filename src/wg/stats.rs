@@ -4,7 +4,7 @@ use tracing::{debug, warn};
 
 use crate::telemetry;
 
-use super::{WgDeviceStats, read_device_stats, read_last_handshake_age};
+use super::uapi::{WgDeviceStats, read_device_stats, read_last_handshake_age};
 
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -111,7 +111,7 @@ fn emit_sample(role: &str, uploaded: u64, downloaded: u64) {
 #[cfg(test)]
 mod tests {
     use super::traffic_delta;
-    use crate::wg::WgDeviceStats;
+    use crate::wg::uapi::WgDeviceStats;
 
     #[test]
     fn traffic_delta_uses_tx_as_uploaded_and_rx_as_downloaded() {

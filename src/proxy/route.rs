@@ -1,4 +1,5 @@
-use crate::{client::ClientArgs, socks5, socks5::TargetAddr, traffic};
+use super::{socks5, socks5::TargetAddr, traffic};
+use crate::client::ClientArgs;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use serde::Deserialize;
