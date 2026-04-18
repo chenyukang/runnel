@@ -1,5 +1,5 @@
 use super::{
-    DEFAULT_TUNNEL_MTU, WgEngine, WgRuntimeConfig, create_device_handle,
+    DEFAULT_TUNNEL_MTU, WgEngine, WgObfsMode, WgRuntimeConfig, create_device_handle,
     default_server_allowed_ips,
     hooks::{
         HookGuard, effective_hook_plan, log_plan_lines, plan_server_hooks, print_plan, run_hooks,
@@ -23,6 +23,8 @@ const UNHANDSHAKEN_PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 pub struct WgServerArgs {
     #[arg(long, value_enum, default_value_t = WgEngine::Device)]
     pub engine: WgEngine,
+    #[arg(long, value_enum, default_value_t = WgObfsMode::Off)]
+    pub obfs: WgObfsMode,
     #[arg(long, default_value = "0.0.0.0:51820")]
     pub listen: String,
     #[arg(long, env = "RUNNEL_WG_PRIVATE_KEY")]
@@ -61,6 +63,7 @@ impl Default for WgServerArgs {
     fn default() -> Self {
         Self {
             engine: WgEngine::Device,
+            obfs: WgObfsMode::Off,
             listen: "0.0.0.0:51820".to_owned(),
             private_key: String::new(),
             peer_public_key: String::new(),
@@ -82,6 +85,7 @@ impl Default for WgServerArgs {
 
 pub async fn run(args: WgServerArgs) -> Result<()> {
     let runtime = args.resolve()?;
+    validate_engine_obfs("wg server", args.engine, args.obfs)?;
     if !args.dry_run {
         check_preflight(
             WgPreflightRole::Server,
@@ -162,6 +166,7 @@ fn plan_lines(
     let mut lines = Vec::new();
     lines.push("runnel wg-server plan".to_owned());
     lines.push(format!("  engine: {}", args.engine));
+    lines.push(format!("  obfs: {}", args.obfs));
     if super::is_auto_device(&args.device) {
         lines.push(format!("  device: {device} (auto)"));
     } else {
@@ -205,6 +210,13 @@ fn plan_lines(
     lines
 }
 
+fn validate_engine_obfs(role: &str, engine: WgEngine, obfs: WgObfsMode) -> Result<()> {
+    if obfs != WgObfsMode::Off && engine != WgEngine::Noise {
+        bail!("{role} --obfs requires --engine noise");
+    }
+    Ok(())
+}
+
 impl WgServerArgs {
     pub fn validate_required(&self) -> Result<()> {
         if self.private_key.trim().is_empty() {
@@ -246,7 +258,7 @@ impl WgServerArgs {
 #[cfg(test)]
 mod tests {
     use super::WgServerArgs;
-    use crate::wg::WgEngine;
+    use crate::wg::{WgEngine, WgObfsMode};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -254,6 +266,7 @@ mod tests {
     fn server_args_resolve_runtime() {
         let args = WgServerArgs {
             engine: WgEngine::Device,
+            obfs: WgObfsMode::Off,
             listen: "0.0.0.0:51820".to_owned(),
             private_key: STANDARD.encode([3u8; 32]),
             peer_public_key: STANDARD.encode([4u8; 32]),
@@ -282,6 +295,7 @@ mod tests {
     fn server_args_preserve_custom_peer_allowed_ips() {
         let args = WgServerArgs {
             engine: WgEngine::Device,
+            obfs: WgObfsMode::Off,
             listen: "0.0.0.0:51820".to_owned(),
             private_key: STANDARD.encode([3u8; 32]),
             peer_public_key: STANDARD.encode([4u8; 32]),

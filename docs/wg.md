@@ -117,16 +117,21 @@ TUN/UDP loop in Runnel with `boringtun::noise::Tunn` directly:
 client:
   wg:
     engine: noise
+    # optional; both sides must match
+    obfs: mask
 
 server:
   wg:
     engine: noise
+    obfs: mask
 ```
 
 The noise engine keeps the same keys, hooks, DNS capture, split routing,
-tcpdump monitor, and traffic samples. It still emits standard WireGuard packets;
-it is the base layer for future packet wrapping or padding, not obfuscation by
-itself.
+tcpdump monitor, and traffic samples. `obfs: off` is the default and emits
+standard WireGuard UDP packets. `obfs: mask` is experimental: it derives a
+shared mask key from the WG key pair, hides the WG packet header and length
+inside a small authenticated wrapper, and adds random padding. It is useful for
+packet-shape experiments, but it is not a censorship-resistance guarantee.
 
 ## Tcpdump Events
 

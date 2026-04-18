@@ -49,6 +49,23 @@ impl fmt::Display for WgEngine {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum WgObfsMode {
+    #[default]
+    Off,
+    Mask,
+}
+
+impl fmt::Display for WgObfsMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Off => f.write_str("off"),
+            Self::Mask => f.write_str("mask"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WgRuntimeConfig {
     pub bind: SocketAddr,

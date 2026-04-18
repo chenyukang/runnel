@@ -16,7 +16,10 @@ use crate::{
     },
     server::ServerArgs,
     tun::TunArgs,
-    wg::{WgEngine, client::WgClientArgs, keys::public_key_from_private_key, server::WgServerArgs},
+    wg::{
+        WgEngine, WgObfsMode, client::WgClientArgs, keys::public_key_from_private_key,
+        server::WgServerArgs,
+    },
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -111,6 +114,7 @@ pub struct TunConfig {
 #[serde(deny_unknown_fields)]
 pub struct WgClientConfig {
     pub engine: Option<WgEngine>,
+    pub obfs: Option<WgObfsMode>,
     pub bind: Option<String>,
     pub endpoint: Option<String>,
     pub private_key: Option<String>,
@@ -135,6 +139,7 @@ pub struct WgClientConfig {
 #[serde(deny_unknown_fields)]
 pub struct WgServerConfig {
     pub engine: Option<WgEngine>,
+    pub obfs: Option<WgObfsMode>,
     pub listen: Option<String>,
     pub private_key: Option<String>,
     pub peer_public_key: Option<String>,
@@ -544,6 +549,7 @@ fn apply_wg_client_config(
     should_apply: impl Fn(&str) -> bool,
 ) {
     maybe_assign(&mut args.engine, &wg_client.engine, should_apply("engine"));
+    maybe_assign(&mut args.obfs, &wg_client.obfs, should_apply("obfs"));
     maybe_assign(&mut args.bind, &wg_client.bind, should_apply("bind"));
     maybe_assign(
         &mut args.endpoint,
@@ -622,6 +628,7 @@ fn apply_wg_server_config(
     should_apply: impl Fn(&str) -> bool,
 ) {
     maybe_assign(&mut args.engine, &wg_server.engine, should_apply("engine"));
+    maybe_assign(&mut args.obfs, &wg_server.obfs, should_apply("obfs"));
     maybe_assign(&mut args.listen, &wg_server.listen, should_apply("listen"));
     maybe_assign(
         &mut args.private_key,
@@ -991,7 +998,8 @@ mod tests {
         },
         server::ServerArgs,
         wg::{
-            WgEngine, client::WgClientArgs, keys::public_key_from_private_key, server::WgServerArgs,
+            WgEngine, WgObfsMode, client::WgClientArgs, keys::public_key_from_private_key,
+            server::WgServerArgs,
         },
     };
     use std::fs;
@@ -1042,6 +1050,7 @@ client:
     - Wi-Fi
   wg:
     engine: noise
+    obfs: mask
     endpoint: 198.51.100.10:51820
     tunnel_ip: 10.8.0.2
     peer_tunnel_ip: 10.8.0.1
@@ -1064,6 +1073,7 @@ server:
   listen: 0.0.0.0:1443
   wg:
     engine: noise
+    obfs: mask
     listen: 0.0.0.0:51820
     tunnel_ip: 10.8.0.1
     peer_tunnel_ip: 10.8.0.2
@@ -1181,6 +1191,14 @@ server:
                 .client
                 .as_ref()
                 .and_then(|cfg| cfg.wg.as_ref())
+                .and_then(|cfg| cfg.obfs),
+            Some(WgObfsMode::Mask)
+        );
+        assert_eq!(
+            parsed
+                .client
+                .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
                 .and_then(|cfg| cfg.endpoint.as_deref()),
             Some("198.51.100.10:51820")
         );
@@ -1248,6 +1266,14 @@ server:
                 .and_then(|cfg| cfg.wg.as_ref())
                 .and_then(|cfg| cfg.engine),
             Some(WgEngine::Noise)
+        );
+        assert_eq!(
+            parsed
+                .server
+                .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
+                .and_then(|cfg| cfg.obfs),
+            Some(WgObfsMode::Mask)
         );
         assert_eq!(
             parsed
