@@ -153,6 +153,7 @@ async fn run_udp_association(
                 .await?;
             }
             RouteDecision::Block => {
+                info!(target = %key, route = "block", mode = "native-http", "route decision");
                 debug!(target = %key, "dropping blocked UDP target");
             }
         }

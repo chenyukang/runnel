@@ -114,6 +114,7 @@ async fn handle_client_connection(
             return Ok(());
         }
         RouteDecision::Block => {
+            info!(peer = %peer, target = %target_string, route = "block", mode = "daze-baboon", "route decision");
             let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
             bail!("target blocked by proxy control: {}", target_string);
         }

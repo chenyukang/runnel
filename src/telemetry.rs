@@ -45,6 +45,8 @@ pub struct DashboardSnapshot {
     pub total_warnings: u64,
     pub total_uploaded: u64,
     pub total_downloaded: u64,
+    #[serde(default)]
+    pub route_stats: RouteStats,
     pub upload_history: Vec<u64>,
     pub download_history: Vec<u64>,
     pub recent_targets: Vec<RecentTargetSnapshot>,
@@ -52,6 +54,30 @@ pub struct DashboardSnapshot {
     pub last_event_age_ms: Option<u64>,
     pub last_warning_age_ms: Option<u64>,
     pub last_traffic_age_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RouteStats {
+    pub proxy: u64,
+    pub direct: u64,
+    pub blocked: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteBucket {
+    Proxy,
+    Direct,
+    Blocked,
+}
+
+impl RouteStats {
+    pub fn record(&mut self, bucket: RouteBucket) {
+        match bucket {
+            RouteBucket::Proxy => self.proxy += 1,
+            RouteBucket::Direct => self.direct += 1,
+            RouteBucket::Blocked => self.blocked += 1,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,6 +88,8 @@ pub struct RecentTargetSnapshot {
     pub link: String,
     #[serde(default)]
     pub detail: String,
+    #[serde(default)]
+    pub repeat_count: u64,
     pub uploaded: u64,
     pub downloaded: u64,
 }
@@ -87,6 +115,7 @@ struct SnapshotState {
     total_warnings: u64,
     total_uploaded: u64,
     total_downloaded: u64,
+    route_stats: RouteStats,
     upload_history: Vec<u64>,
     download_history: Vec<u64>,
     last_bucket_at: Instant,
@@ -107,6 +136,7 @@ impl Default for SnapshotState {
             total_warnings: 0,
             total_uploaded: 0,
             total_downloaded: 0,
+            route_stats: RouteStats::default(),
             upload_history: vec![0; HISTORY_LEN],
             download_history: vec![0; HISTORY_LEN],
             last_bucket_at: Instant::now(),
@@ -144,6 +174,9 @@ impl SnapshotState {
 
         self.capture_recent_event(event);
         self.capture_recent_domain_ip(event);
+        if let Some(bucket) = route_bucket_for_event(event) {
+            self.route_stats.record(bucket);
+        }
 
         if event.message == "dns query" {
             self.capture_recent_domain(event);
@@ -204,6 +237,7 @@ impl SnapshotState {
                 target,
                 route,
                 detail: String::new(),
+                repeat_count: 1,
                 uploaded,
                 downloaded,
             });
@@ -232,13 +266,29 @@ impl SnapshotState {
             .get("detail")
             .cloned()
             .unwrap_or_else(|| recent_domain_default_detail(&route));
+        let seen_at = clock_stamp(event.at);
+
+        if let Some(index) = self
+            .recent_targets
+            .iter()
+            .position(|recent| recent.link == link && recent.route == route)
+        {
+            if let Some(mut recent) = self.recent_targets.remove(index) {
+                recent.seen_at = seen_at;
+                recent.detail = merge_recent_domain_detail(&recent.detail, &detail, &route);
+                recent.repeat_count = recent.repeat_count.saturating_add(1).max(2);
+                self.recent_targets.push_front(recent);
+            }
+            return;
+        }
 
         self.recent_targets.push_front(RecentTargetSnapshot {
-            seen_at: clock_stamp(event.at),
+            seen_at,
             link,
             target,
             route,
             detail,
+            repeat_count: 1,
             uploaded: 0,
             downloaded: 0,
         });
@@ -270,6 +320,7 @@ impl SnapshotState {
             total_warnings: self.total_warnings,
             total_uploaded: self.total_uploaded,
             total_downloaded: self.total_downloaded,
+            route_stats: self.route_stats,
             upload_history: self.upload_history.clone(),
             download_history: self.download_history.clone(),
             recent_targets: self.recent_targets.iter().cloned().collect(),
@@ -309,6 +360,43 @@ impl SnapshotState {
     }
 }
 
+pub fn route_bucket_for_event(event: &TraceEvent) -> Option<RouteBucket> {
+    if event.message == "dns query" {
+        return route_bucket_from_label(
+            event
+                .fields
+                .get("route")
+                .map(String::as_str)
+                .unwrap_or("remote"),
+        );
+    }
+    if event.message.contains("relay completed") {
+        return route_bucket_from_label(
+            event
+                .fields
+                .get("route")
+                .map(String::as_str)
+                .unwrap_or("remote"),
+        );
+    }
+    if event.message == "route decision" {
+        return event
+            .fields
+            .get("route")
+            .and_then(|route| route_bucket_from_label(route));
+    }
+    None
+}
+
+fn route_bucket_from_label(route: &str) -> Option<RouteBucket> {
+    match route {
+        "direct" | "wg-dns-direct" => Some(RouteBucket::Direct),
+        "block" | "blocked" | "wg-dns-block" => Some(RouteBucket::Blocked),
+        "remote" | "proxy" | "wg-dns" | "wg-dns-remote" => Some(RouteBucket::Proxy),
+        _ => None,
+    }
+}
+
 fn recent_event_suffix(event: &TraceEvent) -> String {
     if let Some(target) = event.fields.get("target") {
         return format!(" {target}");
@@ -334,6 +422,13 @@ fn recent_domain_default_detail(route: &str) -> String {
         "wg-dns" | "wg-dns-remote" | "remote" => "wg tunnel".to_owned(),
         _ => "-".to_owned(),
     }
+}
+
+fn merge_recent_domain_detail(current: &str, next: &str, route: &str) -> String {
+    if current.is_empty() || current == "-" || current == recent_domain_default_detail(route) {
+        return next.to_owned();
+    }
+    current.to_owned()
 }
 
 fn append_recent_domain_ip(detail: &mut String, ip: &str) {
@@ -964,6 +1059,68 @@ mod tests {
         assert_eq!(snapshot.recent_targets[0].link, "dns://example.com");
         assert_eq!(snapshot.recent_targets[0].route, "wg-dns");
         assert_eq!(snapshot.recent_targets[0].detail, "wg tunnel");
+        assert_eq!(snapshot.recent_targets[0].repeat_count, 1);
+        assert_eq!(snapshot.route_stats.proxy, 1);
+        assert_eq!(snapshot.route_stats.direct, 0);
+        assert_eq!(snapshot.route_stats.blocked, 0);
+    }
+
+    #[test]
+    fn repeated_dns_queries_update_one_recent_domain_row() {
+        let mut snapshot = SnapshotState::default();
+
+        for _ in 0..3 {
+            snapshot.ingest(&trace_event(
+                "INFO",
+                "dns query",
+                &[
+                    ("target", "tracker.example"),
+                    ("link", "dns://tracker.example"),
+                    ("route", "wg-dns-block"),
+                ],
+            ));
+        }
+
+        assert_eq!(snapshot.recent_targets.len(), 1);
+        assert_eq!(snapshot.recent_targets[0].target, "tracker.example");
+        assert_eq!(snapshot.recent_targets[0].detail, "blocked");
+        assert_eq!(snapshot.recent_targets[0].repeat_count, 3);
+        assert_eq!(snapshot.route_stats.blocked, 3);
+    }
+
+    #[test]
+    fn route_stats_count_proxy_direct_and_blocked_decisions() {
+        let mut snapshot = SnapshotState::default();
+
+        snapshot.ingest(&trace_event(
+            "INFO",
+            "client relay completed",
+            &[("target", "example.com:443")],
+        ));
+        snapshot.ingest(&trace_event(
+            "INFO",
+            "client relay completed",
+            &[("target", "qq.com:443"), ("route", "direct")],
+        ));
+        snapshot.ingest(&trace_event(
+            "INFO",
+            "dns query",
+            &[("target", "ads.example"), ("route", "wg-dns-block")],
+        ));
+        snapshot.ingest(&trace_event(
+            "INFO",
+            "route decision",
+            &[("target", "tracker.example:443"), ("route", "block")],
+        ));
+        snapshot.ingest(&trace_event(
+            "INFO",
+            "traffic sample",
+            &[("target", "wireguard"), ("route", "wg-client")],
+        ));
+
+        assert_eq!(snapshot.route_stats.proxy, 1);
+        assert_eq!(snapshot.route_stats.direct, 1);
+        assert_eq!(snapshot.route_stats.blocked, 2);
     }
 
     #[test]

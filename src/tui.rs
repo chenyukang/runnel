@@ -1,6 +1,7 @@
 use std::{
     collections::VecDeque,
     io,
+    net::IpAddr,
     path::PathBuf,
     process::Command,
     time::{Duration, Instant, SystemTime},
@@ -28,13 +29,14 @@ use tokio::{
 };
 
 use crate::telemetry::{
-    DashboardSnapshot, MonitorContext, RecentTargetSnapshot, TraceEvent, attach_socket,
-    event_impacts_health,
+    DashboardSnapshot, MonitorContext, RecentTargetSnapshot, RouteStats, TraceEvent, attach_socket,
+    event_impacts_health, route_bucket_for_event,
 };
 
 const HISTORY_LEN: usize = 48;
 const RECENT_EVENTS: usize = 40;
 const RECENT_TARGETS: usize = RECENT_EVENTS;
+const RECENT_DOMAIN_STATUS_WIDTH: usize = 9;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Clone, Debug)]
@@ -129,6 +131,7 @@ struct RecentTarget {
     route: String,
     link: String,
     detail: String,
+    repeat_count: u64,
     uploaded: u64,
     downloaded: u64,
 }
@@ -143,6 +146,7 @@ struct DashboardApp {
     total_warnings: u64,
     total_uploaded: u64,
     total_downloaded: u64,
+    route_stats: RouteStats,
     upload_history: Vec<u64>,
     download_history: Vec<u64>,
     last_bucket_at: Instant,
@@ -182,6 +186,7 @@ impl From<RecentTargetSnapshot> for RecentTarget {
             route: value.route,
             link: value.link,
             detail: value.detail,
+            repeat_count: value.repeat_count.max(1),
             uploaded: value.uploaded,
             downloaded: value.downloaded,
         }
@@ -200,6 +205,7 @@ impl DashboardApp {
             total_warnings: 0,
             total_uploaded: 0,
             total_downloaded: 0,
+            route_stats: RouteStats::default(),
             upload_history: vec![0; HISTORY_LEN],
             download_history: vec![0; HISTORY_LEN],
             last_bucket_at: Instant::now(),
@@ -224,6 +230,7 @@ impl DashboardApp {
             total_warnings,
             total_uploaded,
             total_downloaded,
+            route_stats,
             upload_history,
             download_history,
             recent_targets,
@@ -243,6 +250,7 @@ impl DashboardApp {
             total_warnings,
             total_uploaded,
             total_downloaded,
+            route_stats,
             upload_history: fit_history(upload_history),
             download_history: fit_history(download_history),
             last_bucket_at: Instant::now(),
@@ -288,6 +296,9 @@ impl DashboardApp {
         self.capture_listener_context(&event);
         self.capture_recent_event(&event);
         self.capture_recent_domain_ip(&event);
+        if let Some(bucket) = route_bucket_for_event(&event) {
+            self.route_stats.record(bucket);
+        }
 
         if event.message == "dns query" {
             self.capture_recent_domain(&event);
@@ -346,6 +357,7 @@ impl DashboardApp {
                 link: link_from_target(&target),
                 route,
                 detail: String::new(),
+                repeat_count: 1,
                 uploaded,
                 downloaded,
             });
@@ -374,12 +386,28 @@ impl DashboardApp {
             .get("detail")
             .cloned()
             .unwrap_or_else(|| recent_domain_default_detail(&route));
+        let seen_at = clock_stamp(event.at);
+
+        if let Some(index) = self
+            .recent_targets
+            .iter()
+            .position(|recent| recent.link == link && recent.route == route)
+        {
+            if let Some(mut recent) = self.recent_targets.remove(index) {
+                recent.seen_at = seen_at;
+                recent.detail = merge_recent_domain_detail(&recent.detail, &detail, &route);
+                recent.repeat_count = recent.repeat_count.saturating_add(1).max(2);
+                self.recent_targets.push_front(recent);
+            }
+            return;
+        }
 
         self.recent_targets.push_front(RecentTarget {
-            seen_at: clock_stamp(event.at),
+            seen_at,
             link,
             route,
             detail,
+            repeat_count: 1,
             uploaded: 0,
             downloaded: 0,
         });
@@ -542,7 +570,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
         ])
     };
 
-    let title = Paragraph::new(vec![
+    let overview_lines = vec![
         Line::from(vec![
             Span::styled(
                 format!("{} pipit dashboard", SPINNER[app.spinner_index]),
@@ -602,15 +630,23 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
             ),
         ]),
         endpoint_line,
-    ])
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title("Overview")
-            .border_style(Style::default().fg(Color::Cyan)),
-    )
-    .wrap(Wrap { trim: true });
-    frame.render_widget(title, chunks[0]);
+    ];
+    let overview_block = Block::default()
+        .borders(Borders::ALL)
+        .title("Overview")
+        .border_style(Style::default().fg(Color::Cyan));
+    let overview_inner = overview_block.inner(chunks[0]);
+    frame.render_widget(overview_block, chunks[0]);
+
+    let overview = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(48), Constraint::Length(24)])
+        .split(overview_inner);
+    frame.render_widget(
+        Paragraph::new(overview_lines).wrap(Wrap { trim: true }),
+        overview[0],
+    );
+    frame.render_widget(route_stats_panel(app.route_stats), overview[1]);
 
     let stats = Layout::default()
         .direction(Direction::Horizontal)
@@ -743,6 +779,24 @@ fn stat_block(title: &'static str, value: String, color: Color) -> Paragraph<'st
             .title(title)
             .border_style(Style::default().fg(color)),
     )
+}
+
+fn route_stats_panel(stats: RouteStats) -> Paragraph<'static> {
+    Paragraph::new(vec![
+        Line::from(Span::styled("Routes", overview_label_style())),
+        Line::from(vec![
+            Span::styled("proxy: ", overview_label_style()),
+            Span::styled(stats.proxy.to_string(), Style::default().fg(Color::Blue)),
+        ]),
+        Line::from(vec![
+            Span::styled("direct: ", overview_label_style()),
+            Span::styled(stats.direct.to_string(), Style::default().fg(Color::Green)),
+        ]),
+        Line::from(vec![
+            Span::styled("blocked: ", overview_label_style()),
+            Span::styled(stats.blocked.to_string(), Style::default().fg(Color::Red)),
+        ]),
+    ])
 }
 
 fn overview_label_style() -> Style {
@@ -922,7 +976,7 @@ fn recent_targets_title(context: &DashboardContext) -> &'static str {
 
 fn recent_targets_activity_header(context: &DashboardContext) -> &'static str {
     if recent_targets_are_domain_events(context) {
-        "Resolved IPs"
+        "Resolved"
     } else {
         "Up / Down"
     }
@@ -988,10 +1042,37 @@ fn recent_domain_default_detail(route: &str) -> String {
 }
 
 fn recent_domain_detail(item: &RecentTarget) -> String {
-    if item.detail.is_empty() {
-        return recent_domain_default_detail(&item.route);
+    let detail = if item.detail.is_empty() {
+        recent_domain_default_detail(&item.route)
+    } else {
+        item.detail.clone()
+    };
+    if resolved_detail_has_ip(&detail) {
+        detail
+    } else if item.repeat_count > 1 {
+        format!(
+            "{detail:<width$} x{}",
+            item.repeat_count,
+            width = RECENT_DOMAIN_STATUS_WIDTH
+        )
+    } else {
+        format!("{detail:<width$}", width = RECENT_DOMAIN_STATUS_WIDTH)
     }
-    item.detail.clone()
+}
+
+fn resolved_detail_has_ip(detail: &str) -> bool {
+    detail
+        .split(", ")
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && *part != "...")
+        .any(|part| part.parse::<IpAddr>().is_ok())
+}
+
+fn merge_recent_domain_detail(current: &str, next: &str, route: &str) -> String {
+    if current.is_empty() || current == "-" || current == recent_domain_default_detail(route) {
+        return next.to_owned();
+    }
+    current.to_owned()
 }
 
 fn append_recent_domain_ip(detail: &mut String, ip: &str) {
@@ -1254,6 +1335,88 @@ mod tests {
         assert_eq!(app.recent_targets[0].link, "dns://example.com");
         assert_eq!(app.recent_targets[0].route, "wg-dns");
         assert_eq!(app.recent_targets[0].detail, "wg tunnel");
+        assert_eq!(app.recent_targets[0].repeat_count, 1);
+        assert_eq!(app.route_stats.proxy, 1);
+        assert_eq!(app.route_stats.direct, 0);
+        assert_eq!(app.route_stats.blocked, 0);
+    }
+
+    #[test]
+    fn repeated_dns_queries_update_one_recent_domain_row() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        });
+
+        for _ in 0..3 {
+            app.ingest(trace_event(
+                "INFO",
+                "dns query",
+                &[
+                    ("target", "tracker.example"),
+                    ("link", "dns://tracker.example"),
+                    ("route", "wg-dns-block"),
+                ],
+            ));
+        }
+
+        assert_eq!(app.recent_targets.len(), 1);
+        assert_eq!(app.recent_targets[0].link, "dns://tracker.example");
+        assert_eq!(app.recent_targets[0].detail, "blocked");
+        assert_eq!(app.recent_targets[0].repeat_count, 3);
+        assert_eq!(
+            recent_target_activity(&app.recent_targets[0], &app.context),
+            "blocked   x3"
+        );
+        assert_eq!(app.route_stats.blocked, 3);
+    }
+
+    #[test]
+    fn overview_route_stats_count_proxy_direct_and_blocked_decisions() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "client".to_owned(),
+            mode_label: "native-http".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        });
+
+        app.ingest(trace_event(
+            "INFO",
+            "client relay completed",
+            &[("target", "example.com:443")],
+        ));
+        app.ingest(trace_event(
+            "INFO",
+            "client relay completed",
+            &[("target", "qq.com:443"), ("route", "direct")],
+        ));
+        app.ingest(trace_event(
+            "INFO",
+            "dns query",
+            &[("target", "ads.example"), ("route", "wg-dns-block")],
+        ));
+        app.ingest(trace_event(
+            "INFO",
+            "route decision",
+            &[("target", "tracker.example:443"), ("route", "block")],
+        ));
+        app.ingest(trace_event(
+            "INFO",
+            "traffic sample",
+            &[("target", "wireguard"), ("route", "wg-client")],
+        ));
+
+        assert_eq!(app.route_stats.proxy, 1);
+        assert_eq!(app.route_stats.direct, 1);
+        assert_eq!(app.route_stats.blocked, 2);
     }
 
     #[test]
@@ -1296,7 +1459,7 @@ mod tests {
 
         assert_eq!(recent_targets_title(&context), "Recent Domains");
         assert_eq!(recent_targets_link_header(&context), "Domain");
-        assert_eq!(recent_targets_activity_header(&context), "Resolved IPs");
+        assert_eq!(recent_targets_activity_header(&context), "Resolved");
     }
 
     #[test]
@@ -1315,6 +1478,7 @@ mod tests {
             route: "wg-dns-direct".to_owned(),
             link: "dns://example.com".to_owned(),
             detail: "93.184.216.34".to_owned(),
+            repeat_count: 1,
             uploaded: 0,
             downloaded: 0,
         };
@@ -1322,6 +1486,67 @@ mod tests {
         assert_eq!(recent_target_route(&item, &context), "direct");
         assert_eq!(recent_target_link(&item, &context), "example.com");
         assert_eq!(recent_target_activity(&item, &context), "93.184.216.34");
+    }
+
+    #[test]
+    fn repeated_resolved_ip_detail_omits_repeat_count() {
+        let context = DashboardContext {
+            command_label: "client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        };
+        let item = RecentTarget {
+            seen_at: "08:27:01".to_owned(),
+            route: "wg-dns-direct".to_owned(),
+            link: "dns://example.com".to_owned(),
+            detail: "93.184.216.34, 2606:2800:220:1:248:1893:25c8:1946".to_owned(),
+            repeat_count: 4,
+            uploaded: 0,
+            downloaded: 0,
+        };
+
+        assert_eq!(
+            recent_target_activity(&item, &context),
+            "93.184.216.34, 2606:2800:220:1:248:1893:25c8:1946"
+        );
+    }
+
+    #[test]
+    fn repeated_status_detail_aligns_repeat_count() {
+        let context = DashboardContext {
+            command_label: "client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        };
+        let blocked = RecentTarget {
+            seen_at: "08:27:01".to_owned(),
+            route: "wg-dns-block".to_owned(),
+            link: "dns://ads.example".to_owned(),
+            detail: "blocked".to_owned(),
+            repeat_count: 4,
+            uploaded: 0,
+            downloaded: 0,
+        };
+        let proxied = RecentTarget {
+            seen_at: "08:27:02".to_owned(),
+            route: "wg-dns".to_owned(),
+            link: "dns://example.com".to_owned(),
+            detail: "wg tunnel".to_owned(),
+            repeat_count: 4,
+            uploaded: 0,
+            downloaded: 0,
+        };
+
+        assert_eq!(recent_target_activity(&blocked, &context), "blocked   x4");
+        assert_eq!(recent_target_activity(&proxied, &context), "wg tunnel x4");
     }
 
     #[test]
@@ -1375,6 +1600,7 @@ mod tests {
             route: "remote".to_owned(),
             link: "https://example.com".to_owned(),
             detail: String::new(),
+            repeat_count: 1,
             uploaded: 1024,
             downloaded: 2048,
         };
