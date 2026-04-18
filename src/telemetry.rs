@@ -60,6 +60,8 @@ pub struct RecentTargetSnapshot {
     pub target: String,
     pub route: String,
     pub link: String,
+    #[serde(default)]
+    pub detail: String,
     pub uploaded: u64,
     pub downloaded: u64,
 }
@@ -141,6 +143,7 @@ impl SnapshotState {
         }
 
         self.capture_recent_event(event);
+        self.capture_recent_domain_ip(event);
 
         if event.message == "dns query" {
             self.capture_recent_domain(event);
@@ -200,6 +203,7 @@ impl SnapshotState {
                 link: link_from_target(&target),
                 target,
                 route,
+                detail: String::new(),
                 uploaded,
                 downloaded,
             });
@@ -223,16 +227,37 @@ impl SnapshotState {
             .get("route")
             .cloned()
             .unwrap_or_else(|| "remote".to_owned());
+        let detail = event
+            .fields
+            .get("detail")
+            .cloned()
+            .unwrap_or_else(|| recent_domain_default_detail(&route));
 
         self.recent_targets.push_front(RecentTargetSnapshot {
             seen_at: clock_stamp(event.at),
             link,
             target,
             route,
+            detail,
             uploaded: 0,
             downloaded: 0,
         });
         self.recent_targets.truncate(RECENT_TARGETS);
+    }
+
+    fn capture_recent_domain_ip(&mut self, event: &TraceEvent) {
+        let (Some(domain), Some(ip)) = (event.fields.get("domain"), event.fields.get("ip")) else {
+            return;
+        };
+
+        let dns_link = format!("dns://{domain}");
+        if let Some(target) = self
+            .recent_targets
+            .iter_mut()
+            .find(|target| target.link == dns_link || target.target == domain.as_str())
+        {
+            append_recent_domain_ip(&mut target.detail, ip);
+        }
     }
 
     fn snapshot(&self) -> Option<DashboardSnapshot> {
@@ -300,6 +325,38 @@ fn recent_event_suffix(event: &TraceEvent) -> String {
         (None, Some(ip)) => format!(" {ip}"),
         (None, None) => String::new(),
     }
+}
+
+fn recent_domain_default_detail(route: &str) -> String {
+    match route {
+        "wg-dns-direct" | "direct" => "pending".to_owned(),
+        "wg-dns-block" | "block" => "blocked".to_owned(),
+        "wg-dns" | "wg-dns-remote" | "remote" => "wg tunnel".to_owned(),
+        _ => "-".to_owned(),
+    }
+}
+
+fn append_recent_domain_ip(detail: &mut String, ip: &str) {
+    if matches!(
+        detail.as_str(),
+        "" | "-" | "pending" | "blocked" | "wg tunnel"
+    ) {
+        *detail = ip.to_owned();
+        return;
+    }
+
+    if detail
+        .split(", ")
+        .any(|known| known == ip || known == "...")
+    {
+        return;
+    }
+    if detail.split(", ").count() >= 3 {
+        detail.push_str(", ...");
+        return;
+    }
+    detail.push_str(", ");
+    detail.push_str(ip);
 }
 
 pub fn init_channel(capacity: usize) {
@@ -906,6 +963,7 @@ mod tests {
         assert_eq!(snapshot.recent_targets[0].target, "example.com");
         assert_eq!(snapshot.recent_targets[0].link, "dns://example.com");
         assert_eq!(snapshot.recent_targets[0].route, "wg-dns");
+        assert_eq!(snapshot.recent_targets[0].detail, "wg tunnel");
     }
 
     #[test]
@@ -925,6 +983,28 @@ mod tests {
             "{}",
             snapshot.recent_events[0]
         );
+    }
+
+    #[test]
+    fn wg_hook_updates_recent_domain_resolved_ips() {
+        let mut snapshot = SnapshotState::default();
+        snapshot.ingest(&trace_event(
+            "INFO",
+            "dns query",
+            &[
+                ("target", "baidu.com"),
+                ("link", "dns://baidu.com"),
+                ("route", "wg-dns-direct"),
+            ],
+        ));
+        snapshot.ingest(&trace_event(
+            "INFO",
+            "running wg hook",
+            &[("domain", "baidu.com"), ("ip", "110.242.74.102")],
+        ));
+
+        assert_eq!(snapshot.recent_targets.len(), 1);
+        assert_eq!(snapshot.recent_targets[0].detail, "110.242.74.102");
     }
 
     #[test]

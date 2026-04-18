@@ -128,6 +128,7 @@ struct RecentTarget {
     seen_at: String,
     route: String,
     link: String,
+    detail: String,
     uploaded: u64,
     downloaded: u64,
 }
@@ -180,6 +181,7 @@ impl From<RecentTargetSnapshot> for RecentTarget {
             seen_at: value.seen_at,
             route: value.route,
             link: value.link,
+            detail: value.detail,
             uploaded: value.uploaded,
             downloaded: value.downloaded,
         }
@@ -285,6 +287,7 @@ impl DashboardApp {
 
         self.capture_listener_context(&event);
         self.capture_recent_event(&event);
+        self.capture_recent_domain_ip(&event);
 
         if event.message == "dns query" {
             self.capture_recent_domain(&event);
@@ -342,6 +345,7 @@ impl DashboardApp {
                 seen_at: clock_stamp(event.at),
                 link: link_from_target(&target),
                 route,
+                detail: String::new(),
                 uploaded,
                 downloaded,
             });
@@ -365,15 +369,36 @@ impl DashboardApp {
             .get("route")
             .cloned()
             .unwrap_or_else(|| "remote".to_owned());
+        let detail = event
+            .fields
+            .get("detail")
+            .cloned()
+            .unwrap_or_else(|| recent_domain_default_detail(&route));
 
         self.recent_targets.push_front(RecentTarget {
             seen_at: clock_stamp(event.at),
             link,
             route,
+            detail,
             uploaded: 0,
             downloaded: 0,
         });
         self.recent_targets.truncate(RECENT_TARGETS);
+    }
+
+    fn capture_recent_domain_ip(&mut self, event: &TraceEvent) {
+        let (Some(domain), Some(ip)) = (event.fields.get("domain"), event.fields.get("ip")) else {
+            return;
+        };
+
+        let dns_link = format!("dns://{domain}");
+        if let Some(target) = self
+            .recent_targets
+            .iter_mut()
+            .find(|target| target.link == dns_link || target.link == domain.as_str())
+        {
+            append_recent_domain_ip(&mut target.detail, ip);
+        }
     }
 
     fn refresh_process_stats(&mut self) {
@@ -643,13 +668,12 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(chunks[3]);
 
-    let speed = current_speed(app);
     let rows = app.recent_targets.iter().map(|item| {
         Row::new(vec![
             Cell::from(item.seen_at.clone()),
-            Cell::from(item.route.clone()),
-            Cell::from(item.link.clone()),
-            Cell::from(recent_target_activity(item, &app.context, speed)),
+            Cell::from(recent_target_route(item, &app.context)),
+            Cell::from(recent_target_link(item, &app.context)),
+            Cell::from(recent_target_activity(item, &app.context)),
         ])
     });
     let table = Table::new(rows, recent_targets_widths())
@@ -657,7 +681,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
             Row::new(vec![
                 "When",
                 "Route",
-                "Link",
+                recent_targets_link_header(&app.context),
                 recent_targets_activity_header(&app.context),
             ])
             .style(
@@ -898,19 +922,43 @@ fn recent_targets_title(context: &DashboardContext) -> &'static str {
 
 fn recent_targets_activity_header(context: &DashboardContext) -> &'static str {
     if recent_targets_are_domain_events(context) {
-        "Tunnel Speed"
+        "Resolved IPs"
     } else {
         "Up / Down"
     }
 }
 
-fn recent_target_activity(
-    item: &RecentTarget,
-    context: &DashboardContext,
-    speed: (u64, u64),
-) -> String {
+fn recent_targets_link_header(context: &DashboardContext) -> &'static str {
+    if recent_targets_are_domain_events(context) {
+        "Domain"
+    } else {
+        "Link"
+    }
+}
+
+fn recent_target_route(item: &RecentTarget, context: &DashboardContext) -> String {
     if recent_targets_are_domain_events(context) || item.link.starts_with("dns://") {
-        return format_speed(speed);
+        return recent_domain_route_label(&item.route);
+    }
+
+    item.route.clone()
+}
+
+fn recent_target_link(item: &RecentTarget, context: &DashboardContext) -> String {
+    if recent_targets_are_domain_events(context) || item.link.starts_with("dns://") {
+        return item
+            .link
+            .strip_prefix("dns://")
+            .unwrap_or(&item.link)
+            .to_owned();
+    }
+
+    item.link.clone()
+}
+
+fn recent_target_activity(item: &RecentTarget, context: &DashboardContext) -> String {
+    if recent_targets_are_domain_events(context) || item.link.starts_with("dns://") {
+        return recent_domain_detail(item);
     }
 
     format!(
@@ -920,19 +968,53 @@ fn recent_target_activity(
     )
 }
 
-fn current_speed(app: &DashboardApp) -> (u64, u64) {
-    (
-        app.upload_history.last().copied().unwrap_or_default(),
-        app.download_history.last().copied().unwrap_or_default(),
-    )
+fn recent_domain_route_label(route: &str) -> String {
+    match route {
+        "wg-dns-direct" | "direct" => "direct",
+        "wg-dns-block" | "block" => "block",
+        "wg-dns" | "wg-dns-remote" | "remote" => "proxy",
+        _ => route,
+    }
+    .to_owned()
 }
 
-fn format_speed((uploaded_per_sec, downloaded_per_sec): (u64, u64)) -> String {
-    format!(
-        "{}/s / {}/s",
-        format_bytes(uploaded_per_sec),
-        format_bytes(downloaded_per_sec)
-    )
+fn recent_domain_default_detail(route: &str) -> String {
+    match route {
+        "wg-dns-direct" | "direct" => "pending".to_owned(),
+        "wg-dns-block" | "block" => "blocked".to_owned(),
+        "wg-dns" | "wg-dns-remote" | "remote" => "wg tunnel".to_owned(),
+        _ => "-".to_owned(),
+    }
+}
+
+fn recent_domain_detail(item: &RecentTarget) -> String {
+    if item.detail.is_empty() {
+        return recent_domain_default_detail(&item.route);
+    }
+    item.detail.clone()
+}
+
+fn append_recent_domain_ip(detail: &mut String, ip: &str) {
+    if matches!(
+        detail.as_str(),
+        "" | "-" | "pending" | "blocked" | "wg tunnel"
+    ) {
+        *detail = ip.to_owned();
+        return;
+    }
+
+    if detail
+        .split(", ")
+        .any(|known| known == ip || known == "...")
+    {
+        return;
+    }
+    if detail.split(", ").count() >= 3 {
+        detail.push_str(", ...");
+        return;
+    }
+    detail.push_str(", ");
+    detail.push_str(ip);
 }
 
 fn recent_targets_are_domain_events(context: &DashboardContext) -> bool {
@@ -1026,8 +1108,9 @@ fn split_target(target: &str) -> (String, Option<u16>) {
 mod tests {
     use super::{
         DashboardApp, DashboardContext, RecentTarget, TraceEvent, fit_wave_data_to_width,
-        link_from_target, recent_target_activity, recent_targets_activity_header,
-        recent_targets_title, recent_targets_widths, split_target,
+        link_from_target, recent_target_activity, recent_target_link, recent_target_route,
+        recent_targets_activity_header, recent_targets_link_header, recent_targets_title,
+        recent_targets_widths, split_target,
     };
     use ratatui::layout::Constraint;
     use std::{collections::BTreeMap, path::PathBuf, time::SystemTime};
@@ -1170,6 +1253,7 @@ mod tests {
         assert_eq!(app.recent_targets.len(), 1);
         assert_eq!(app.recent_targets[0].link, "dns://example.com");
         assert_eq!(app.recent_targets[0].route, "wg-dns");
+        assert_eq!(app.recent_targets[0].detail, "wg tunnel");
     }
 
     #[test]
@@ -1211,11 +1295,12 @@ mod tests {
         };
 
         assert_eq!(recent_targets_title(&context), "Recent Domains");
-        assert_eq!(recent_targets_activity_header(&context), "Tunnel Speed");
+        assert_eq!(recent_targets_link_header(&context), "Domain");
+        assert_eq!(recent_targets_activity_header(&context), "Resolved IPs");
     }
 
     #[test]
-    fn wg_recent_domain_activity_shows_tunnel_speed() {
+    fn wg_recent_domain_activity_shows_resolved_ips() {
         let context = DashboardContext {
             command_label: "client".to_owned(),
             mode_label: "wg".to_owned(),
@@ -1227,15 +1312,50 @@ mod tests {
         };
         let item = RecentTarget {
             seen_at: "08:27:01".to_owned(),
-            route: "wg-dns".to_owned(),
+            route: "wg-dns-direct".to_owned(),
             link: "dns://example.com".to_owned(),
+            detail: "93.184.216.34".to_owned(),
             uploaded: 0,
             downloaded: 0,
         };
 
+        assert_eq!(recent_target_route(&item, &context), "direct");
+        assert_eq!(recent_target_link(&item, &context), "example.com");
+        assert_eq!(recent_target_activity(&item, &context), "93.184.216.34");
+    }
+
+    #[test]
+    fn wg_hook_updates_recent_domain_resolved_ips() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("pipit.log"),
+            log_filter: "info".to_owned(),
+        });
+
+        app.ingest(trace_event(
+            "INFO",
+            "dns query",
+            &[
+                ("target", "baidu.com"),
+                ("link", "dns://baidu.com"),
+                ("route", "wg-dns-direct"),
+            ],
+        ));
+        app.ingest(trace_event(
+            "INFO",
+            "running wg hook",
+            &[("domain", "baidu.com"), ("ip", "110.242.74.102")],
+        ));
+
+        assert_eq!(app.recent_targets.len(), 1);
+        assert_eq!(app.recent_targets[0].detail, "110.242.74.102");
         assert_eq!(
-            recent_target_activity(&item, &context, (1536, 2048)),
-            "1.5 KiB/s / 2.0 KiB/s"
+            recent_target_activity(&app.recent_targets[0], &app.context),
+            "110.242.74.102"
         );
     }
 
@@ -1254,15 +1374,13 @@ mod tests {
             seen_at: "08:27:01".to_owned(),
             route: "remote".to_owned(),
             link: "https://example.com".to_owned(),
+            detail: String::new(),
             uploaded: 1024,
             downloaded: 2048,
         };
 
         assert_eq!(recent_targets_activity_header(&context), "Up / Down");
-        assert_eq!(
-            recent_target_activity(&item, &context, (0, 0)),
-            "1.0 KiB / 2.0 KiB"
-        );
+        assert_eq!(recent_target_activity(&item, &context), "1.0 KiB / 2.0 KiB");
     }
 
     #[test]
