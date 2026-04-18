@@ -180,6 +180,7 @@ async fn native_http_mode_rejects_private_literal_targets_by_default() -> Result
         cidr_file: None,
         domain_rules: Default::default(),
         ip_rules: Default::default(),
+        adblock: Default::default(),
         user_agent: "pipit-test".to_owned(),
         handshake_timeout_secs: 10,
         connect_timeout_secs: 10,

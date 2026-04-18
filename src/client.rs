@@ -1,6 +1,7 @@
 use crate::{
     mode::ProxyMode,
     proxy::{
+        adblock::AdblockConfig,
         auth::AuthProof,
         http, mux, netlog, route,
         route::{FilterMode, RouteDecision},
@@ -59,6 +60,8 @@ pub struct ClientArgs {
     pub domain_rules: route::RouteRuleConfig,
     #[arg(skip)]
     pub ip_rules: route::RouteRuleConfig,
+    #[arg(skip)]
+    pub adblock: AdblockConfig,
     #[arg(long, default_value = "Mozilla/5.0")]
     pub user_agent: String,
     #[arg(long, default_value_t = 10)]
@@ -126,7 +129,7 @@ async fn run_native_http(args: ClientArgs) -> Result<()> {
         _ => bail!("run_native_http only supports native-http mode"),
     }
 
-    let router = route::Router::from_args(&args)?;
+    let router = route::Router::from_args(&args).await?;
     let connector = TlsConnector::from(tls::load_client_config(args.ca_cert.as_deref())?);
     let (default_host, _) = tls::split_host_port(&args.server)?;
     let server_name = args

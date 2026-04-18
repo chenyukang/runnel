@@ -29,6 +29,10 @@ The command prints one YAML file containing both sides:
 - `client.mode: wg` plus `client.wg`: use this on the client machine.
 - `server.mode: wg` plus `server.wg`: use this on the server machine.
 
+Generated configs enable `client.adblock` by default with EasyList,
+EasyPrivacy, and uBlock filters. Set `client.adblock.enabled: false` if you do
+not want DNS-level ad blocking.
+
 Use `--json` if another tool needs to consume the generated material.
 
 ## Check Before Running
@@ -170,6 +174,35 @@ client:
 `domain_rules.block` replies NXDOMAIN from the local DNS capture listener.
 If `domain_rules` are configured with `client.wg.dns`, config
 loading enables `dns_capture` automatically.
+
+Adblock subscriptions use the same DNS capture path in WG mode. User
+`domain_rules.block` entries are evaluated first, then adblock block rules,
+then user `domain_rules.direct` / `domain_rules.proxy`, and finally the default
+tunnel route:
+
+```yaml
+client:
+  mode: wg
+  adblock:
+    enabled: true
+    lists:
+      - ~/.config/pipit/easylist.txt
+      - https://easylist.to/easylist/easyprivacy.txt
+    cache_dir: ~/.cache/pipit/adblock
+    update_interval_hours: 24
+    decision_cache_ttl_secs: 300
+    fail_open: true
+  wg:
+    dns: 1.1.1.1
+    dns_capture: true
+```
+
+Set `enabled: false` to keep subscriptions in config but disable adblock. If
+`enabled` is omitted, adblock turns on automatically when `lists` is non-empty.
+HTTP(S) list subscriptions are cached locally and refreshed on startup after
+`update_interval_hours`. DNS decisions are cached in memory for
+`decision_cache_ttl_secs`, so adblock matching happens once per new queried
+domain rather than on every tunnel packet.
 
 Because this is DNS based, it only applies to DNS queries that pass through the
 local capture listener. DoH/DoT, browser private DNS, cached answers, or direct

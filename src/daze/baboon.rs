@@ -28,7 +28,7 @@ use tracing::{info, warn};
 const BABOON_PATH: &str = "/sync";
 
 pub(super) async fn run_client(args: ClientArgs) -> Result<()> {
-    let router = route::Router::from_args(&args)?;
+    let router = route::Router::from_args(&args).await?;
     let listener = TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("failed to bind {}", args.listen))?;

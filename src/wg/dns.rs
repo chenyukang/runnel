@@ -9,7 +9,10 @@ use tokio::{net::UdpSocket, task::JoinHandle, time::timeout};
 use tracing::{debug, warn};
 
 use crate::{
-    proxy::route::{self, RouteDecision, RouteRuleConfig},
+    proxy::{
+        adblock::Adblocker,
+        route::{self, RouteDecision, RouteRuleConfig},
+    },
     telemetry,
 };
 
@@ -26,7 +29,8 @@ pub(crate) struct DnsCaptureGuard {
 #[derive(Clone)]
 pub(crate) struct DomainRuleEngine {
     rules: RouteRuleConfig,
-    dynamic_routes: Arc<DynamicRouteManager>,
+    dynamic_routes: Option<Arc<DynamicRouteManager>>,
+    adblock: Option<Arc<Adblocker>>,
 }
 
 impl Drop for DnsCaptureGuard {
@@ -36,20 +40,28 @@ impl Drop for DnsCaptureGuard {
 }
 
 impl DomainRuleEngine {
-    pub(crate) fn new(rules: RouteRuleConfig, dynamic_routes: Arc<DynamicRouteManager>) -> Self {
+    pub(crate) fn new(
+        rules: RouteRuleConfig,
+        dynamic_routes: Option<Arc<DynamicRouteManager>>,
+        adblock: Option<Arc<Adblocker>>,
+    ) -> Self {
         Self {
             rules,
             dynamic_routes,
+            adblock,
         }
     }
 
-    fn decide(&self, domain: &str) -> Result<RouteDecision> {
-        decide_domain_rules(&self.rules, domain)
+    async fn decide(&self, domain: &str) -> Result<RouteDecision> {
+        decide_domain_rules(&self.rules, self.adblock.as_deref(), domain).await
     }
 
     fn apply_response_routes(&self, domain: &str, response: &[u8]) -> Result<()> {
+        let Some(dynamic_routes) = &self.dynamic_routes else {
+            return Ok(());
+        };
         for ip in parse_dns_answer_ips(response) {
-            if self.dynamic_routes.add_direct_host(domain, ip)? {
+            if dynamic_routes.add_direct_host(domain, ip)? {
                 debug!(domain = %domain, ip = %ip, "wg domain direct route installed");
             }
         }
@@ -57,15 +69,24 @@ impl DomainRuleEngine {
     }
 }
 
-fn decide_domain_rules(rules: &RouteRuleConfig, domain: &str) -> Result<RouteDecision> {
+async fn decide_domain_rules(
+    rules: &RouteRuleConfig,
+    adblock: Option<&Adblocker>,
+    domain: &str,
+) -> Result<RouteDecision> {
+    if route::matches_domain_rules(&rules.block, domain)? {
+        return Ok(RouteDecision::Block);
+    }
+    if let Some(adblock) = adblock
+        && adblock.blocks_domain(domain).await
+    {
+        return Ok(RouteDecision::Block);
+    }
     if route::matches_domain_rules(&rules.direct, domain)? {
         return Ok(RouteDecision::Direct);
     }
     if route::matches_domain_rules(&rules.proxy, domain)? {
         return Ok(RouteDecision::Remote);
-    }
-    if route::matches_domain_rules(&rules.block, domain)? {
-        return Ok(RouteDecision::Block);
     }
     Ok(RouteDecision::Remote)
 }
@@ -100,7 +121,7 @@ async fn run_dns_capture(
         let packet = buffer[..len].to_vec();
         let domain = parse_dns_query_name(&packet);
         let decision = match (&domain_rules, domain.as_deref()) {
-            (Some(rules), Some(domain)) => match rules.decide(domain) {
+            (Some(rules), Some(domain)) => match rules.decide(domain).await {
                 Ok(decision) => decision,
                 Err(err) => {
                     warn!(domain = %domain, error = %err, "wg DNS domain rule evaluation failed");
@@ -360,7 +381,10 @@ mod tests {
     use super::{
         decide_domain_rules, nxdomain_response, parse_dns_answer_ips, parse_dns_query_name,
     };
-    use crate::proxy::route::{RouteDecision, RouteRuleConfig};
+    use crate::proxy::{
+        adblock::Adblocker,
+        route::{RouteDecision, RouteRuleConfig},
+    };
     use std::net::{IpAddr, Ipv4Addr};
 
     fn query_packet() -> Vec<u8> {
@@ -425,8 +449,8 @@ mod tests {
         assert_eq!(&response[12..], &packet[12..]);
     }
 
-    #[test]
-    fn domain_rule_decision_matches_wg_dns_policy() {
+    #[tokio::test]
+    async fn domain_rule_decision_matches_wg_dns_policy() {
         let rules = RouteRuleConfig {
             direct: vec!["*.qq.com".to_owned()],
             proxy: Vec::new(),
@@ -434,16 +458,45 @@ mod tests {
         };
 
         assert_eq!(
-            decide_domain_rules(&rules, "img.qq.com").unwrap(),
+            decide_domain_rules(&rules, None, "img.qq.com")
+                .await
+                .unwrap(),
             RouteDecision::Direct
         );
         assert_eq!(
-            decide_domain_rules(&rules, "ads.xxx.com").unwrap(),
+            decide_domain_rules(&rules, None, "ads.xxx.com")
+                .await
+                .unwrap(),
             RouteDecision::Block
         );
         assert_eq!(
-            decide_domain_rules(&rules, "example.com").unwrap(),
+            decide_domain_rules(&rules, None, "example.com")
+                .await
+                .unwrap(),
             RouteDecision::Remote
+        );
+    }
+
+    #[tokio::test]
+    async fn adblock_decision_beats_wg_direct_rule() {
+        let rules = RouteRuleConfig {
+            direct: vec!["*.qq.com".to_owned()],
+            proxy: Vec::new(),
+            block: Vec::new(),
+        };
+        let adblock = Adblocker::from_rules_for_test(&["||ads.qq.com^"]);
+
+        assert_eq!(
+            decide_domain_rules(&rules, Some(&adblock), "ads.qq.com")
+                .await
+                .unwrap(),
+            RouteDecision::Block
+        );
+        assert_eq!(
+            decide_domain_rules(&rules, Some(&adblock), "img.qq.com")
+                .await
+                .unwrap(),
+            RouteDecision::Direct
         );
     }
 }

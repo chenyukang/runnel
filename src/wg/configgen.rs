@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use clap::Args;
 use serde::Serialize;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use crate::proxy::route::{self, RouteRuleConfig};
 
@@ -9,6 +9,13 @@ use super::{
     DEFAULT_TUNNEL_MTU, default_server_allowed_ips, keys::generate_key_material,
     normalize_allowed_ips, parse_socket_addr,
 };
+
+const DEFAULT_ADBLOCK_DNS: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+const DEFAULT_ADBLOCK_LISTS: &[&str] = &[
+    "https://easylist.to/easylist/easylist.txt",
+    "https://easylist.to/easylist/easyprivacy.txt",
+    "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt",
+];
 
 #[derive(Clone, Debug, Args)]
 pub struct WgConfigArgs {
@@ -45,9 +52,20 @@ struct GeneratedWgConfig {
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct GeneratedWgClientSection {
     mode: &'static str,
+    adblock: GeneratedAdblockConfig,
     #[serde(skip_serializing_if = "RouteRuleConfig::is_empty")]
     ip_rules: RouteRuleConfig,
     wg: GeneratedWgClientConfig,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct GeneratedAdblockConfig {
+    enabled: bool,
+    lists: Vec<&'static str>,
+    cache_dir: &'static str,
+    update_interval_hours: u64,
+    decision_cache_ttl_secs: u64,
+    fail_open: bool,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -101,9 +119,8 @@ fn generate_config(args: &WgConfigArgs) -> Result<GeneratedWgConfig> {
     if args.client_tunnel_ip == args.server_tunnel_ip {
         bail!("wg config client_tunnel_ip and server_tunnel_ip must differ");
     }
-    if args.dns_capture && args.dns.is_none() {
-        bail!("wg config dns_capture requires --dns as the upstream resolver");
-    }
+    let dns = args.dns.or(Some(DEFAULT_ADBLOCK_DNS));
+    let dns_capture = args.dns_capture || dns.is_some();
     let server_endpoint = parse_socket_addr("wg config server_endpoint", &args.server_endpoint)?;
     let client_keys = generate_key_material();
     let server_keys = generate_key_material();
@@ -118,6 +135,7 @@ fn generate_config(args: &WgConfigArgs) -> Result<GeneratedWgConfig> {
     Ok(GeneratedWgConfig {
         client: GeneratedWgClientSection {
             mode: "wg",
+            adblock: default_adblock_config(),
             ip_rules: RouteRuleConfig {
                 direct: args.direct_ips.clone(),
                 proxy: Vec::new(),
@@ -131,8 +149,8 @@ fn generate_config(args: &WgConfigArgs) -> Result<GeneratedWgConfig> {
                 peer_tunnel_ip: args.server_tunnel_ip,
                 mtu: args.mtu,
                 persistent_keepalive_secs: args.persistent_keepalive_secs,
-                dns: args.dns,
-                dns_capture: args.dns_capture,
+                dns,
+                dns_capture,
             },
         },
         server: GeneratedWgServerSection {
@@ -149,6 +167,17 @@ fn generate_config(args: &WgConfigArgs) -> Result<GeneratedWgConfig> {
             },
         },
     })
+}
+
+fn default_adblock_config() -> GeneratedAdblockConfig {
+    GeneratedAdblockConfig {
+        enabled: true,
+        lists: DEFAULT_ADBLOCK_LISTS.to_vec(),
+        cache_dir: "~/.cache/pipit/adblock",
+        update_interval_hours: 24,
+        decision_cache_ttl_secs: 300,
+        fail_open: true,
+    }
 }
 
 fn validate_ip_rules(label: &str, rules: &[String]) -> Result<()> {
@@ -196,6 +225,20 @@ mod tests {
         assert_eq!(generated.server.mode, "wg");
         assert_eq!(generated.client.wg.endpoint, "198.51.100.10:51820");
         assert_eq!(generated.server.wg.listen, "0.0.0.0:51820");
+        assert!(generated.client.adblock.enabled);
+        assert_eq!(
+            generated.client.adblock.lists,
+            vec![
+                "https://easylist.to/easylist/easylist.txt",
+                "https://easylist.to/easylist/easyprivacy.txt",
+                "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt"
+            ]
+        );
+        assert_eq!(
+            generated.client.wg.dns,
+            Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
+        );
+        assert!(generated.client.wg.dns_capture);
         assert!(generated.client.ip_rules.is_empty());
         assert_eq!(generated.server.wg.peer_allowed_ips, vec!["10.8.0.2/32"]);
         assert_eq!(
@@ -210,6 +253,10 @@ mod tests {
         let yaml = serde_yaml::to_string(&generated).unwrap();
         assert!(!yaml.contains("proxy:"), "{yaml}");
         let parsed: FileConfig = serde_yaml::from_str(&yaml).unwrap();
+        let client = parsed.client.as_ref().expect("generated client section");
+        let adblock = client.adblock.as_ref().expect("generated adblock section");
+        assert_eq!(adblock.enabled, Some(true));
+        assert_eq!(adblock.lists.len(), 3);
         assert_eq!(
             parsed
                 .client
@@ -253,6 +300,11 @@ mod tests {
         assert_eq!(generated.server.wg.peer_allowed_ips, vec!["10.9.0.0/24"]);
         assert_eq!(generated.client.wg.mtu, 1280);
         assert_eq!(generated.client.wg.persistent_keepalive_secs, 30);
+        assert_eq!(
+            generated.client.wg.dns,
+            Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
+        );
+        assert!(generated.client.wg.dns_capture);
 
         let yaml = serde_yaml::to_string(&generated).unwrap();
         assert!(yaml.contains("direct:"), "{yaml}");

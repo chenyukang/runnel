@@ -125,6 +125,9 @@ There are also shape-only templates at
 [`config/wg-ipv4.yaml`](./config/wg-ipv4.yaml) and
 [`config/wg-ipv6.yaml`](./config/wg-ipv6.yaml). Prefer `wg-config` for real
 deployments so each client/server pair gets fresh keys.
+Generated WG configs enable `client.adblock` by default with EasyList,
+EasyPrivacy, and uBlock filters; set `client.adblock.enabled: false` if you do
+not want DNS-level ad blocking.
 
 Start the server first:
 
@@ -304,6 +307,15 @@ client:
       - "0.3.0.2/16"
     block:
       - "12.9.*.0"
+  adblock:
+    enabled: true
+    lists:
+      - ~/.config/pipit/easylist.txt
+      - https://easylist.to/easylist/easyprivacy.txt
+    cache_dir: ~/.cache/pipit/adblock
+    update_interval_hours: 24
+    decision_cache_ttl_secs: 300
+    fail_open: true
 ```
 
 `domain_rules` use case-insensitive glob matching. A pattern like `*.qq.com`
@@ -315,6 +327,16 @@ host routes. Inline rules automatically enable `client.filter: rule` unless
 describe client-side routing behavior. Quote wildcard patterns in YAML because
 unquoted `*` starts a YAML alias. If `client.filter` is explicitly set to
 `proxy` or `direct`, only `block` rules are still honored.
+
+`client.adblock` loads ABP/uBlock-style network filter lists. Set
+`enabled: false` to keep subscriptions in config but disable adblock. If
+`enabled` is omitted, adblock turns on automatically when `lists` is non-empty.
+Local files are read directly; HTTP(S) subscriptions are cached under
+`cache_dir` and refreshed after `update_interval_hours`. Adblock decisions are
+cached in memory for `decision_cache_ttl_secs`. The routing priority is: user `block` rules,
+adblock block rules, user `direct`/`proxy` rules, then the default proxy path.
+With `fail_open: true`, broken subscriptions are skipped so startup does not
+fail just because a list server is unavailable.
 
 ```bash
 PIPIT_PASSWORD='replace-me' ./target/release/pipit client \
@@ -332,8 +354,8 @@ Filter modes:
 
 - `--filter proxy`: always use the remote proxy. This is the default.
 - `--filter direct`: always connect directly from the client machine.
-- `--filter rule`: evaluate hostname glob rules, then CIDR rules, then fall back
-  to remote.
+- `--filter rule`: evaluate block rules, adblock rules, direct/proxy rules, then
+  fall back to remote.
 
 Example `rule.ls`:
 
@@ -358,8 +380,9 @@ rules are not used there, but block rules still apply. WG mode can map common
 default route. WG also supports `domain_rules` through DNS capture:
 `domain_rules.direct` installs dynamic direct host routes for resolved A/AAAA
 records, `domain_rules.block` returns NXDOMAIN, and `domain_rules.proxy` keeps
-the default tunnel behavior. WG `ip_rules.block` still needs firewall or
-blackhole-route hooks and is not enforced yet.
+the default tunnel behavior. In WG mode `client.adblock` also runs from DNS
+capture and returns NXDOMAIN for blocked domains. WG `ip_rules.block` still
+needs firewall or blackhole-route hooks and is not enforced yet.
 
 ## Config Files
 

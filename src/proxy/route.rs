@@ -1,4 +1,4 @@
-use super::{socks5, socks5::TargetAddr, traffic};
+use super::{adblock::Adblocker, socks5, socks5::TargetAddr, traffic};
 use crate::client::ClientArgs;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
@@ -64,11 +64,12 @@ struct RuleTable {
 pub struct Router {
     mode: FilterMode,
     table: RuleTable,
+    adblock: Option<Arc<Adblocker>>,
     cache: Mutex<HashMap<String, RouteDecision>>,
 }
 
 impl Router {
-    pub fn from_args(args: &ClientArgs) -> Result<Arc<Self>> {
+    pub async fn from_args(args: &ClientArgs) -> Result<Arc<Self>> {
         let should_load_inline_rules = !args.domain_rules.is_empty() || !args.ip_rules.is_empty();
         let mut table = if matches!(args.filter, FilterMode::Rule) || should_load_inline_rules {
             RuleTable::load(
@@ -87,41 +88,41 @@ impl Router {
         if matches!(args.filter, FilterMode::Rule) {
             table.direct_cidrs.extend(reserved_ip_nets());
         }
+        let adblock = Adblocker::from_config(&args.adblock).await?;
 
         Ok(Arc::new(Self {
             mode: args.filter,
             table,
+            adblock,
             cache: Mutex::new(HashMap::new()),
         }))
     }
 
     pub async fn decide(&self, target: &TargetAddr) -> Result<RouteDecision> {
-        match self.mode {
-            FilterMode::Proxy => {
-                if let Some(decision) = self.table.decide_block_only(target).await? {
-                    return Ok(decision);
-                }
-                Ok(RouteDecision::Remote)
-            }
-            FilterMode::Direct => {
-                if let Some(decision) = self.table.decide_block_only(target).await? {
-                    return Ok(decision);
-                }
-                Ok(RouteDecision::Direct)
-            }
-            FilterMode::Rule => self.decide_by_rule(target).await,
-        }
-    }
-
-    async fn decide_by_rule(&self, target: &TargetAddr) -> Result<RouteDecision> {
-        let host = target.host_string();
-        if let Some(cached) = self.cache.lock().await.get(&host).copied() {
+        if let Some(cached) = self.cache.lock().await.get(&cache_key(target)).copied() {
             return Ok(cached);
         }
 
-        let decision = self.table.decide(target).await?;
-        self.cache.lock().await.insert(host, decision);
+        let decision = self.decide_uncached(target).await?;
+        self.cache.lock().await.insert(cache_key(target), decision);
         Ok(decision)
+    }
+
+    async fn decide_uncached(&self, target: &TargetAddr) -> Result<RouteDecision> {
+        if let Some(decision) = self.table.decide_block_only(target).await? {
+            return Ok(decision);
+        }
+        if let Some(adblock) = &self.adblock
+            && adblock.blocks_target(target).await
+        {
+            return Ok(RouteDecision::Block);
+        }
+
+        match self.mode {
+            FilterMode::Proxy => Ok(RouteDecision::Remote),
+            FilterMode::Direct => Ok(RouteDecision::Direct),
+            FilterMode::Rule => self.table.decide_route_only(target).await,
+        }
     }
 }
 
@@ -238,7 +239,35 @@ impl RuleTable {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn decide(&self, target: &TargetAddr) -> Result<RouteDecision> {
+        let host = target.host_string();
+        if matches_any(&self.block_globs, &host)? {
+            return Ok(RouteDecision::Block);
+        }
+
+        if !self.block_cidrs.is_empty() {
+            let addrs = resolve_target_ips(target).await?;
+            if contains_any(&self.block_cidrs, &addrs) {
+                return Ok(RouteDecision::Block);
+            }
+            return self
+                .decide_route_only_with_addrs(target, Some(&addrs))
+                .await;
+        }
+
+        self.decide_route_only(target).await
+    }
+
+    async fn decide_route_only(&self, target: &TargetAddr) -> Result<RouteDecision> {
+        self.decide_route_only_with_addrs(target, None).await
+    }
+
+    async fn decide_route_only_with_addrs(
+        &self,
+        target: &TargetAddr,
+        known_addrs: Option<&[IpAddr]>,
+    ) -> Result<RouteDecision> {
         let host = target.host_string();
         if matches_any(&self.direct_globs, &host)? {
             return Ok(RouteDecision::Direct);
@@ -246,19 +275,19 @@ impl RuleTable {
         if matches_any(&self.remote_globs, &host)? {
             return Ok(RouteDecision::Remote);
         }
-        if matches_any(&self.block_globs, &host)? {
-            return Ok(RouteDecision::Block);
-        }
 
-        let addrs = resolve_target_ips(target).await?;
-        if contains_any(&self.direct_cidrs, &addrs) {
+        let addrs;
+        let addrs = if let Some(addrs) = known_addrs {
+            addrs
+        } else {
+            addrs = resolve_target_ips(target).await?;
+            &addrs
+        };
+        if contains_any(&self.direct_cidrs, addrs) {
             return Ok(RouteDecision::Direct);
         }
-        if contains_any(&self.remote_cidrs, &addrs) {
+        if contains_any(&self.remote_cidrs, addrs) {
             return Ok(RouteDecision::Remote);
-        }
-        if contains_any(&self.block_cidrs, &addrs) {
-            return Ok(RouteDecision::Block);
         }
 
         Ok(RouteDecision::Remote)
@@ -278,6 +307,10 @@ impl RuleTable {
         }
         Ok(None)
     }
+}
+
+fn cache_key(target: &TargetAddr) -> String {
+    target.to_string()
 }
 
 pub async fn relay_direct_socks(
@@ -641,6 +674,7 @@ mod tests {
         let router = Router {
             mode: FilterMode::Proxy,
             table,
+            adblock: None,
             cache: Mutex::new(HashMap::new()),
         };
 
@@ -657,6 +691,65 @@ mod tests {
                 .await
                 .expect("block rule is honored in proxy mode"),
             RouteDecision::Block
+        );
+    }
+
+    #[tokio::test]
+    async fn user_block_rules_beat_direct_rules() {
+        let table = RuleTable::load(
+            None,
+            None,
+            &RouteRuleConfig {
+                direct: vec!["*.example".to_owned()],
+                proxy: Vec::new(),
+                block: vec!["ads.example".to_owned()],
+            },
+            &RouteRuleConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            table
+                .decide(&TargetAddr::Domain("ads.example".to_owned(), 443))
+                .await
+                .expect("block wins over direct"),
+            RouteDecision::Block
+        );
+    }
+
+    #[tokio::test]
+    async fn adblock_rules_beat_user_direct_rules() {
+        let table = RuleTable::load(
+            None,
+            None,
+            &RouteRuleConfig {
+                direct: vec!["*.qq.com".to_owned()],
+                proxy: Vec::new(),
+                block: Vec::new(),
+            },
+            &RouteRuleConfig::default(),
+        )
+        .unwrap();
+        let router = Router {
+            mode: FilterMode::Rule,
+            table,
+            adblock: Some(Adblocker::from_rules_for_test(&["||ads.qq.com^"])),
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        assert_eq!(
+            router
+                .decide(&TargetAddr::Domain("ads.qq.com".to_owned(), 443))
+                .await
+                .expect("adblock wins over direct"),
+            RouteDecision::Block
+        );
+        assert_eq!(
+            router
+                .decide(&TargetAddr::Domain("img.qq.com".to_owned(), 443))
+                .await
+                .expect("direct still applies after adblock miss"),
+            RouteDecision::Direct
         );
     }
 

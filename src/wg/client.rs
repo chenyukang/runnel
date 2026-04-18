@@ -23,7 +23,10 @@ use std::{
 use tokio::{net::UdpSocket, time::timeout};
 use tracing::{info, warn};
 
-use crate::{proxy::route::RouteRuleConfig, system_proxy};
+use crate::{
+    proxy::{adblock::AdblockConfig, adblock::Adblocker, route::RouteRuleConfig},
+    system_proxy,
+};
 
 const HANDSHAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -60,6 +63,8 @@ pub struct WgClientArgs {
     pub direct_ips: Vec<String>,
     #[arg(skip)]
     pub domain_rules: RouteRuleConfig,
+    #[arg(skip)]
+    pub adblock: AdblockConfig,
     #[arg(long)]
     pub up: Vec<String>,
     #[arg(long)]
@@ -89,6 +94,7 @@ impl Default for WgClientArgs {
             proxy_ips: Vec::new(),
             direct_ips: Vec::new(),
             domain_rules: RouteRuleConfig::default(),
+            adblock: AdblockConfig::default(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -136,6 +142,7 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
     let socket_path = control_socket_path(&actual_device);
     apply_device_config(&socket_path, &runtime)?;
     start_stats_poller("wg-client", socket_path.clone());
+    let adblock = Adblocker::from_config(&args.adblock).await?;
     let plan = effective_hook_plan(
         plan_client_hooks(&actual_device, &runtime)?,
         &args.up,
@@ -148,7 +155,18 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
     };
     let domain_rules = domain_route_manager
         .as_ref()
-        .map(|manager| DomainRuleEngine::new(args.domain_rules.clone(), Arc::clone(manager)));
+        .map(|manager| {
+            DomainRuleEngine::new(
+                args.domain_rules.clone(),
+                Some(Arc::clone(manager)),
+                adblock.clone(),
+            )
+        })
+        .or_else(|| {
+            adblock
+                .as_ref()
+                .map(|_| DomainRuleEngine::new(args.domain_rules.clone(), None, adblock.clone()))
+        });
     run_hooks(&plan.up)?;
 
     // Keep the device alive until we receive a shutdown signal. The guard is declared
@@ -361,6 +379,18 @@ impl WgClientArgs {
                 );
             }
         }
+        if self.adblock.is_active() {
+            if self.dns.is_none() {
+                bail!(
+                    "wg client adblock requires client.wg.dns because WG adblock is driven by DNS capture"
+                );
+            }
+            if !self.dns_capture {
+                bail!(
+                    "wg client adblock requires client.wg.dns_capture: true because WG cannot block by domain without DNS capture"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -450,6 +480,7 @@ mod tests {
             proxy_ips: Vec::new(),
             direct_ips: Vec::new(),
             domain_rules: RouteRuleConfig::default(),
+            adblock: Default::default(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -484,6 +515,7 @@ mod tests {
             proxy_ips: vec!["203.0.113.0/24".to_owned()],
             direct_ips: Vec::new(),
             domain_rules: RouteRuleConfig::default(),
+            adblock: Default::default(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -512,6 +544,7 @@ mod tests {
             proxy_ips: Vec::new(),
             direct_ips: vec!["100.64.0.0/10".to_owned()],
             domain_rules: RouteRuleConfig::default(),
+            adblock: Default::default(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -540,6 +573,7 @@ mod tests {
             proxy_ips: Vec::new(),
             direct_ips: Vec::new(),
             domain_rules: RouteRuleConfig::default(),
+            adblock: Default::default(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: false,
@@ -568,6 +602,7 @@ mod tests {
             proxy_ips: vec!["203.0.113.0/24".to_owned()],
             direct_ips: Vec::new(),
             domain_rules: RouteRuleConfig::default(),
+            adblock: Default::default(),
             up: Vec::new(),
             down: Vec::new(),
             print_hooks: true,

@@ -10,7 +10,10 @@ use crate::{
     cert::CertArgs,
     client::ClientArgs,
     mode::ProxyMode,
-    proxy::route::{self, FilterMode, RouteRuleConfig},
+    proxy::{
+        adblock::AdblockConfig,
+        route::{self, FilterMode, RouteRuleConfig},
+    },
     server::ServerArgs,
     tun::TunArgs,
     wg::{client::WgClientArgs, keys::public_key_from_private_key, server::WgServerArgs},
@@ -50,6 +53,7 @@ pub struct ClientConfig {
     pub cidr_file: Option<PathBuf>,
     pub domain_rules: Option<RouteRuleConfig>,
     pub ip_rules: Option<RouteRuleConfig>,
+    pub adblock: Option<AdblockConfig>,
     pub user_agent: Option<String>,
     pub handshake_timeout_secs: Option<u64>,
     pub connect_timeout_secs: Option<u64>,
@@ -291,6 +295,9 @@ pub fn apply_client(
     let ip_rules = merged_route_rules(&config.ip_rules, &client.ip_rules);
     args.domain_rules = domain_rules.clone();
     args.ip_rules = ip_rules.clone();
+    if let Some(adblock) = &client.adblock {
+        args.adblock = adblock.with_base_dir(base_dir);
+    }
     if should_enable_rule_mode_for_inline_rules(args, client, matches, &domain_rules, &ip_rules) {
         args.filter = FilterMode::Rule;
     }
@@ -328,7 +335,9 @@ pub fn apply_client(
         apply_wg_client_config(&mut args.wg, wg, |_| true);
     }
     if matches!(args.effective_mode()?, ProxyMode::Wg) {
+        args.wg.adblock = args.adblock.clone();
         apply_common_route_rules_to_wg(&mut args.wg, &domain_rules, &ip_rules)?;
+        apply_adblock_to_wg(&mut args.wg)?;
     }
     validate_active_client_credentials(args, config)
 }
@@ -487,7 +496,7 @@ pub fn apply_wg_client(
     args: &mut WgClientArgs,
     config: &FileConfig,
     _matches: &ArgMatches,
-    _base_dir: &Path,
+    base_dir: &Path,
 ) -> Result<()> {
     let Some(client) = &config.client else {
         return Ok(());
@@ -499,7 +508,11 @@ pub fn apply_wg_client(
     apply_wg_client_config(args, wg_client, |id| should_override(_matches, id));
     let domain_rules = merged_route_rules(&config.domain_rules, &client.domain_rules);
     let ip_rules = merged_route_rules(&config.ip_rules, &client.ip_rules);
+    if let Some(adblock) = &client.adblock {
+        args.adblock = adblock.with_base_dir(base_dir);
+    }
     apply_common_route_rules_to_wg(args, &domain_rules, &ip_rules)?;
+    apply_adblock_to_wg(args)?;
     validate_wg_client_pair(args, config.server.as_ref())
 }
 
@@ -719,6 +732,22 @@ fn wg_domain_rules_need_dns_capture(domain_rules: &RouteRuleConfig) -> bool {
     !domain_rules.direct.is_empty() || !domain_rules.block.is_empty()
 }
 
+fn apply_adblock_to_wg(args: &mut WgClientArgs) -> Result<()> {
+    if !args.adblock.is_active() {
+        return Ok(());
+    }
+    if args.dns.is_none() {
+        bail!(
+            "client.adblock requires client.wg.dns in wg mode because adblock is driven by DNS capture"
+        );
+    }
+    if !args.dns_capture {
+        warn!("enabling client.wg.dns_capture because client.adblock is configured for wg mode");
+        args.dns_capture = true;
+    }
+    Ok(())
+}
+
 fn merged_route_rules(
     global: &Option<RouteRuleConfig>,
     local: &Option<RouteRuleConfig>,
@@ -926,14 +955,18 @@ fn resolve_path(base_dir: &Path, path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientConfig, FileConfig, ServerConfig, WgServerConfig, apply_common_route_rules_to_wg,
-        load, maybe_assign_optional, resolve_path, validate_active_client_credentials,
-        validate_active_server_credentials, validate_wg_client_pair,
+        ClientConfig, FileConfig, ServerConfig, WgServerConfig, apply_adblock_to_wg,
+        apply_common_route_rules_to_wg, load, maybe_assign_optional, resolve_path,
+        validate_active_client_credentials, validate_active_server_credentials,
+        validate_wg_client_pair,
     };
     use crate::{
         client::ClientArgs,
         mode::ProxyMode,
-        proxy::route::{FilterMode, RouteRuleConfig},
+        proxy::{
+            adblock::AdblockConfig,
+            route::{FilterMode, RouteRuleConfig},
+        },
         server::ServerArgs,
         wg::{client::WgClientArgs, keys::public_key_from_private_key, server::WgServerArgs},
     };
@@ -972,6 +1005,14 @@ client:
       - "0.3.0.2/16"
     block:
       - "12.9.*.0"
+  adblock:
+    lists:
+      - lists/easylist.txt
+      - https://example.com/easyprivacy.txt
+    cache_dir: cache/adblock
+    update_interval_hours: 12
+    decision_cache_ttl_secs: 60
+    fail_open: true
   system_proxy: true
   system_proxy_services:
     - Wi-Fi
@@ -1047,6 +1088,25 @@ server:
                 .and_then(|cfg| cfg.ip_rules.as_ref())
                 .map(|rules| rules.direct.clone()),
             Some(vec!["128.33.*".to_owned(), "0.3.0.2/16".to_owned()])
+        );
+        assert_eq!(
+            parsed
+                .client
+                .as_ref()
+                .and_then(|cfg| cfg.adblock.as_ref())
+                .map(|adblock| adblock.lists.clone()),
+            Some(vec![
+                "lists/easylist.txt".to_owned(),
+                "https://example.com/easyprivacy.txt".to_owned()
+            ])
+        );
+        assert_eq!(
+            parsed
+                .client
+                .as_ref()
+                .and_then(|cfg| cfg.adblock.as_ref())
+                .and_then(|adblock| adblock.cache_dir.as_deref()),
+            Some(Path::new("cache/adblock"))
         );
         assert_eq!(
             parsed
@@ -1317,6 +1377,54 @@ telemetry-sock: /tmp/pipit.sock
     }
 
     #[test]
+    fn adblock_enables_wg_dns_capture_when_dns_is_configured() {
+        let mut args = WgClientArgs {
+            dns: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+            dns_capture: false,
+            adblock: AdblockConfig {
+                lists: vec!["easylist.txt".to_owned()],
+                ..AdblockConfig::default()
+            },
+            ..Default::default()
+        };
+
+        apply_adblock_to_wg(&mut args).unwrap();
+
+        assert!(args.dns_capture);
+    }
+
+    #[test]
+    fn adblock_requires_wg_dns_upstream() {
+        let mut args = WgClientArgs {
+            adblock: AdblockConfig {
+                lists: vec!["easylist.txt".to_owned()],
+                ..AdblockConfig::default()
+            },
+            ..Default::default()
+        };
+
+        let err = apply_adblock_to_wg(&mut args).unwrap_err().to_string();
+
+        assert!(err.contains("client.wg.dns"), "{err}");
+    }
+
+    #[test]
+    fn disabled_adblock_does_not_require_wg_dns_upstream() {
+        let mut args = WgClientArgs {
+            adblock: AdblockConfig {
+                enabled: Some(false),
+                lists: vec!["easylist.txt".to_owned()],
+                ..AdblockConfig::default()
+            },
+            ..Default::default()
+        };
+
+        apply_adblock_to_wg(&mut args).unwrap();
+
+        assert!(!args.dns_capture);
+    }
+
+    #[test]
     fn wg_peer_public_key_mismatch_reports_startup_error() {
         let client_private = key([0x11; 32]);
         let server_private = key([0x22; 32]);
@@ -1395,6 +1503,7 @@ wg_client:
             cidr_file: None,
             domain_rules: Default::default(),
             ip_rules: Default::default(),
+            adblock: Default::default(),
             user_agent: "Mozilla/5.0".to_owned(),
             handshake_timeout_secs: 10,
             connect_timeout_secs: 10,
