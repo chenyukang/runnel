@@ -1,10 +1,13 @@
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::telemetry;
 
-use super::uapi::{WgDeviceStats, read_device_stats, read_last_handshake_age};
+use super::{
+    WgRuntimeConfig,
+    uapi::{WgDeviceStats, read_device_stats, read_last_handshake_age, refresh_peer_config},
+};
 
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -80,6 +83,89 @@ pub(crate) fn start_handshake_watchdog(role: &'static str, socket_path: PathBuf,
                     error = %error,
                     "wg handshake watchdog task failed"
                 );
+            }
+        }
+    });
+}
+
+pub(crate) fn start_unhandshaken_peer_refresher(
+    role: &'static str,
+    socket_path: PathBuf,
+    runtime: WgRuntimeConfig,
+    interval: Duration,
+) {
+    if interval.is_zero() {
+        return;
+    }
+
+    let _ = tokio::spawn(async move {
+        let start = tokio::time::Instant::now() + interval;
+        let mut ticker = tokio::time::interval_at(start, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            ticker.tick().await;
+            let path = socket_path.clone();
+            let sample = tokio::task::spawn_blocking(move || read_last_handshake_age(&path)).await;
+
+            match sample {
+                Ok(Ok(Some(_))) => {
+                    debug!(
+                        role,
+                        uapi_socket = %socket_path.display(),
+                        "stopping wg unhandshaken peer refresher after successful handshake"
+                    );
+                    break;
+                }
+                Ok(Ok(None)) => {
+                    let path = socket_path.clone();
+                    let runtime = runtime.clone();
+                    let refresh =
+                        tokio::task::spawn_blocking(move || refresh_peer_config(&path, &runtime))
+                            .await;
+                    match refresh {
+                        Ok(Ok(())) => {
+                            info!(
+                                role,
+                                uapi_socket = %socket_path.display(),
+                                interval_secs = interval.as_secs(),
+                                "refreshed wg peer while waiting for first handshake"
+                            );
+                        }
+                        Ok(Err(error)) => {
+                            warn!(
+                                role,
+                                uapi_socket = %socket_path.display(),
+                                error = %error,
+                                "failed to refresh wg peer before first handshake"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                role,
+                                uapi_socket = %socket_path.display(),
+                                error = %error,
+                                "wg peer refresh task failed"
+                            );
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    debug!(
+                        role,
+                        uapi_socket = %socket_path.display(),
+                        error = %error,
+                        "failed to poll wg handshake before peer refresh"
+                    );
+                }
+                Err(error) => {
+                    debug!(
+                        role,
+                        uapi_socket = %socket_path.display(),
+                        error = %error,
+                        "wg handshake poll task failed before peer refresh"
+                    );
+                }
             }
         }
     });

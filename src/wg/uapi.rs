@@ -25,6 +25,16 @@ pub(crate) fn build_set_request(runtime: &WgRuntimeConfig) -> String {
     if let Some(listen_port) = runtime.listen_port() {
         lines.push(format!("listen_port={listen_port}"));
     }
+    lines.extend(peer_config_lines(runtime));
+    lines.join("\n")
+}
+
+pub(crate) fn build_peer_refresh_request(runtime: &WgRuntimeConfig) -> String {
+    peer_config_lines(runtime).join("\n")
+}
+
+fn peer_config_lines(runtime: &WgRuntimeConfig) -> Vec<String> {
+    let mut lines = Vec::new();
     lines.push("replace_peers=true".to_owned());
     lines.push(format!(
         "public_key={}",
@@ -42,11 +52,16 @@ pub(crate) fn build_set_request(runtime: &WgRuntimeConfig) -> String {
             .iter()
             .map(|allowed_ip| format!("allowed_ip={allowed_ip}")),
     );
-    lines.join("\n")
+    lines
 }
 
 pub(crate) fn apply_device_config(socket_path: &Path, runtime: &WgRuntimeConfig) -> Result<()> {
     let request = build_set_request(runtime);
+    send_set_request(socket_path, &request)
+}
+
+pub(crate) fn refresh_peer_config(socket_path: &Path, runtime: &WgRuntimeConfig) -> Result<()> {
+    let request = build_peer_refresh_request(runtime);
     send_set_request(socket_path, &request)
 }
 
@@ -175,8 +190,8 @@ fn parse_errno(response: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        WgDeviceStats, build_set_request, control_socket_path, parse_device_stats,
-        parse_last_handshake_age,
+        WgDeviceStats, build_peer_refresh_request, build_set_request, control_socket_path,
+        parse_device_stats, parse_last_handshake_age,
     };
     use crate::wg::{WgRuntimeConfig, default_client_allowed_ips, default_server_allowed_ips};
     use std::{
@@ -241,6 +256,33 @@ mod tests {
         assert!(request.contains("allowed_ip=10.8.0.2/32"));
         assert!(!request.contains("endpoint="));
         assert!(!request.contains("persistent_keepalive_interval="));
+    }
+
+    #[test]
+    fn peer_refresh_request_updates_peer_without_rebinding_device() {
+        let runtime = WgRuntimeConfig {
+            bind: SocketAddr::from(([0, 0, 0, 0], 51820)),
+            endpoint: Some(SocketAddr::from(([198, 51, 100, 10], 51820))),
+            tunnel_ip: IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2)),
+            peer_tunnel_ip: IpAddr::V4(Ipv4Addr::new(10, 8, 0, 1)),
+            mtu: 1420,
+            persistent_keepalive_secs: Some(25),
+            private_key: [0x11; 32],
+            peer_public_key: [0x22; 32],
+            peer_allowed_ips: default_client_allowed_ips(),
+            excluded_ips: Vec::new(),
+        };
+
+        let request = build_peer_refresh_request(&runtime);
+        assert!(request.contains("replace_peers=true"));
+        assert!(request.contains(
+            "public_key=2222222222222222222222222222222222222222222222222222222222222222"
+        ));
+        assert!(request.contains("endpoint=198.51.100.10:51820"));
+        assert!(request.contains("persistent_keepalive_interval=25"));
+        assert!(request.contains("allowed_ip=0.0.0.0/0"));
+        assert!(!request.contains("private_key="));
+        assert!(!request.contains("listen_port="));
     }
 
     #[test]

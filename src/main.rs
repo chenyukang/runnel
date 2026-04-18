@@ -4,6 +4,7 @@ use pipit::{cert, client, config, server, telemetry, tui, tun, wg};
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -58,6 +59,7 @@ enum Commands {
     Cert(cert::CertArgs),
     Tui(TuiArgs),
     Stop(StopArgs),
+    Reload(ReloadArgs),
     Status(StatusArgs),
 }
 
@@ -67,7 +69,7 @@ struct TuiArgs {
     attach: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 enum ServiceRole {
     Client,
     Server,
@@ -90,6 +92,14 @@ impl ServiceRole {
 
 #[derive(Debug, Clone, Args)]
 struct StopArgs {
+    #[arg(value_enum)]
+    role: Option<ServiceRole>,
+    #[arg(long, default_value_t = 10)]
+    wait_secs: u64,
+}
+
+#[derive(Debug, Clone, Args)]
+struct ReloadArgs {
     #[arg(value_enum)]
     role: Option<ServiceRole>,
     #[arg(long, default_value_t = 10)]
@@ -304,7 +314,9 @@ async fn main() -> Result<()> {
                         args.attach = cli.telemetry_sock.clone();
                     }
                 }
-                (Commands::Stop(_), "stop") | (Commands::Status(_), "status") => {}
+                (Commands::Stop(_), "stop")
+                | (Commands::Reload(_), "reload")
+                | (Commands::Status(_), "status") => {}
                 _ => {}
             }
         }
@@ -317,6 +329,10 @@ async fn main() -> Result<()> {
     }
     if let Commands::Stop(args) = &cli.command {
         stop_daemon_process(&cli.log_file, cli.pid_file.clone(), args.clone()).await?;
+        return Ok(());
+    }
+    if let Commands::Reload(args) = &cli.command {
+        reload_daemon_process(&cli, config_path, args.clone()).await?;
         return Ok(());
     }
     if let Commands::Status(args) = &cli.command {
@@ -362,6 +378,7 @@ async fn main() -> Result<()> {
             Commands::Cert(args) => cert::run(args),
             Commands::Tui(_) => Ok(()),
             Commands::Stop(_) => Ok(()),
+            Commands::Reload(_) => Ok(()),
             Commands::Status(_) => Ok(()),
         }
     };
@@ -391,7 +408,7 @@ async fn main() -> Result<()> {
 fn normalize_cli_modes(cli: &mut Cli) {
     if matches!(
         cli.command,
-        Commands::Tui(_) | Commands::Stop(_) | Commands::Status(_)
+        Commands::Tui(_) | Commands::Stop(_) | Commands::Reload(_) | Commands::Status(_)
     ) {
         cli.tui = false;
         cli.daemon = false;
@@ -421,6 +438,7 @@ fn validate_daemon_mode(cli: &Cli) -> Result<()> {
         | Commands::Cert(_)
         | Commands::Tui(_)
         | Commands::Stop(_)
+        | Commands::Reload(_)
         | Commands::Status(_) => {
             anyhow::bail!(
                 "--daemon is only supported for client, server, tun, wg-client, and wg-server"
@@ -675,6 +693,7 @@ fn dashboard_context(cli: &Cli, log_file: PathBuf) -> Option<tui::DashboardConte
         | Commands::Cert(_)
         | Commands::Tui(_)
         | Commands::Stop(_)
+        | Commands::Reload(_)
         | Commands::Status(_) => {
             return None;
         }
@@ -776,6 +795,7 @@ fn monitor_context(cli: &Cli, log_file: PathBuf) -> Option<telemetry::MonitorCon
         | Commands::Cert(_)
         | Commands::Tui(_)
         | Commands::Stop(_)
+        | Commands::Reload(_)
         | Commands::Status(_) => {
             return None;
         }
@@ -885,6 +905,7 @@ fn command_role(command: &Commands) -> Option<&'static str> {
         | Commands::Cert(_)
         | Commands::Tui(_)
         | Commands::Stop(_)
+        | Commands::Reload(_)
         | Commands::Status(_) => None,
     }
 }
@@ -1487,6 +1508,109 @@ async fn stop_daemon_process(
     }
 }
 
+async fn reload_daemon_process(
+    cli: &Cli,
+    config_path: Option<PathBuf>,
+    args: ReloadArgs,
+) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (cli, config_path, args);
+        anyhow::bail!("pipit reload is only supported on unix platforms");
+    }
+
+    #[cfg(unix)]
+    {
+        let role = resolve_reload_role(&cli.log_file, cli.pid_file.clone(), args.role)?;
+        stop_daemon_process(
+            &cli.log_file,
+            cli.pid_file.clone(),
+            StopArgs {
+                role: Some(role),
+                wait_secs: args.wait_secs,
+            },
+        )
+        .await?;
+        start_reloaded_daemon(cli, config_path.as_deref(), role)?;
+        println!("pipit daemon reloaded role={}", role.as_str());
+        Ok(())
+    }
+}
+
+fn resolve_reload_role(
+    log_file: &Path,
+    configured_pid_file: Option<PathBuf>,
+    role: Option<ServiceRole>,
+) -> Result<ServiceRole> {
+    if let Some(role) = role {
+        return Ok(role);
+    }
+
+    if configured_pid_file.is_some() {
+        anyhow::bail!("reload requires a role when --pid-file is set");
+    }
+
+    let pid_file = resolve_stop_pid_file(log_file, None, None)?;
+    role_from_pid_file(&pid_file).with_context(|| {
+        format!(
+            "failed to infer daemon role from pid file {}; pass `reload client`, `reload server`, `reload tun`, `reload wg-client`, or `reload wg-server`",
+            pid_file.display()
+        )
+    })
+}
+
+fn start_reloaded_daemon(cli: &Cli, config_path: Option<&Path>, role: ServiceRole) -> Result<()> {
+    let executable = std::env::current_exe().context("failed to locate current executable")?;
+    let args = reload_start_args(cli, config_path, role);
+    let status = Command::new(executable)
+        .args(&args)
+        .status()
+        .context("failed to start reloaded daemon process")?;
+    if !status.success() {
+        anyhow::bail!("reloaded daemon startup command exited with {status}");
+    }
+    Ok(())
+}
+
+fn reload_start_args(cli: &Cli, config_path: Option<&Path>, role: ServiceRole) -> Vec<OsString> {
+    let mut args = Vec::new();
+    args.push("--log".into());
+    args.push(cli.log.clone().into());
+    args.push("--log-file".into());
+    args.push(cli.log_file.as_os_str().to_owned());
+    if let Some(path) = &cli.telemetry_sock {
+        args.push("--telemetry-sock".into());
+        args.push(path.as_os_str().to_owned());
+    }
+    if let Some(path) = &cli.pid_file {
+        args.push("--pid-file".into());
+        args.push(path.as_os_str().to_owned());
+    }
+    if let Some(path) = config_path {
+        args.push("--config".into());
+        args.push(path.as_os_str().to_owned());
+    }
+    args.push("--daemon".into());
+    args.push(role.as_str().into());
+    args
+}
+
+fn role_from_pid_file(path: &Path) -> Option<ServiceRole> {
+    let file_name = path.file_name()?.to_str()?;
+    for role in [
+        ServiceRole::Client,
+        ServiceRole::Server,
+        ServiceRole::Tun,
+        ServiceRole::WgClient,
+        ServiceRole::WgServer,
+    ] {
+        if file_name.ends_with(&format!(".{}.pid", role.as_str())) {
+            return Some(role);
+        }
+    }
+    None
+}
+
 fn resolve_stop_pid_file(
     log_file: &Path,
     configured_pid_file: Option<PathBuf>,
@@ -1579,13 +1703,14 @@ impl Drop for PidFileGuard {
 #[cfg(test)]
 mod tests {
     use super::{
-        Commands, RuntimeStatus, ServiceRole, classify_service_state, command_role,
-        default_config_paths_for, first_existing_config_path, read_file_tail,
-        resolve_status_targets, run_utility_command, should_show_status_state,
-        wait_for_daemon_startup,
+        Cli, Commands, ReloadArgs, RuntimeStatus, ServiceRole, classify_service_state,
+        command_role, default_config_paths_for, first_existing_config_path, read_file_tail,
+        reload_start_args, resolve_reload_role, resolve_status_targets, role_from_pid_file,
+        run_utility_command, should_show_status_state, wait_for_daemon_startup,
     };
     use pipit::wg;
     use std::{
+        ffi::OsString,
         fs,
         path::{Path, PathBuf},
         process::Command as ProcessCommand,
@@ -1743,6 +1868,76 @@ mod tests {
         });
         assert!(command_role(&pubkey).is_none());
         assert!(run_utility_command(&pubkey).is_some_and(|result| result.is_ok()));
+    }
+
+    #[test]
+    fn reload_start_args_restarts_selected_role_as_daemon() {
+        let cli = Cli {
+            log: "debug".to_owned(),
+            log_file: PathBuf::from("pipit.log"),
+            telemetry_sock: Some(PathBuf::from("pipit.sock")),
+            pid_file: Some(PathBuf::from("pipit.pid")),
+            tui: false,
+            daemon: false,
+            config: Some(PathBuf::from("config.yaml")),
+            command: Commands::Reload(ReloadArgs {
+                role: Some(ServiceRole::WgClient),
+                wait_secs: 10,
+            }),
+        };
+
+        assert_eq!(
+            reload_start_args(&cli, Some(Path::new("config.yaml")), ServiceRole::WgClient),
+            vec![
+                OsString::from("--log"),
+                OsString::from("debug"),
+                OsString::from("--log-file"),
+                OsString::from("pipit.log"),
+                OsString::from("--telemetry-sock"),
+                OsString::from("pipit.sock"),
+                OsString::from("--pid-file"),
+                OsString::from("pipit.pid"),
+                OsString::from("--config"),
+                OsString::from("config.yaml"),
+                OsString::from("--daemon"),
+                OsString::from("wg-client"),
+            ]
+        );
+    }
+
+    #[test]
+    fn reload_role_can_be_inferred_from_wg_pid_file() {
+        assert_eq!(
+            role_from_pid_file(Path::new("proxy.wg-client.pid")),
+            Some(ServiceRole::WgClient)
+        );
+        assert_eq!(
+            role_from_pid_file(Path::new("proxy.wg-server.pid")),
+            Some(ServiceRole::WgServer)
+        );
+    }
+
+    #[test]
+    fn reload_requires_role_with_custom_pid_file() {
+        let error = resolve_reload_role(
+            Path::new("proxy.log"),
+            Some(PathBuf::from("custom.pid")),
+            None,
+        )
+        .expect_err("custom pid reload needs explicit role");
+
+        assert!(format!("{error:#}").contains("requires a role"));
+    }
+
+    #[test]
+    fn reload_command_is_not_a_service_role() {
+        let command = Commands::Reload(ReloadArgs {
+            role: Some(ServiceRole::Client),
+            wait_secs: 10,
+        });
+
+        assert!(command_role(&command).is_none());
+        assert!(run_utility_command(&command).is_none());
     }
 
     #[test]

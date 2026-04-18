@@ -6,7 +6,7 @@ use super::{
     normalize_allowed_ips, parse_key, parse_socket_addr,
     preflight::{WgPreflightRole, check as check_preflight},
     select_device_name,
-    stats::{start_handshake_watchdog, start_stats_poller},
+    stats::{start_handshake_watchdog, start_stats_poller, start_unhandshaken_peer_refresher},
     uapi::{apply_device_config, control_socket_path},
     wait_for_shutdown_signal,
 };
@@ -16,6 +16,7 @@ use std::{net::IpAddr, time::Duration};
 use tracing::info;
 
 const DEFAULT_HANDSHAKE_WATCHDOG_SECS: u64 = 30;
+const UNHANDSHAKEN_PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug, Args)]
 pub struct WgServerArgs {
@@ -102,6 +103,12 @@ pub async fn run(args: WgServerArgs) -> Result<()> {
     let socket_path = control_socket_path(&actual_device);
     apply_device_config(&socket_path, &runtime)?;
     start_stats_poller("wg-server", socket_path.clone());
+    start_unhandshaken_peer_refresher(
+        "wg-server",
+        socket_path.clone(),
+        runtime.clone(),
+        UNHANDSHAKEN_PEER_REFRESH_INTERVAL,
+    );
     start_handshake_watchdog(
         "wg-server",
         socket_path.clone(),

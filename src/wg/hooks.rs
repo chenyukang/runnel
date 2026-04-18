@@ -233,10 +233,17 @@ pub(crate) fn build_client_hook_plan(
 
     #[cfg(target_os = "macos")]
     {
-        if route.interface.is_none() {
+        let interface = route.interface.as_deref();
+        if interface.is_none() {
             bail!(
                 "failed to determine macOS outbound interface for {}; explicit hooks are required",
                 endpoint_ip
+            );
+        }
+        if interface.is_some_and(is_macos_tunnel_interface) {
+            bail!(
+                "route to WG endpoint {endpoint_ip} currently resolves to tunnel interface {}; clean stale tunnel routes before starting the client",
+                interface.unwrap()
             );
         }
 
@@ -805,7 +812,10 @@ fn parse_macos_route_get(output: &str) -> Result<RouteInfo> {
         if let Some(value) = trimmed.strip_prefix("interface:") {
             interface = Some(value.trim().to_owned());
         } else if let Some(value) = trimmed.strip_prefix("gateway:") {
-            gateway = Some(value.trim().to_owned());
+            let value = value.trim();
+            if value.parse::<IpAddr>().is_ok() {
+                gateway = Some(value.to_owned());
+            }
         }
     }
 
@@ -814,6 +824,11 @@ fn parse_macos_route_get(output: &str) -> Result<RouteInfo> {
     }
 
     Ok(RouteInfo { interface, gateway })
+}
+
+#[cfg(target_os = "macos")]
+fn is_macos_tunnel_interface(interface: &str) -> bool {
+    interface.starts_with("utun") || interface.starts_with("tun")
 }
 
 #[cfg(target_os = "linux")]
@@ -927,6 +942,42 @@ mod tests {
                 .iter()
                 .any(|route| route.contains(&IpAddr::V6("fc00::1".parse::<Ipv6Addr>().unwrap())))
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_route_get_ignores_non_ip_gateway_values() {
+        let route = super::parse_macos_route_get(
+            r#"
+   route to: 172.235.244.118
+destination: 172.235.244.118
+    gateway: index: 27 utun5
+  interface: utun5
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(route.interface.as_deref(), Some("utun5"));
+        assert_eq!(route.gateway, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_client_hook_plan_rejects_endpoint_route_through_tunnel_interface() {
+        for gateway in [None, Some("198.18.0.1".to_owned())] {
+            let err = build_client_hook_plan(
+                "utun123",
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
+                &client_runtime(),
+                &RouteInfo {
+                    interface: Some("utun5".to_owned()),
+                    gateway,
+                },
+            )
+            .expect_err("endpoint route through tunnel should be rejected");
+
+            assert!(format!("{err:#}").contains("stale tunnel routes"));
+        }
     }
 
     #[cfg(target_os = "macos")]
