@@ -5,12 +5,12 @@ edition = "2024"
 rust-version = "1.85"
 description = "A Rust proxy and tunnel toolbox with WireGuard-style, TUN, SOCKS, and TLS-based transports."
 readme = "README.md"
-repository = "https://github.com/chenyukang/pipit"
-homepage = "https://github.com/chenyukang/pipit"
+repository = "https://github.com/chenyukang/runnel"
+homepage = "https://github.com/chenyukang/runnel"
 documentation = "https://docs.rs/runnel-rs"
 license = "MIT OR Apache-2.0"
-keywords = ["proxy", "tunnel", "wireguard", "socks", "tun", "vpn"]
-categories = ["command-line-utilities", "network-programming", "vpn"]
+keywords = ["proxy", "tunnel", "wireguard", "socks", "vpn"]
+categories = ["command-line-utilities", "network-programming"]
 default-run = "runnel"
 include = [
     "src/**",

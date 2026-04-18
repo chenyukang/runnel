@@ -41,7 +41,7 @@ client:
       - "192.168.*"
       - "169.254.*"
   wg:
-    endpoint: SERVER-IP:51820
+    endpoint: SERVER-IP:1443
     private_key: REPLACE_WITH_CLIENT_PRIVATE_KEY
     peer_public_key: REPLACE_WITH_SERVER_PUBLIC_KEY
     tunnel_ip: 10.8.0.2
@@ -54,7 +54,7 @@ client:
 server:
   mode: wg
   wg:
-    listen: 0.0.0.0:51820
+    listen: 0.0.0.0:1443
     private_key: REPLACE_WITH_SERVER_PRIVATE_KEY
     peer_public_key: REPLACE_WITH_CLIENT_PUBLIC_KEY
     tunnel_ip: 10.8.0.1

@@ -13,14 +13,6 @@ pub struct WgKeygenArgs {
     pub json: bool,
 }
 
-#[derive(Clone, Debug, Args)]
-pub struct WgPubkeyArgs {
-    #[arg(long, default_value = "")]
-    pub private_key: String,
-    #[arg(long)]
-    pub json: bool,
-}
-
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct WgKeyMaterial {
     pub(crate) private_key: String,
@@ -30,27 +22,6 @@ pub(crate) struct WgKeyMaterial {
 pub fn run_keygen(args: WgKeygenArgs) -> Result<()> {
     let material = generate_key_material();
     print_key_material(&material, args.json)?;
-    Ok(())
-}
-
-pub fn run_pubkey(args: WgPubkeyArgs) -> Result<()> {
-    if args.private_key.trim().is_empty() {
-        anyhow::bail!("wg private_key is required; pass --private-key");
-    }
-    let material = WgKeyMaterial {
-        private_key: String::new(),
-        public_key: public_key_from_private_key(&args.private_key)?,
-    };
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "public_key": material.public_key,
-            }))?
-        );
-    } else {
-        println!("public_key={}", material.public_key);
-    }
     Ok(())
 }
 

@@ -30,6 +30,11 @@ Client traffic intake sample:
   separate server transport. The current implementation pairs it with
   `client.mode: native-http`.
 
+Routing rule samples:
+
+- `rule.ls`: domain suffix/glob rules for the classic SOCKS rule engine.
+- `rule.cidr`: CIDR rules for the classic SOCKS rule engine.
+
 ## WG Keys
 
 The WG templates contain obvious `REPLACE_WITH_*` placeholders. Generate real
@@ -38,7 +43,7 @@ real server address before running:
 
 ```bash
 runnel wg-config \
-  --server-endpoint SERVER-IP:51820 \
+  --server-endpoint SERVER-IP:1443 \
   --client-tunnel-ip 10.8.0.2 \
   --server-tunnel-ip 10.8.0.1 \
   --dns 1.1.1.1 \

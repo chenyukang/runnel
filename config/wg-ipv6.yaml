@@ -25,7 +25,7 @@ client:
       - "fe80::/10"
       - "ff00::/8"
   wg:
-    endpoint: "[SERVER-IPv6]:51820"
+    endpoint: "[SERVER-IPv6]:1443"
     private_key: REPLACE_WITH_CLIENT_PRIVATE_KEY
     peer_public_key: REPLACE_WITH_SERVER_PUBLIC_KEY
     tunnel_ip: fd00:8::2
@@ -38,7 +38,7 @@ client:
 server:
   mode: wg
   wg:
-    listen: "[::]:51820"
+    listen: "[::]:1443"
     private_key: REPLACE_WITH_SERVER_PRIVATE_KEY
     peer_public_key: REPLACE_WITH_CLIENT_PUBLIC_KEY
     tunnel_ip: fd00:8::1

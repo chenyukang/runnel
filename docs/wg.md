@@ -13,7 +13,7 @@ and UDP port before running it:
 
 ```bash
 runnel wg-config \
-  --server-endpoint SERVER-IP:51820 \
+  --server-endpoint SERVER-IP:1443 \
   --client-tunnel-ip 10.8.0.2 \
   --server-tunnel-ip 10.8.0.1 \
   --dns 1.1.1.1 \
@@ -28,6 +28,9 @@ The command prints one YAML file containing both sides:
 
 - `client.mode: wg` plus `client.wg`: use this on the client machine.
 - `server.mode: wg` plus `server.wg`: use this on the server machine.
+
+Use a UDP port your server firewall and local network allow. `1443/UDP` is a
+practical starting point when `51820/UDP` is blocked or shaped by the network.
 
 Generated configs enable `client.adblock` by default with EasyList,
 EasyPrivacy, and uBlock filters. Set `client.adblock.enabled: false` if you do
