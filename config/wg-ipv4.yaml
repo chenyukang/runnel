@@ -41,6 +41,7 @@ client:
       - "192.168.*"
       - "169.254.*"
   wg:
+    # engine: noise
     endpoint: SERVER-IP:1443
     private_key: REPLACE_WITH_CLIENT_PRIVATE_KEY
     peer_public_key: REPLACE_WITH_SERVER_PUBLIC_KEY
@@ -56,6 +57,7 @@ client:
 server:
   mode: wg
   wg:
+    # engine: noise
     listen: 0.0.0.0:1443
     private_key: REPLACE_WITH_SERVER_PRIVATE_KEY
     peer_public_key: REPLACE_WITH_CLIENT_PUBLIC_KEY

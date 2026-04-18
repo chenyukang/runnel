@@ -1,9 +1,10 @@
 use super::{
-    DEFAULT_TUNNEL_MTU, WgRuntimeConfig, create_device_handle, default_server_allowed_ips,
+    DEFAULT_TUNNEL_MTU, WgEngine, WgRuntimeConfig, create_device_handle,
+    default_server_allowed_ips,
     hooks::{
         HookGuard, effective_hook_plan, log_plan_lines, plan_server_hooks, print_plan, run_hooks,
     },
-    normalize_allowed_ips, parse_key, parse_socket_addr,
+    noise, normalize_allowed_ips, parse_key, parse_socket_addr,
     preflight::{WgPreflightRole, check as check_preflight},
     select_device_name,
     stats::{start_stats_poller, start_unhandshaken_peer_refresher},
@@ -20,6 +21,8 @@ const UNHANDSHAKEN_PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug, Args)]
 pub struct WgServerArgs {
+    #[arg(long, value_enum, default_value_t = WgEngine::Device)]
+    pub engine: WgEngine,
     #[arg(long, default_value = "0.0.0.0:51820")]
     pub listen: String,
     #[arg(long, env = "RUNNEL_WG_PRIVATE_KEY")]
@@ -57,6 +60,7 @@ pub struct WgServerArgs {
 impl Default for WgServerArgs {
     fn default() -> Self {
         Self {
+            engine: WgEngine::Device,
             listen: "0.0.0.0:51820".to_owned(),
             private_key: String::new(),
             peer_public_key: String::new(),
@@ -100,6 +104,10 @@ pub async fn run(args: WgServerArgs) -> Result<()> {
         if args.dry_run {
             return Ok(());
         }
+    }
+
+    if args.engine == WgEngine::Noise {
+        return noise::run_server(args, runtime).await;
     }
 
     let (_device_handle, actual_device) = create_device_handle(&args.device)?;
@@ -153,6 +161,7 @@ fn plan_lines(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push("runnel wg-server plan".to_owned());
+    lines.push(format!("  engine: {}", args.engine));
     if super::is_auto_device(&args.device) {
         lines.push(format!("  device: {device} (auto)"));
     } else {
@@ -237,12 +246,14 @@ impl WgServerArgs {
 #[cfg(test)]
 mod tests {
     use super::WgServerArgs;
+    use crate::wg::WgEngine;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn server_args_resolve_runtime() {
         let args = WgServerArgs {
+            engine: WgEngine::Device,
             listen: "0.0.0.0:51820".to_owned(),
             private_key: STANDARD.encode([3u8; 32]),
             peer_public_key: STANDARD.encode([4u8; 32]),
@@ -270,6 +281,7 @@ mod tests {
     #[test]
     fn server_args_preserve_custom_peer_allowed_ips() {
         let args = WgServerArgs {
+            engine: WgEngine::Device,
             listen: "0.0.0.0:51820".to_owned(),
             private_key: STANDARD.encode([3u8; 32]),
             peer_public_key: STANDARD.encode([4u8; 32]),

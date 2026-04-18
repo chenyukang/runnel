@@ -8,7 +8,7 @@ use runnel::{
     mode::ProxyMode,
     proxy::route::FilterMode,
     server::{self, ServerArgs},
-    wg::{client::WgClientArgs, server::WgServerArgs},
+    wg::{WgEngine, client::WgClientArgs, server::WgServerArgs},
 };
 use std::{
     fs,
@@ -474,6 +474,7 @@ async fn run_child_role(role: &str) -> Result<()> {
                 fallback_timeout_secs: 1,
                 max_fallback_body_size: 1024,
                 wg: WgServerArgs {
+                    engine: WgEngine::Device,
                     listen: format!("0.0.0.0:{wg_port}"),
                     private_key: env_required("RUNNEL_PERF_WG_SERVER_PRIVATE_KEY")?,
                     peer_public_key: env_required("RUNNEL_PERF_WG_CLIENT_PUBLIC_KEY")?,
@@ -523,6 +524,7 @@ async fn run_child_role(role: &str) -> Result<()> {
                 tun_dns_redirect_ip: None,
                 tun_dns_upstream: None,
                 wg: WgClientArgs {
+                    engine: WgEngine::Device,
                     bind: "0.0.0.0:0".to_owned(),
                     endpoint: format!("127.0.0.1:{wg_port}"),
                     private_key: env_required("RUNNEL_PERF_WG_CLIENT_PRIVATE_KEY")?,

@@ -97,6 +97,18 @@ server:
 More WG details, including dry-run hooks and DNS behavior, live in
 [`docs/wg.md`](./docs/wg.md).
 
+WG mode defaults to boringtun's device engine. There is also an experimental
+low-level noise engine, mainly for transport experiments:
+
+```yaml
+client:
+  wg:
+    engine: noise
+
+server:
+  wg:
+    engine: noise
+```
 
 ## Daily Commands
 

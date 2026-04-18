@@ -3,6 +3,7 @@ pub mod configgen;
 mod dns;
 mod hooks;
 pub mod keys;
+mod noise;
 mod preflight;
 pub mod server;
 mod stats;
@@ -16,8 +17,13 @@ use boringtun::{
     noise::Tunn,
     x25519::{PublicKey, StaticSecret},
 };
+use clap::ValueEnum;
 use ipnet::IpNet;
-use std::net::{IpAddr, SocketAddr};
+use serde::Deserialize;
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+};
 
 pub(crate) const AUTO_WG_DEVICE: &str = "auto";
 pub(crate) const DEFAULT_TUNNEL_MTU: u16 = 1420;
@@ -25,6 +31,23 @@ pub(crate) const HANDSHAKE_BUFFER_SIZE: usize = 2048;
 const WG_KEY_LEN: usize = 32;
 #[cfg(target_os = "macos")]
 const MACOS_AUTO_WG_START_INDEX: u16 = 233;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum WgEngine {
+    #[default]
+    Device,
+    Noise,
+}
+
+impl fmt::Display for WgEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Device => f.write_str("device"),
+            Self::Noise => f.write_str("noise"),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WgRuntimeConfig {
@@ -55,9 +78,7 @@ impl WgRuntimeConfig {
             bail!("{role} tunnel_ip and peer_tunnel_ip must use the same IP version");
         }
         if !self.bind.ip().is_unspecified() {
-            bail!(
-                "{role} currently requires an unspecified listen address because boringtun device mode binds UDP on all interfaces"
-            );
+            bail!("{role} currently requires an unspecified listen address");
         }
         if let Some(endpoint) = self.endpoint
             && !endpoint.ip().is_ipv4()

@@ -1,11 +1,12 @@
 use super::{
-    DEFAULT_TUNNEL_MTU, WgRuntimeConfig, create_device_handle, default_client_allowed_ips_for,
+    DEFAULT_TUNNEL_MTU, WgEngine, WgRuntimeConfig, create_device_handle,
+    default_client_allowed_ips_for,
     dns::{DomainRuleEngine, start_dns_capture},
     hooks::{
         DynamicRouteManager, HookGuard, effective_hook_plan, log_plan_lines, plan_client_hooks,
         print_plan, run_hooks,
     },
-    normalize_allowed_ips, parse_key, parse_socket_addr,
+    noise, normalize_allowed_ips, parse_key, parse_socket_addr,
     preflight::{WgPreflightRole, check as check_preflight},
     select_device_name,
     stats::start_stats_poller,
@@ -33,6 +34,8 @@ const HANDSHAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, Args)]
 pub struct WgClientArgs {
+    #[arg(long, value_enum, default_value_t = WgEngine::Device)]
+    pub engine: WgEngine,
     #[arg(long, default_value = "0.0.0.0:0")]
     pub bind: String,
     #[arg(long)]
@@ -85,6 +88,7 @@ pub struct WgClientArgs {
 impl Default for WgClientArgs {
     fn default() -> Self {
         Self {
+            engine: WgEngine::Device,
             bind: "0.0.0.0:0".to_owned(),
             endpoint: String::new(),
             private_key: String::new(),
@@ -143,6 +147,10 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
 
     if !args.skip_handshake_probe {
         probe_server_handshake(&runtime, HANDSHAKE_PROBE_TIMEOUT).await?;
+    }
+
+    if args.engine == WgEngine::Noise {
+        return noise::run_client(args, runtime).await;
     }
 
     let (_device_handle, actual_device) = create_device_handle(&args.device)?;
@@ -296,6 +304,7 @@ fn plan_lines(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push("runnel wg-client plan".to_owned());
+    lines.push(format!("  engine: {}", args.engine));
     if super::is_auto_device(&args.device) {
         lines.push(format!("  device: {device} (auto)"));
     } else {
@@ -473,7 +482,7 @@ mod tests {
     use super::{WgClientArgs, plan_lines, probe_server_handshake};
     use crate::proxy::route::RouteRuleConfig;
     use crate::wg::{
-        HANDSHAKE_BUFFER_SIZE, WgRuntimeConfig, default_client_allowed_ips,
+        HANDSHAKE_BUFFER_SIZE, WgEngine, WgRuntimeConfig, default_client_allowed_ips,
         default_server_allowed_ips, hooks::HookPlan,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -490,6 +499,7 @@ mod tests {
     #[test]
     fn client_args_resolve_runtime() {
         let args = WgClientArgs {
+            engine: WgEngine::Device,
             bind: "0.0.0.0:0".to_owned(),
             endpoint: "198.51.100.10:51820".to_owned(),
             private_key: STANDARD.encode([1u8; 32]),
@@ -527,6 +537,7 @@ mod tests {
     #[test]
     fn client_args_preserve_custom_proxy_ips() {
         let args = WgClientArgs {
+            engine: WgEngine::Device,
             bind: "0.0.0.0:0".to_owned(),
             endpoint: "198.51.100.10:51820".to_owned(),
             private_key: STANDARD.encode([1u8; 32]),
@@ -558,6 +569,7 @@ mod tests {
     #[test]
     fn client_args_collect_direct_ips() {
         let args = WgClientArgs {
+            engine: WgEngine::Device,
             bind: "0.0.0.0:0".to_owned(),
             endpoint: "198.51.100.10:51820".to_owned(),
             private_key: STANDARD.encode([1u8; 32]),
@@ -589,6 +601,7 @@ mod tests {
     #[test]
     fn client_args_reject_dns_capture_without_dns_upstream() {
         let args = WgClientArgs {
+            engine: WgEngine::Device,
             bind: "0.0.0.0:0".to_owned(),
             endpoint: "198.51.100.10:51820".to_owned(),
             private_key: STANDARD.encode([1u8; 32]),
@@ -620,6 +633,7 @@ mod tests {
     #[test]
     fn client_plan_mentions_dns_and_hooks() {
         let args = WgClientArgs {
+            engine: WgEngine::Device,
             bind: "0.0.0.0:0".to_owned(),
             endpoint: "198.51.100.10:51820".to_owned(),
             private_key: STANDARD.encode([1u8; 32]),

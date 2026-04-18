@@ -107,6 +107,27 @@ The server cannot actively probe a client because it normally starts first and
 does not know the client's UDP endpoint. Use the client startup probe, status
 data, and packet captures when diagnosing WG reachability.
 
+## Engine
+
+WG mode defaults to `engine: device`, which lets boringtun own the WireGuard
+device loop and UAPI socket. For transport experiments, `engine: noise` runs the
+TUN/UDP loop in Runnel with `boringtun::noise::Tunn` directly:
+
+```yaml
+client:
+  wg:
+    engine: noise
+
+server:
+  wg:
+    engine: noise
+```
+
+The noise engine keeps the same keys, hooks, DNS capture, split routing,
+tcpdump monitor, and traffic samples. It still emits standard WireGuard packets;
+it is the base layer for future packet wrapping or padding, not obfuscation by
+itself.
+
 ## Tcpdump Events
 
 WG mode can start a sidecar `tcpdump` process and emit packet metadata into the
