@@ -1,9 +1,9 @@
 # Sample native-mux config.
-# Use PIPIT_PASSWORD for the shared secret; do not commit real passwords.
+# Use RUNNEL_PASSWORD for the shared secret; do not commit real passwords.
 
 log: info
-log_file: ./logs/pipit-native-mux.log
-telemetry_sock: ./run/pipit-native-mux.sock
+log_file: ./logs/runnel-native-mux.log
+telemetry_sock: ./run/runnel-native-mux.sock
 tui: true
 
 client:

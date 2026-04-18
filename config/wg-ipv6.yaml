@@ -1,10 +1,10 @@
 # Sample WG IPv6-only config.
-# Prefer generating a fresh config with `pipit wg-config`.
+# Prefer generating a fresh config with `runnel wg-config`.
 # Replace every REPLACE_WITH_* value before running.
 
 log: info
-log_file: ./logs/pipit-wg-ipv6.log
-telemetry_sock: ./run/pipit-wg-ipv6.sock
+log_file: ./logs/runnel-wg-ipv6.log
+telemetry_sock: ./run/runnel-wg-ipv6.sock
 tui: true
 
 client:
@@ -15,7 +15,7 @@ client:
       - https://easylist.to/easylist/easylist.txt
       - https://easylist.to/easylist/easyprivacy.txt
       - https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt
-    cache_dir: ~/.cache/pipit/adblock
+    cache_dir: ~/.cache/runnel/adblock
     update_interval_hours: 24
     decision_cache_ttl_secs: 300
     fail_open: true

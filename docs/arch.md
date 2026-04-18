@@ -1,16 +1,16 @@
-# `pipit` Architecture
+# `runnel` Architecture
 
-`pipit` has one core shape: local application traffic is collected on the
-client side, carried to a `pipit server`, and then connected to the final
+`runnel` has one core shape: local application traffic is collected on the
+client side, carried to a `runnel server`, and then connected to the final
 destination from the server side.
 
 The important choice is how traffic enters the client:
 
-- SOCKS intake: apps explicitly use the local `pipit client` SOCKS listener.
-- Client TUN intake: `pipit tun` captures system traffic, then converts it into
+- SOCKS intake: apps explicitly use the local `runnel client` SOCKS listener.
+- Client TUN intake: `runnel tun` captures system traffic, then converts it into
   SOCKS flows.
 - WG TUN intake: the OS routes traffic into a WireGuard-style TUN device managed
-  by `pipit client` in `client.mode: wg`.
+  by `runnel client` in `client.mode: wg`.
 
 ```mermaid
 flowchart TD
@@ -18,14 +18,14 @@ flowchart TD
 
     subgraph ClientHost["Client host"]
         direction TB
-        App -->|"App proxy setting"| Socks["SOCKS listener<br/>pipit client"]
-        App -->|"OS route"| ClientTun["Client TUN device<br/>pipit tun"]
+        App -->|"App proxy setting"| Socks["SOCKS listener<br/>runnel client"]
+        App -->|"OS route"| ClientTun["Client TUN device<br/>runnel tun"]
         App -->|"OS route / default route"| WgTun["WG TUN device<br/>client.mode: wg"]
 
         ClientTun --> Tun2Proxy["tun2proxy<br/>packet to SOCKS flows"]
         Tun2Proxy --> Socks
         Socks --> Policy["SOCKS routing policy<br/>proxy / direct / rule"]
-        Policy -->|"proxy"| ClientTransport["pipit client transport<br/>native-http / native-mux / daze-*"]
+        Policy -->|"proxy"| ClientTransport["runnel client transport<br/>native-http / native-mux / daze-*"]
 
         WgTun --> BoringTunClient["boringtun engine<br/>encrypt packets"]
         BoringTunClient --> WgUdp["UDP WireGuard packets<br/>usually UDP 51820"]
@@ -50,16 +50,16 @@ flowchart TD
 ## Reading The Diagram
 
 SOCKS mode is application-proxy based. An app connects to the local SOCKS
-listener exposed by `pipit client`; `pipit` then applies routing policy. Remote
+listener exposed by `runnel client`; `runnel` then applies routing policy. Remote
 traffic goes through one of the client/server transports, such as `native-http`,
 `native-mux`, `daze-ashe`, `daze-baboon`, or `daze-czar`. SOCKS policy can also
 choose local direct handling for selected traffic, but that bypass is omitted
 from the diagram so the server path stays clear.
 
 Client TUN mode is a client-side capture layer in front of the SOCKS pipeline.
-`pipit tun` receives packets from a TUN device, uses `tun2proxy` to turn them
+`runnel tun` receives packets from a TUN device, uses `tun2proxy` to turn them
 into SOCKS-style flows, and then sends those flows through the normal
-`pipit client` path.
+`runnel client` path.
 
 WG mode is packet-tunnel based. The OS sends matching routes into the WG TUN
 device; `boringtun` encrypts those packets into UDP and sends them to the server.

@@ -1,4 +1,4 @@
-# `pipit` WG Mode Quickstart
+# `runnel` WG Mode Quickstart
 
 This note covers the recommended `client.mode: wg` / `server.mode: wg` path
 built on `boringtun`.
@@ -12,7 +12,7 @@ Run this on your local machine. Replace `SERVER-IP` with the public server IP
 and UDP port before running it:
 
 ```bash
-pipit wg-config \
+runnel wg-config \
   --server-endpoint SERVER-IP:51820 \
   --client-tunnel-ip 10.8.0.2 \
   --server-tunnel-ip 10.8.0.1 \
@@ -21,7 +21,7 @@ pipit wg-config \
   --direct-ip "10.*" \
   --direct-ip "172.16.0.0/12" \
   --direct-ip "192.168.*" \
-  --nat-out-interface eth0 > pipit.wg.yaml
+  --nat-out-interface eth0 > runnel.wg.yaml
 ```
 
 The command prints one YAML file containing both sides:
@@ -51,7 +51,7 @@ client:
 ```
 
 ```bash
-pipit --config pipit.wg.yaml client
+runnel --config runnel.wg.yaml client
 ```
 
 Server:
@@ -64,7 +64,7 @@ server:
 ```
 
 ```bash
-pipit --config pipit.wg.yaml server
+runnel --config runnel.wg.yaml server
 ```
 
 This validates keys, endpoint parsing, allowed IPs, and prints the hook plan. It
@@ -75,13 +75,13 @@ does not create the TUN device. Remove `dry_run: true` before real startup.
 Server first:
 
 ```bash
-sudo pipit --config pipit.wg.yaml server
+sudo runnel --config runnel.wg.yaml server
 ```
 
 Client second:
 
 ```bash
-sudo pipit --config pipit.wg.yaml --tui client
+sudo runnel --config runnel.wg.yaml --tui client
 ```
 
 `client.mode: wg` defaults to full-tunnel IPv4 routing through `0.0.0.0/0`,
@@ -186,9 +186,9 @@ client:
   adblock:
     enabled: true
     lists:
-      - ~/.config/pipit/easylist.txt
+      - ~/.config/runnel/easylist.txt
       - https://easylist.to/easylist/easyprivacy.txt
-    cache_dir: ~/.cache/pipit/adblock
+    cache_dir: ~/.cache/runnel/adblock
     update_interval_hours: 24
     decision_cache_ttl_secs: 300
     fail_open: true
@@ -247,10 +247,10 @@ For a repeatable diagnostic run, use the smoke script on both machines:
 
 ```bash
 # server machine
-sudo scripts/pipit-wg-smoke.sh --role server --config pipit.wg.yaml --start
+sudo scripts/runnel-wg-smoke.sh --role server --config runnel.wg.yaml --start
 
 # client machine
-sudo scripts/pipit-wg-smoke.sh --role client --config pipit.wg.yaml --start
+sudo scripts/runnel-wg-smoke.sh --role client --config runnel.wg.yaml --start
 ```
 
 The client role checks `ping 10.8.0.1`, `curl https://ifconfig.me`, DNS

@@ -1983,42 +1983,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pipit"
-version = "0.1.0"
-dependencies = [
- "adblock",
- "anyhow",
- "base64 0.22.1",
- "boringtun",
- "clap",
- "crossterm",
- "glob",
- "hex",
- "hmac",
- "ipnet",
- "libc",
- "md5",
- "rand 0.8.5",
- "ratatui",
- "rcgen",
- "reqwest",
- "rustls",
- "rustls-native-certs",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "sysinfo",
- "tokio",
- "tokio-rustls",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "tun2proxy",
-]
-
-[[package]]
 name = "poly1305"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2394,6 +2358,42 @@ dependencies = [
  "nix 0.30.1",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "runnel-rs"
+version = "0.1.0"
+dependencies = [
+ "adblock",
+ "anyhow",
+ "base64 0.22.1",
+ "boringtun",
+ "clap",
+ "crossterm",
+ "glob",
+ "hex",
+ "hmac",
+ "ipnet",
+ "libc",
+ "md5",
+ "rand 0.8.5",
+ "ratatui",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "sysinfo",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "tun2proxy",
 ]
 
 [[package]]

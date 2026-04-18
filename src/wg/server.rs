@@ -22,7 +22,7 @@ const UNHANDSHAKEN_PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 pub struct WgServerArgs {
     #[arg(long, default_value = "0.0.0.0:51820")]
     pub listen: String,
-    #[arg(long, env = "PIPIT_WG_PRIVATE_KEY")]
+    #[arg(long, env = "RUNNEL_WG_PRIVATE_KEY")]
     #[arg(default_value = "")]
     pub private_key: String,
     #[arg(long)]
@@ -145,7 +145,7 @@ fn plan_lines(
     plan: &super::hooks::HookPlan,
 ) -> Vec<String> {
     let mut lines = Vec::new();
-    lines.push("pipit wg-server plan".to_owned());
+    lines.push("runnel wg-server plan".to_owned());
     if super::is_auto_device(&args.device) {
         lines.push(format!("  device: {device} (auto)"));
     } else {
@@ -189,7 +189,7 @@ impl WgServerArgs {
     pub fn validate_required(&self) -> Result<()> {
         if self.private_key.trim().is_empty() {
             bail!(
-                "wg server private_key is required; pass --private-key, set PIPIT_WG_PRIVATE_KEY, or set it in --config"
+                "wg server private_key is required; pass --private-key, set RUNNEL_WG_PRIVATE_KEY, or set it in --config"
             );
         }
         if self.peer_public_key.trim().is_empty() {

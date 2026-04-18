@@ -1,9 +1,9 @@
 # Sample daze-baboon config.
-# Use PIPIT_PASSWORD for the shared secret; do not commit real passwords.
+# Use RUNNEL_PASSWORD for the shared secret; do not commit real passwords.
 
 log: info
-log_file: ./logs/pipit-daze-baboon.log
-telemetry_sock: ./run/pipit-daze-baboon.sock
+log_file: ./logs/runnel-daze-baboon.log
+telemetry_sock: ./run/runnel-daze-baboon.sock
 tui: true
 
 client:

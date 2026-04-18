@@ -180,7 +180,7 @@ pub(crate) fn default_device_name() -> &'static str {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        "pipitwg0"
+        "runnelwg0"
     }
 }
 

@@ -6,7 +6,7 @@ placeholders such as `SERVER-IP`, `SERVER-IPv6`, and `SERVER-NAME`.
 Do not put production passwords or real WG private keys in these files. Prefer:
 
 ```bash
-export PIPIT_PASSWORD='replace-me-with-your-secret'
+export RUNNEL_PASSWORD='replace-me-with-your-secret'
 ```
 
 ## Files
@@ -37,7 +37,7 @@ keys/configs instead of reusing sample material. Replace `SERVER-IP` with the
 real server address before running:
 
 ```bash
-pipit wg-config \
+runnel wg-config \
   --server-endpoint SERVER-IP:51820 \
   --client-tunnel-ip 10.8.0.2 \
   --server-tunnel-ip 10.8.0.1 \

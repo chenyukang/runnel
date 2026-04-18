@@ -1,11 +1,11 @@
 use anyhow::{Context, Result};
-use pipit::{
+use rcgen::generate_simple_self_signed;
+use runnel::{
     client::{self, ClientArgs},
     mode::ProxyMode,
     proxy::{route::FilterMode, socks5},
     server::{self, ServerArgs},
 };
-use rcgen::generate_simple_self_signed;
 use std::{
     fs,
     net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener},
@@ -298,7 +298,7 @@ async fn start_env(mode: ProxyMode) -> Result<TestEnv> {
         domain_rules: Default::default(),
         ip_rules: Default::default(),
         adblock: Default::default(),
-        user_agent: "pipit-test".to_owned(),
+        user_agent: "runnel-test".to_owned(),
         handshake_timeout_secs: 10,
         connect_timeout_secs: 10,
         max_header_size: 16 * 1024,
@@ -643,7 +643,7 @@ async fn start_local_dns_client(
         domain_rules: Default::default(),
         ip_rules: Default::default(),
         adblock: Default::default(),
-        user_agent: "pipit-test".to_owned(),
+        user_agent: "runnel-test".to_owned(),
         handshake_timeout_secs: 10,
         connect_timeout_secs: 10,
         max_header_size: 16 * 1024,
@@ -681,7 +681,7 @@ fn write_temp_cert_pair() -> Result<(PathBuf, PathBuf)> {
     let certified = generate_simple_self_signed(vec!["example.com".to_owned()])
         .context("failed to generate self-signed certificate")?;
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let base = std::env::temp_dir().join(format!("pipit-e2e-{id}"));
+    let base = std::env::temp_dir().join(format!("runnel-e2e-{id}"));
     let cert_path = base.with_extension("crt");
     let key_path = base.with_extension("key");
     fs::write(&cert_path, certified.cert.pem())

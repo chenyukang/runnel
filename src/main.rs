@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
-use pipit::{cert, client, config, server, telemetry, tui, tun, wg};
+use runnel::{cert, client, config, server, telemetry, tui, tun, wg};
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
@@ -14,19 +14,19 @@ use tokio::time::sleep;
 use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-const DAEMON_ENV: &str = "PIPIT_DAEMONIZED";
+const DAEMON_ENV: &str = "RUNNEL_DAEMONIZED";
 const DAEMON_STARTUP_CHECK: Duration = Duration::from_millis(1200);
 const DAEMON_STARTUP_POLL: Duration = Duration::from_millis(100);
 const SERVICE_ROLES: &[&str] = &["client", "server", "tun"];
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "pipit",
+    name = "runnel",
     version,
     about = "A compact and durable Rust tunnel proxy"
 )]
 struct Cli {
-    #[arg(long, global = true, env = "PIPIT_LOG", default_value = "info")]
+    #[arg(long, global = true, env = "RUNNEL_LOG", default_value = "info")]
     log: String,
     #[arg(long, global = true, default_value = "proxy.log")]
     log_file: PathBuf,
@@ -38,7 +38,7 @@ struct Cli {
     tui: bool,
     #[arg(long, global = true)]
     daemon: bool,
-    #[arg(long, global = true, env = "PIPIT_CONFIG")]
+    #[arg(long, global = true, env = "RUNNEL_CONFIG")]
     config: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
@@ -148,7 +148,7 @@ fn default_config_paths_for(
         push_config_path(
             &mut paths,
             &mut seen,
-            xdg_config_home.join("pipit").join("config.yaml"),
+            xdg_config_home.join("runnel").join("config.yaml"),
         );
     }
     if let Some(home) = home {
@@ -163,7 +163,7 @@ fn default_config_paths_for(
     push_config_path(
         &mut paths,
         &mut seen,
-        PathBuf::from("/etc/pipit/config.yaml"),
+        PathBuf::from("/etc/runnel/config.yaml"),
     );
 
     paths
@@ -174,7 +174,7 @@ fn push_legacy_home_config_paths(
     seen: &mut BTreeSet<PathBuf>,
     home: &Path,
 ) {
-    push_config_path(paths, seen, home.join(".pipit").join("config.yaml"));
+    push_config_path(paths, seen, home.join(".runnel").join("config.yaml"));
 }
 
 fn push_modern_home_config_paths(
@@ -185,7 +185,7 @@ fn push_modern_home_config_paths(
     push_config_path(
         paths,
         seen,
-        home.join(".config").join("pipit").join("config.yaml"),
+        home.join(".config").join("runnel").join("config.yaml"),
     );
 
     #[cfg(target_os = "macos")]
@@ -194,7 +194,7 @@ fn push_modern_home_config_paths(
         seen,
         home.join("Library")
             .join("Application Support")
-            .join("pipit")
+            .join("runnel")
             .join("config.yaml"),
     );
 }
@@ -385,7 +385,7 @@ async fn main() -> Result<()> {
     let command = async move {
         let result = command.await;
         if let Err(error) = &result {
-            error!(error = %format!("{error:#}"), "pipit command exited with error");
+            error!(error = %format!("{error:#}"), "runnel command exited with error");
         }
         result
     };
@@ -416,7 +416,7 @@ fn normalize_cli_modes(cli: &mut Cli) {
     }
 
     if cli.daemon && cli.tui {
-        eprintln!("pipit: disabling TUI because daemon mode runs in the background");
+        eprintln!("runnel: disabling TUI because daemon mode runs in the background");
         cli.tui = false;
     }
 }
@@ -480,7 +480,7 @@ fn spawn_daemon_process(cli: &Cli) -> Result<()> {
         .spawn()
         .context("failed to start daemon process in background")?;
     if let Some(status) = wait_for_daemon_startup(&mut child)? {
-        let mut message = format!("pipit daemon exited during startup with {status}");
+        let mut message = format!("runnel daemon exited during startup with {status}");
         if let Ok(log_file) = absolute_path(&cli.log_file) {
             if log_file.exists() {
                 message.push_str(&format!("\nlog: {}", log_file.display()));
@@ -503,15 +503,15 @@ fn spawn_daemon_process(cli: &Cli) -> Result<()> {
         let pid_file = resolve_pid_file_for_role(&cli.log_file, cli.pid_file.clone(), role).ok();
         if let Some(pid_file) = pid_file {
             println!(
-                "pipit daemon started pid={} pid_file={}",
+                "runnel daemon started pid={} pid_file={}",
                 child.id(),
                 pid_file.display()
             );
         } else {
-            println!("pipit daemon started pid={}", child.id());
+            println!("runnel daemon started pid={}", child.id());
         }
     } else {
-        println!("pipit daemon started pid={}", child.id());
+        println!("runnel daemon started pid={}", child.id());
     }
     Ok(())
 }
@@ -615,19 +615,19 @@ fn dashboard_context(cli: &Cli, log_file: PathBuf) -> Option<tui::DashboardConte
                 mode_label: mode
                     .map(|mode| mode.to_string())
                     .unwrap_or_else(|| "-".to_owned()),
-                listen: Some(if matches!(mode, Some(pipit::mode::ProxyMode::Wg)) {
+                listen: Some(if matches!(mode, Some(runnel::mode::ProxyMode::Wg)) {
                     args.wg.bind.clone()
                 } else {
                     args.listen.clone()
                 }),
-                upstream: Some(if matches!(mode, Some(pipit::mode::ProxyMode::Wg)) {
+                upstream: Some(if matches!(mode, Some(runnel::mode::ProxyMode::Wg)) {
                     args.wg.endpoint.clone()
                 } else {
                     args.server.clone()
                 }),
                 path: Some(match mode {
-                    Some(pipit::mode::ProxyMode::NativeMux) => args.mux_path.clone(),
-                    Some(pipit::mode::ProxyMode::Wg) => args.wg.device.clone(),
+                    Some(runnel::mode::ProxyMode::NativeMux) => args.mux_path.clone(),
+                    Some(runnel::mode::ProxyMode::Wg) => args.wg.device.clone(),
                     _ => args.path.clone(),
                 }),
                 log_file,
@@ -637,19 +637,19 @@ fn dashboard_context(cli: &Cli, log_file: PathBuf) -> Option<tui::DashboardConte
         Commands::Server(args) => tui::DashboardContext {
             command_label: "server".to_owned(),
             mode_label: args.mode.to_string(),
-            listen: Some(if matches!(args.mode, pipit::mode::ProxyMode::Wg) {
+            listen: Some(if matches!(args.mode, runnel::mode::ProxyMode::Wg) {
                 args.wg.listen.clone()
             } else {
                 args.listen.clone()
             }),
-            upstream: Some(if matches!(args.mode, pipit::mode::ProxyMode::Wg) {
+            upstream: Some(if matches!(args.mode, runnel::mode::ProxyMode::Wg) {
                 args.wg.peer_tunnel_ip.to_string()
             } else {
                 args.fallback_url.clone()
             }),
             path: Some(match args.mode {
-                pipit::mode::ProxyMode::NativeMux => args.mux_path.clone(),
-                pipit::mode::ProxyMode::Wg => args.wg.device.clone(),
+                runnel::mode::ProxyMode::NativeMux => args.mux_path.clone(),
+                runnel::mode::ProxyMode::Wg => args.wg.device.clone(),
                 _ => args.path.clone(),
             }),
             log_file,
@@ -712,19 +712,19 @@ fn monitor_context(cli: &Cli, log_file: PathBuf) -> Option<telemetry::MonitorCon
                 mode_label: mode
                     .map(|mode| mode.to_string())
                     .unwrap_or_else(|| "-".to_owned()),
-                listen: Some(if matches!(mode, Some(pipit::mode::ProxyMode::Wg)) {
+                listen: Some(if matches!(mode, Some(runnel::mode::ProxyMode::Wg)) {
                     args.wg.bind.clone()
                 } else {
                     args.listen.clone()
                 }),
-                upstream: Some(if matches!(mode, Some(pipit::mode::ProxyMode::Wg)) {
+                upstream: Some(if matches!(mode, Some(runnel::mode::ProxyMode::Wg)) {
                     args.wg.endpoint.clone()
                 } else {
                     args.server.clone()
                 }),
                 path: Some(match mode {
-                    Some(pipit::mode::ProxyMode::NativeMux) => args.mux_path.clone(),
-                    Some(pipit::mode::ProxyMode::Wg) => args.wg.device.clone(),
+                    Some(runnel::mode::ProxyMode::NativeMux) => args.mux_path.clone(),
+                    Some(runnel::mode::ProxyMode::Wg) => args.wg.device.clone(),
                     _ => args.path.clone(),
                 }),
                 log_file,
@@ -735,19 +735,19 @@ fn monitor_context(cli: &Cli, log_file: PathBuf) -> Option<telemetry::MonitorCon
         Commands::Server(args) => telemetry::MonitorContext {
             command_label: "server".to_owned(),
             mode_label: args.mode.to_string(),
-            listen: Some(if matches!(args.mode, pipit::mode::ProxyMode::Wg) {
+            listen: Some(if matches!(args.mode, runnel::mode::ProxyMode::Wg) {
                 args.wg.listen.clone()
             } else {
                 args.listen.clone()
             }),
-            upstream: Some(if matches!(args.mode, pipit::mode::ProxyMode::Wg) {
+            upstream: Some(if matches!(args.mode, runnel::mode::ProxyMode::Wg) {
                 args.wg.peer_tunnel_ip.to_string()
             } else {
                 args.fallback_url.clone()
             }),
             path: Some(match args.mode {
-                pipit::mode::ProxyMode::NativeMux => args.mux_path.clone(),
-                pipit::mode::ProxyMode::Wg => args.wg.device.clone(),
+                runnel::mode::ProxyMode::NativeMux => args.mux_path.clone(),
+                runnel::mode::ProxyMode::Wg => args.wg.device.clone(),
                 _ => args.path.clone(),
             }),
             log_file,
@@ -869,7 +869,7 @@ fn default_sidecar_path(log_file: &Path, role: &str, ext: &str) -> Result<PathBu
     let stem = log_file
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .unwrap_or("pipit");
+        .unwrap_or("runnel");
     Ok(parent.join(format!("{stem}.{role}.{ext}")))
 }
 
@@ -997,7 +997,7 @@ async fn status_daemon_processes(
     #[cfg(not(unix))]
     {
         let _ = (log_file, configured_pid_file, configured_socket, args);
-        anyhow::bail!("pipit status is only supported on unix platforms");
+        anyhow::bail!("runnel status is only supported on unix platforms");
     }
 
     #[cfg(unix)]
@@ -1468,7 +1468,7 @@ async fn stop_daemon_process(
     #[cfg(not(unix))]
     {
         let _ = (log_file, configured_pid_file, args);
-        anyhow::bail!("pipit stop is only supported on unix platforms");
+        anyhow::bail!("runnel stop is only supported on unix platforms");
     }
 
     #[cfg(unix)]
@@ -1478,7 +1478,7 @@ async fn stop_daemon_process(
         if !process_exists(pid)? {
             let _ = fs::remove_file(&pid_file);
             println!(
-                "pipit daemon is not running (removed stale pid file {})",
+                "runnel daemon is not running (removed stale pid file {})",
                 pid_file.display()
             );
             return Ok(());
@@ -1490,7 +1490,7 @@ async fn stop_daemon_process(
             if !process_exists(pid)? {
                 let _ = fs::remove_file(&pid_file);
                 println!(
-                    "pipit daemon stopped pid={} pid_file={}",
+                    "runnel daemon stopped pid={} pid_file={}",
                     pid,
                     pid_file.display()
                 );
@@ -1516,7 +1516,7 @@ async fn reload_daemon_process(
     #[cfg(not(unix))]
     {
         let _ = (cli, config_path, args);
-        anyhow::bail!("pipit reload is only supported on unix platforms");
+        anyhow::bail!("runnel reload is only supported on unix platforms");
     }
 
     #[cfg(unix)]
@@ -1532,7 +1532,7 @@ async fn reload_daemon_process(
         )
         .await?;
         start_reloaded_daemon(cli, config_path.as_deref(), role)?;
-        println!("pipit daemon reloaded role={}", role.as_str());
+        println!("runnel daemon reloaded role={}", role.as_str());
         Ok(())
     }
 }
@@ -1708,7 +1708,7 @@ mod tests {
         reload_start_args, resolve_reload_role, resolve_status_targets, role_from_pid_file,
         run_utility_command, should_show_status_state, wait_for_daemon_startup,
     };
-    use pipit::wg;
+    use runnel::wg;
     use std::{
         ffi::OsString,
         fs,
@@ -1725,18 +1725,18 @@ mod tests {
             Some(Path::new("/home/alice")),
         );
 
-        assert_eq!(paths[0], PathBuf::from("/home/alice/.pipit/config.yaml"));
-        assert_eq!(paths[1], PathBuf::from("/xdg/pipit/config.yaml"));
-        assert!(paths.contains(&PathBuf::from("/home/alice/.config/pipit/config.yaml")));
+        assert_eq!(paths[0], PathBuf::from("/home/alice/.runnel/config.yaml"));
+        assert_eq!(paths[1], PathBuf::from("/xdg/runnel/config.yaml"));
+        assert!(paths.contains(&PathBuf::from("/home/alice/.config/runnel/config.yaml")));
         assert_eq!(
             paths
                 .iter()
-                .filter(|path| *path == &PathBuf::from("/home/alice/.pipit/config.yaml"))
+                .filter(|path| *path == &PathBuf::from("/home/alice/.runnel/config.yaml"))
                 .count(),
             1
         );
         #[cfg(unix)]
-        assert!(paths.ends_with(&[PathBuf::from("/etc/pipit/config.yaml")]));
+        assert!(paths.ends_with(&[PathBuf::from("/etc/runnel/config.yaml")]));
     }
 
     #[test]
@@ -1746,7 +1746,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "pipit-config-discovery-{}-{suffix}",
+            "runnel-config-discovery-{}-{suffix}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -1783,7 +1783,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "pipit-log-tail-{}-{suffix}.log",
+            "runnel-log-tail-{}-{suffix}.log",
             std::process::id()
         ));
         fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
@@ -1874,9 +1874,9 @@ mod tests {
     fn reload_start_args_restarts_selected_role_as_daemon() {
         let cli = Cli {
             log: "debug".to_owned(),
-            log_file: PathBuf::from("pipit.log"),
-            telemetry_sock: Some(PathBuf::from("pipit.sock")),
-            pid_file: Some(PathBuf::from("pipit.pid")),
+            log_file: PathBuf::from("runnel.log"),
+            telemetry_sock: Some(PathBuf::from("runnel.sock")),
+            pid_file: Some(PathBuf::from("runnel.pid")),
             tui: false,
             daemon: false,
             config: Some(PathBuf::from("config.yaml")),
@@ -1892,11 +1892,11 @@ mod tests {
                 OsString::from("--log"),
                 OsString::from("debug"),
                 OsString::from("--log-file"),
-                OsString::from("pipit.log"),
+                OsString::from("runnel.log"),
                 OsString::from("--telemetry-sock"),
-                OsString::from("pipit.sock"),
+                OsString::from("runnel.sock"),
                 OsString::from("--pid-file"),
-                OsString::from("pipit.pid"),
+                OsString::from("runnel.pid"),
                 OsString::from("--config"),
                 OsString::from("config.yaml"),
                 OsString::from("--daemon"),

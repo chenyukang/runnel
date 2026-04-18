@@ -173,7 +173,7 @@ fn default_adblock_config() -> GeneratedAdblockConfig {
     GeneratedAdblockConfig {
         enabled: true,
         lists: DEFAULT_ADBLOCK_LISTS.to_vec(),
-        cache_dir: "~/.cache/pipit/adblock",
+        cache_dir: "~/.cache/runnel/adblock",
         update_interval_hours: 24,
         decision_cache_ttl_secs: 300,
         fail_open: true,

@@ -1,7 +1,7 @@
 mod support;
 
 use anyhow::{Context, Result};
-use pipit::{
+use runnel::{
     client::{self, ClientArgs},
     mode::ProxyMode,
     proxy::{route::FilterMode, tls},
@@ -53,7 +53,7 @@ async fn native_http_server_fallback_serves_plain_tls_requests() -> Result<()> {
     let fallback_handle = spawn_http_target(fallback_port, |_path, _request| {
         b"native-fallback-ok".to_vec()
     });
-    let (cert_path, key_path) = write_temp_cert_pair("pipit-native-fallback")?;
+    let (cert_path, key_path) = write_temp_cert_pair("runnel-native-fallback")?;
 
     let _env = start_server(
         ServerArgs {
@@ -163,7 +163,7 @@ async fn native_http_mode_rejects_private_literal_targets_by_default() -> Result
     let server_port = free_port()?;
     let socks_port = free_port()?;
     let target_port = free_port()?;
-    let (cert_path, key_path) = write_temp_cert_pair("pipit-private-target")?;
+    let (cert_path, key_path) = write_temp_cert_pair("runnel-private-target")?;
 
     let client_args = ClientArgs {
         listen: format!("127.0.0.1:{socks_port}"),
@@ -181,7 +181,7 @@ async fn native_http_mode_rejects_private_literal_targets_by_default() -> Result
         domain_rules: Default::default(),
         ip_rules: Default::default(),
         adblock: Default::default(),
-        user_agent: "pipit-test".to_owned(),
+        user_agent: "runnel-test".to_owned(),
         handshake_timeout_secs: 10,
         connect_timeout_secs: 10,
         max_header_size: 16 * 1024,

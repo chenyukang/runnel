@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROLE="client"
-CONFIG="pipit.wg.yaml"
-PIPIT_BIN="./target/release/pipit"
+CONFIG="runnel.wg.yaml"
+RUNNEL_BIN="./target/release/runnel"
 LOG_DIR="/tmp"
 START=0
 DOMAIN="example.com"
@@ -12,14 +12,14 @@ TCPDUMP_SECONDS=8
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/pipit-wg-smoke.sh --role server --config pipit.wg.yaml --start
-  scripts/pipit-wg-smoke.sh --role client --config pipit.wg.yaml --start
+  scripts/runnel-wg-smoke.sh --role server --config runnel.wg.yaml --start
+  scripts/runnel-wg-smoke.sh --role client --config runnel.wg.yaml --start
 
 Options:
   --role client|server       Which side to diagnose. Default: client.
-  --config PATH              pipit YAML config with client/server mode: wg. Default: pipit.wg.yaml.
-  --pipit PATH               pipit binary. Default: ./target/release/pipit.
-  --start                    Start the selected pipit WG side in the background.
+  --config PATH              runnel YAML config with client/server mode: wg. Default: runnel.wg.yaml.
+  --runnel PATH               runnel binary. Default: ./target/release/runnel.
+  --start                    Start the selected runnel WG side in the background.
   --domain NAME              DNS smoke-test domain. Default: example.com.
   --tcpdump-seconds N        Seconds to wait for UDP 51820 packets. Default: 8.
 
@@ -39,8 +39,8 @@ while [[ $# -gt 0 ]]; do
       CONFIG="${2:?missing --config value}"
       shift 2
       ;;
-    --pipit)
-      PIPIT_BIN="${2:?missing --pipit value}"
+    --runnel)
+      RUNNEL_BIN="${2:?missing --runnel value}"
       shift 2
       ;;
     --start)
@@ -147,17 +147,17 @@ run_step() {
   echo "==> $*"
 }
 
-start_pipit() {
+start_runnel() {
   local subcommand="$1"
   local logfile="$2"
-  run_step "starting pipit $subcommand"
-  "$PIPIT_BIN" --log-file "$logfile" --config "$CONFIG" "$subcommand" >"$logfile.stdout" 2>"$logfile.stderr" &
-  PIPIT_PID=$!
-  echo "pid: $PIPIT_PID"
+  run_step "starting runnel $subcommand"
+  "$RUNNEL_BIN" --log-file "$logfile" --config "$CONFIG" "$subcommand" >"$logfile.stdout" 2>"$logfile.stderr" &
+  RUNNEL_PID=$!
+  echo "pid: $RUNNEL_PID"
   echo "log: $logfile"
   sleep 2
-  if ! kill -0 "$PIPIT_PID" >/dev/null 2>&1; then
-    echo "pipit $subcommand exited early" >&2
+  if ! kill -0 "$RUNNEL_PID" >/dev/null 2>&1; then
+    echo "runnel $subcommand exited early" >&2
     tail -80 "$logfile" "$logfile.stdout" "$logfile.stderr" 2>/dev/null || true
     exit 1
   fi
@@ -184,14 +184,14 @@ server_smoke() {
   local listen
   listen="$(strip_quotes "$(nested_section_value server wg listen)")"
   local port="${listen##*:}"
-  local logfile="$LOG_DIR/pipit-wg-server-smoke.log"
+  local logfile="$LOG_DIR/runnel-wg-server-smoke.log"
 
   if [[ "$START" -eq 1 ]]; then
-    start_pipit "server" "$logfile"
+    start_runnel "server" "$logfile"
   fi
 
   run_step "server process"
-  pgrep -fl 'pipit.*server' || true
+  pgrep -fl 'runnel.*server' || true
 
   if command -v ss >/dev/null 2>&1; then
     run_step "UDP listen check with ss"
@@ -212,14 +212,14 @@ client_smoke() {
   dns="$(strip_quotes "$(nested_section_value client wg dns)")"
   host="$(endpoint_host "$endpoint")"
   port="$(endpoint_port "$endpoint")"
-  logfile="$LOG_DIR/pipit-wg-client-smoke.log"
+  logfile="$LOG_DIR/runnel-wg-client-smoke.log"
 
   if [[ "$START" -eq 1 ]]; then
-    start_pipit "client" "$logfile"
+    start_runnel "client" "$logfile"
   fi
 
   run_step "client process"
-  pgrep -fl 'pipit.*client' || true
+  pgrep -fl 'runnel.*client' || true
 
   run_step "route to WG endpoint $host"
   if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -238,7 +238,7 @@ client_smoke() {
 
   iface="$(detect_iface "$host")"
   if [[ -n "$iface" && "$(id -u)" -eq 0 && -n "$port" && "$port" =~ ^[0-9]+$ && "$(command -v tcpdump || true)" ]]; then
-    tcpdump_log="$LOG_DIR/pipit-wg-tcpdump-smoke.log"
+    tcpdump_log="$LOG_DIR/runnel-wg-tcpdump-smoke.log"
     run_step "tcpdump UDP transport check on $iface host=$host port=$port"
     tcpdump -ni "$iface" -c 4 "host $host and udp port $port" >"$tcpdump_log" 2>&1 &
     TCPDUMP_PID=$!
@@ -306,7 +306,7 @@ client_smoke() {
   tail -80 "$logfile" 2>/dev/null || true
 }
 
-need_cmd "$PIPIT_BIN"
+need_cmd "$RUNNEL_BIN"
 
 case "$ROLE" in
   server) server_smoke ;;

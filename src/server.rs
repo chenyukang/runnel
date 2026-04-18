@@ -39,7 +39,7 @@ pub struct ServerArgs {
     pub key: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = ProxyMode::NativeHttp)]
     pub mode: ProxyMode,
-    #[arg(long, env = "PIPIT_PASSWORD")]
+    #[arg(long, env = "RUNNEL_PASSWORD")]
     #[arg(default_value = "")]
     pub password: String,
     #[arg(long, default_value = "/connect")]
@@ -136,7 +136,7 @@ impl ServerArgs {
     pub fn validate_required(&self) -> Result<()> {
         if self.password.trim().is_empty() {
             bail!(
-                "server password is required; pass --password, set PIPIT_PASSWORD, or set it in --config"
+                "server password is required; pass --password, set RUNNEL_PASSWORD, or set it in --config"
             );
         }
         Ok(())

@@ -1,7 +1,7 @@
 mod support;
 
 use anyhow::Result;
-use pipit::{
+use runnel::{
     client::{self, ClientArgs},
     mode::ProxyMode,
     proxy::route::FilterMode,
@@ -97,7 +97,7 @@ async fn rule_filter_blocks_matching_domain_before_dns_resolution() -> Result<()
     let _guard = test_lock().lock().await;
     init_test_tracing();
 
-    let temp_dir = TempDir::new("pipit-rule-e2e")?;
+    let temp_dir = TempDir::new("runnel-rule-e2e")?;
     let rule_file = temp_dir.join("rules.ls");
     fs::write(&rule_file, "B blocked.invalid\n")?;
 
@@ -149,7 +149,7 @@ async fn start_client(
         domain_rules: Default::default(),
         ip_rules: Default::default(),
         adblock: Default::default(),
-        user_agent: "pipit-test".to_owned(),
+        user_agent: "runnel-test".to_owned(),
         handshake_timeout_secs: 10,
         connect_timeout_secs: 1,
         max_header_size: 16 * 1024,

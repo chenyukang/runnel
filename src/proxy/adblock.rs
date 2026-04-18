@@ -291,15 +291,15 @@ fn cache_file_name(source: &str) -> String {
 
 fn default_adblock_cache_dir() -> PathBuf {
     if let Some(cache_home) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(cache_home).join("pipit").join("adblock");
+        return PathBuf::from(cache_home).join("runnel").join("adblock");
     }
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home)
             .join(".cache")
-            .join("pipit")
+            .join("runnel")
             .join("adblock");
     }
-    std::env::temp_dir().join("pipit-adblock")
+    std::env::temp_dir().join("runnel-adblock")
 }
 
 fn resolve_source(base_dir: &Path, source: &str) -> String {
@@ -383,11 +383,11 @@ mod tests {
             cache_dir: Some(PathBuf::from("cache")),
             ..AdblockConfig::default()
         };
-        let resolved = config.with_base_dir(Path::new("/tmp/pipit"));
+        let resolved = config.with_base_dir(Path::new("/tmp/runnel"));
 
-        assert_eq!(resolved.lists[0], "/tmp/pipit/lists/easylist.txt");
+        assert_eq!(resolved.lists[0], "/tmp/runnel/lists/easylist.txt");
         assert_eq!(resolved.lists[1], "https://example.com/easyprivacy.txt");
-        assert_eq!(resolved.cache_dir, Some(PathBuf::from("/tmp/pipit/cache")));
+        assert_eq!(resolved.cache_dir, Some(PathBuf::from("/tmp/runnel/cache")));
     }
 
     #[test]
@@ -399,7 +399,7 @@ mod tests {
             lists: vec!["~/easylist.txt".to_owned()],
             ..AdblockConfig::default()
         };
-        let resolved = config.with_base_dir(Path::new("/tmp/pipit"));
+        let resolved = config.with_base_dir(Path::new("/tmp/runnel"));
 
         assert_eq!(
             resolved.lists[0],

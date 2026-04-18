@@ -1,15 +1,15 @@
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use boringtun::x25519::{PublicKey, StaticSecret};
-use pipit::{
+use rand::rngs::OsRng;
+use rcgen::generate_simple_self_signed;
+use runnel::{
     client::{self, ClientArgs},
     mode::ProxyMode,
     proxy::route::FilterMode,
     server::{self, ServerArgs},
     wg::{client::WgClientArgs, server::WgServerArgs},
 };
-use rand::rngs::OsRng;
-use rcgen::generate_simple_self_signed;
 use std::{
     fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener as StdTcpListener},
@@ -34,7 +34,7 @@ const DEFAULT_WARMUP_REQUESTS: usize = 100;
 const DEFAULT_SMALL_REQUESTS: usize = 1000;
 const DEFAULT_LARGE_DOWNLOADS: usize = 8;
 const DEFAULT_LARGE_BODY_BYTES: usize = 1024 * 1024;
-const CHILD_ROLE_ENV: &str = "PIPIT_PERF_CHILD_ROLE";
+const CHILD_ROLE_ENV: &str = "RUNNEL_PERF_CHILD_ROLE";
 static NEXT_CERT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
@@ -130,17 +130,17 @@ async fn main() -> Result<()> {
         return run_child_role(&role).await;
     }
 
-    if cfg!(debug_assertions) && std::env::var_os("PIPIT_RUN_PERF_BENCH").is_none() {
+    if cfg!(debug_assertions) && std::env::var_os("RUNNEL_RUN_PERF_BENCH").is_none() {
         println!("mode_perf bench is skipped in debug/test profile");
         println!("run `cargo bench --bench mode_perf` for release-profile results");
         return Ok(());
     }
 
     let config = BenchConfig {
-        warmup_requests: env_usize("PIPIT_PERF_WARMUP", DEFAULT_WARMUP_REQUESTS),
-        small_requests: env_usize("PIPIT_PERF_REQUESTS", DEFAULT_SMALL_REQUESTS),
-        large_downloads: env_usize("PIPIT_PERF_LARGE_DOWNLOADS", DEFAULT_LARGE_DOWNLOADS),
-        large_body_bytes: env_usize("PIPIT_PERF_LARGE_BYTES", DEFAULT_LARGE_BODY_BYTES),
+        warmup_requests: env_usize("RUNNEL_PERF_WARMUP", DEFAULT_WARMUP_REQUESTS),
+        small_requests: env_usize("RUNNEL_PERF_REQUESTS", DEFAULT_SMALL_REQUESTS),
+        large_downloads: env_usize("RUNNEL_PERF_LARGE_DOWNLOADS", DEFAULT_LARGE_DOWNLOADS),
+        large_body_bytes: env_usize("RUNNEL_PERF_LARGE_BYTES", DEFAULT_LARGE_BODY_BYTES),
     };
 
     init_optional_tracing();
@@ -327,7 +327,7 @@ async fn start_env(mode: ProxyMode, large_body_bytes: usize) -> Result<BenchEnv>
         domain_rules: Default::default(),
         ip_rules: Default::default(),
         adblock: Default::default(),
-        user_agent: "pipit-bench".to_owned(),
+        user_agent: "runnel-bench".to_owned(),
         handshake_timeout_secs: 10,
         connect_timeout_secs: 10,
         max_header_size: 16 * 1024,
@@ -364,27 +364,27 @@ async fn start_env(mode: ProxyMode, large_body_bytes: usize) -> Result<BenchEnv>
 }
 
 async fn start_wg_env(large_body_bytes: usize) -> Result<WgBenchEnv> {
-    let client_tunnel_ip = env_ip("PIPIT_PERF_WG_CLIENT_IP", "10.88.0.2")?;
-    let server_tunnel_ip = env_ip("PIPIT_PERF_WG_SERVER_IP", "10.88.0.1")?;
+    let client_tunnel_ip = env_ip("RUNNEL_PERF_WG_CLIENT_IP", "10.88.0.2")?;
+    let server_tunnel_ip = env_ip("RUNNEL_PERF_WG_SERVER_IP", "10.88.0.1")?;
     anyhow::ensure!(
         client_tunnel_ip.is_ipv4() == server_tunnel_ip.is_ipv4(),
-        "PIPIT_PERF_WG_CLIENT_IP and PIPIT_PERF_WG_SERVER_IP must use the same IP version"
+        "RUNNEL_PERF_WG_CLIENT_IP and RUNNEL_PERF_WG_SERVER_IP must use the same IP version"
     );
 
     let target_port = free_port()?;
     let wg_port = free_udp_port()?;
-    let mtu = env_usize("PIPIT_PERF_WG_MTU", 1420) as u16;
-    let server_device = env_string("PIPIT_PERF_WG_SERVER_DEVICE", default_wg_server_device());
-    let client_device = env_string("PIPIT_PERF_WG_CLIENT_DEVICE", default_wg_client_device());
+    let mtu = env_usize("RUNNEL_PERF_WG_MTU", 1420) as u16;
+    let server_device = env_string("RUNNEL_PERF_WG_SERVER_DEVICE", default_wg_server_device());
+    let client_device = env_string("RUNNEL_PERF_WG_CLIENT_DEVICE", default_wg_client_device());
     let (client_private_key, client_public_key) = wg_key_pair();
     let (server_private_key, server_public_key) = wg_key_pair();
 
     let mut target_child = ChildGuard::new(spawn_mode_perf_child(
         "wg-target",
         &[
-            ("PIPIT_PERF_WG_TARGET_PORT", target_port.to_string()),
-            ("PIPIT_PERF_LARGE_BYTES", large_body_bytes.to_string()),
-            ("PIPIT_PERF_WG_SERVER_IP", server_tunnel_ip.to_string()),
+            ("RUNNEL_PERF_WG_TARGET_PORT", target_port.to_string()),
+            ("RUNNEL_PERF_LARGE_BYTES", large_body_bytes.to_string()),
+            ("RUNNEL_PERF_WG_SERVER_IP", server_tunnel_ip.to_string()),
         ],
     )?);
     let target_probe_ip = if server_tunnel_ip.is_ipv6() {
@@ -398,13 +398,13 @@ async fn start_wg_env(large_body_bytes: usize) -> Result<WgBenchEnv> {
     let mut server_child = ChildGuard::new(spawn_mode_perf_child(
         "wg-server",
         &[
-            ("PIPIT_PERF_WG_PORT", wg_port.to_string()),
-            ("PIPIT_PERF_WG_SERVER_PRIVATE_KEY", server_private_key),
-            ("PIPIT_PERF_WG_CLIENT_PUBLIC_KEY", client_public_key),
-            ("PIPIT_PERF_WG_SERVER_DEVICE", server_device),
-            ("PIPIT_PERF_WG_SERVER_IP", server_tunnel_ip.to_string()),
-            ("PIPIT_PERF_WG_CLIENT_IP", client_tunnel_ip.to_string()),
-            ("PIPIT_PERF_WG_MTU", mtu.to_string()),
+            ("RUNNEL_PERF_WG_PORT", wg_port.to_string()),
+            ("RUNNEL_PERF_WG_SERVER_PRIVATE_KEY", server_private_key),
+            ("RUNNEL_PERF_WG_CLIENT_PUBLIC_KEY", client_public_key),
+            ("RUNNEL_PERF_WG_SERVER_DEVICE", server_device),
+            ("RUNNEL_PERF_WG_SERVER_IP", server_tunnel_ip.to_string()),
+            ("RUNNEL_PERF_WG_CLIENT_IP", client_tunnel_ip.to_string()),
+            ("RUNNEL_PERF_WG_MTU", mtu.to_string()),
         ],
     )?);
     sleep(Duration::from_millis(500)).await;
@@ -413,13 +413,13 @@ async fn start_wg_env(large_body_bytes: usize) -> Result<WgBenchEnv> {
     let mut client_child = ChildGuard::new(spawn_mode_perf_child(
         "wg-client",
         &[
-            ("PIPIT_PERF_WG_PORT", wg_port.to_string()),
-            ("PIPIT_PERF_WG_CLIENT_PRIVATE_KEY", client_private_key),
-            ("PIPIT_PERF_WG_SERVER_PUBLIC_KEY", server_public_key),
-            ("PIPIT_PERF_WG_CLIENT_DEVICE", client_device),
-            ("PIPIT_PERF_WG_CLIENT_IP", client_tunnel_ip.to_string()),
-            ("PIPIT_PERF_WG_SERVER_IP", server_tunnel_ip.to_string()),
-            ("PIPIT_PERF_WG_MTU", mtu.to_string()),
+            ("RUNNEL_PERF_WG_PORT", wg_port.to_string()),
+            ("RUNNEL_PERF_WG_CLIENT_PRIVATE_KEY", client_private_key),
+            ("RUNNEL_PERF_WG_SERVER_PUBLIC_KEY", server_public_key),
+            ("RUNNEL_PERF_WG_CLIENT_DEVICE", client_device),
+            ("RUNNEL_PERF_WG_CLIENT_IP", client_tunnel_ip.to_string()),
+            ("RUNNEL_PERF_WG_SERVER_IP", server_tunnel_ip.to_string()),
+            ("RUNNEL_PERF_WG_MTU", mtu.to_string()),
         ],
     )?);
     sleep(Duration::from_millis(500)).await;
@@ -440,9 +440,9 @@ async fn start_wg_env(large_body_bytes: usize) -> Result<WgBenchEnv> {
 async fn run_child_role(role: &str) -> Result<()> {
     match role {
         "wg-target" => {
-            let port = env_u16("PIPIT_PERF_WG_TARGET_PORT")?;
-            let large_body_bytes = env_usize("PIPIT_PERF_LARGE_BYTES", DEFAULT_LARGE_BODY_BYTES);
-            let server_tunnel_ip = env_ip("PIPIT_PERF_WG_SERVER_IP", "10.88.0.1")?;
+            let port = env_u16("RUNNEL_PERF_WG_TARGET_PORT")?;
+            let large_body_bytes = env_usize("RUNNEL_PERF_LARGE_BYTES", DEFAULT_LARGE_BODY_BYTES);
+            let server_tunnel_ip = env_ip("RUNNEL_PERF_WG_SERVER_IP", "10.88.0.1")?;
             let bind_ip = if server_tunnel_ip.is_ipv6() {
                 IpAddr::V6(Ipv6Addr::UNSPECIFIED)
             } else {
@@ -452,10 +452,10 @@ async fn run_child_role(role: &str) -> Result<()> {
             Ok(())
         }
         "wg-server" => {
-            let client_tunnel_ip = env_ip("PIPIT_PERF_WG_CLIENT_IP", "10.88.0.2")?;
-            let server_tunnel_ip = env_ip("PIPIT_PERF_WG_SERVER_IP", "10.88.0.1")?;
-            let wg_port = env_u16("PIPIT_PERF_WG_PORT")?;
-            let mtu = env_usize("PIPIT_PERF_WG_MTU", 1420) as u16;
+            let client_tunnel_ip = env_ip("RUNNEL_PERF_WG_CLIENT_IP", "10.88.0.2")?;
+            let server_tunnel_ip = env_ip("RUNNEL_PERF_WG_SERVER_IP", "10.88.0.1")?;
+            let wg_port = env_u16("RUNNEL_PERF_WG_PORT")?;
+            let mtu = env_usize("RUNNEL_PERF_WG_MTU", 1420) as u16;
             let args = ServerArgs {
                 listen: String::new(),
                 cert: None,
@@ -475,9 +475,9 @@ async fn run_child_role(role: &str) -> Result<()> {
                 max_fallback_body_size: 1024,
                 wg: WgServerArgs {
                     listen: format!("0.0.0.0:{wg_port}"),
-                    private_key: env_required("PIPIT_PERF_WG_SERVER_PRIVATE_KEY")?,
-                    peer_public_key: env_required("PIPIT_PERF_WG_CLIENT_PUBLIC_KEY")?,
-                    device: env_string("PIPIT_PERF_WG_SERVER_DEVICE", default_wg_server_device()),
+                    private_key: env_required("RUNNEL_PERF_WG_SERVER_PRIVATE_KEY")?,
+                    peer_public_key: env_required("RUNNEL_PERF_WG_CLIENT_PUBLIC_KEY")?,
+                    device: env_string("RUNNEL_PERF_WG_SERVER_DEVICE", default_wg_server_device()),
                     tunnel_ip: server_tunnel_ip,
                     peer_tunnel_ip: client_tunnel_ip,
                     peer_allowed_ips: vec![host_cidr(client_tunnel_ip)],
@@ -493,10 +493,10 @@ async fn run_child_role(role: &str) -> Result<()> {
             server::run(args).await
         }
         "wg-client" => {
-            let client_tunnel_ip = env_ip("PIPIT_PERF_WG_CLIENT_IP", "10.88.0.2")?;
-            let server_tunnel_ip = env_ip("PIPIT_PERF_WG_SERVER_IP", "10.88.0.1")?;
-            let wg_port = env_u16("PIPIT_PERF_WG_PORT")?;
-            let mtu = env_usize("PIPIT_PERF_WG_MTU", 1420) as u16;
+            let client_tunnel_ip = env_ip("RUNNEL_PERF_WG_CLIENT_IP", "10.88.0.2")?;
+            let server_tunnel_ip = env_ip("RUNNEL_PERF_WG_SERVER_IP", "10.88.0.1")?;
+            let wg_port = env_u16("RUNNEL_PERF_WG_PORT")?;
+            let mtu = env_usize("RUNNEL_PERF_WG_MTU", 1420) as u16;
             let args = ClientArgs {
                 listen: String::new(),
                 server: String::new(),
@@ -513,7 +513,7 @@ async fn run_child_role(role: &str) -> Result<()> {
                 domain_rules: Default::default(),
                 ip_rules: Default::default(),
                 adblock: Default::default(),
-                user_agent: "pipit-bench".to_owned(),
+                user_agent: "runnel-bench".to_owned(),
                 handshake_timeout_secs: 10,
                 connect_timeout_secs: 10,
                 max_header_size: 16 * 1024,
@@ -524,9 +524,9 @@ async fn run_child_role(role: &str) -> Result<()> {
                 wg: WgClientArgs {
                     bind: "0.0.0.0:0".to_owned(),
                     endpoint: format!("127.0.0.1:{wg_port}"),
-                    private_key: env_required("PIPIT_PERF_WG_CLIENT_PRIVATE_KEY")?,
-                    peer_public_key: env_required("PIPIT_PERF_WG_SERVER_PUBLIC_KEY")?,
-                    device: env_string("PIPIT_PERF_WG_CLIENT_DEVICE", default_wg_client_device()),
+                    private_key: env_required("RUNNEL_PERF_WG_CLIENT_PRIVATE_KEY")?,
+                    peer_public_key: env_required("RUNNEL_PERF_WG_SERVER_PUBLIC_KEY")?,
+                    device: env_string("RUNNEL_PERF_WG_CLIENT_DEVICE", default_wg_client_device()),
                     tunnel_ip: client_tunnel_ip,
                     peer_tunnel_ip: server_tunnel_ip,
                     mtu,
@@ -555,10 +555,10 @@ fn spawn_mode_perf_child(role: &str, vars: &[(&str, String)]) -> Result<Child> {
         Command::new(std::env::current_exe().context("failed to locate bench binary")?);
     command
         .env(CHILD_ROLE_ENV, role)
-        .env("PIPIT_RUN_PERF_BENCH", "1")
+        .env("RUNNEL_RUN_PERF_BENCH", "1")
         .stderr(Stdio::inherit());
 
-    if env_bool("PIPIT_PERF_LOG") {
+    if env_bool("RUNNEL_PERF_LOG") {
         command.stdout(Stdio::inherit());
     } else {
         command.stdout(Stdio::null());
@@ -711,7 +711,7 @@ async fn fetch_via_wg_path(
 }
 
 async fn wait_for_wg_target(target_addr: SocketAddr, client_source_ip: IpAddr) -> Result<()> {
-    timeout(Duration::from_secs(env_usize("PIPIT_PERF_WG_READY_TIMEOUT", 15) as u64), async move {
+    timeout(Duration::from_secs(env_usize("RUNNEL_PERF_WG_READY_TIMEOUT", 15) as u64), async move {
         loop {
             match fetch_via_wg_path(target_addr, client_source_ip, "/small").await {
                 Ok(body) if body.ends_with(b"ok") => return Ok::<(), anyhow::Error>(()),
@@ -723,7 +723,7 @@ async fn wait_for_wg_target(target_addr: SocketAddr, client_source_ip: IpAddr) -
     .await
     .with_context(|| {
         format!(
-            "timed out waiting for WG benchmark target {target_addr}; run with sudo and set PIPIT_PERF_LOG=1 for details"
+            "timed out waiting for WG benchmark target {target_addr}; run with sudo and set RUNNEL_PERF_LOG=1 for details"
         )
     })?
 }
@@ -761,13 +761,13 @@ fn print_table(results: &[ModeResult], config: BenchConfig) {
         .any(|result| result.mode == ProxyMode::Wg.as_str())
     {
         println!(
-            "| wg | - | - | - | - | - | - | skipped unless PIPIT_PERF_WG=1 or PIPIT_PERF_MODES=wg is set because real WG mode creates a TUN/device and needs host privileges |"
+            "| wg | - | - | - | - | - | - | skipped unless RUNNEL_PERF_WG=1 or RUNNEL_PERF_MODES=wg is set because real WG mode creates a TUN/device and needs host privileges |"
         );
     }
     println!();
     println!("Tune with environment variables:");
     println!(
-        "`PIPIT_PERF_MODES`, `PIPIT_PERF_WG`, `PIPIT_PERF_WARMUP`, `PIPIT_PERF_REQUESTS`, `PIPIT_PERF_LARGE_DOWNLOADS`, `PIPIT_PERF_LARGE_BYTES`."
+        "`RUNNEL_PERF_MODES`, `RUNNEL_PERF_WG`, `RUNNEL_PERF_WARMUP`, `RUNNEL_PERF_REQUESTS`, `RUNNEL_PERF_LARGE_DOWNLOADS`, `RUNNEL_PERF_LARGE_BYTES`."
     );
 }
 
@@ -788,8 +788,8 @@ fn selected_modes() -> Vec<ProxyMode> {
         ProxyMode::Wg,
     ];
 
-    let Some(selected) = std::env::var("PIPIT_PERF_MODES").ok() else {
-        return if env_bool("PIPIT_PERF_WG") {
+    let Some(selected) = std::env::var("RUNNEL_PERF_MODES").ok() else {
+        return if env_bool("RUNNEL_PERF_WG") {
             all.to_vec()
         } else {
             non_wg.to_vec()
@@ -886,7 +886,7 @@ fn default_wg_server_device() -> &'static str {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        "pipitwgs0"
+        "runnelwgs0"
     }
 }
 
@@ -897,7 +897,7 @@ fn default_wg_client_device() -> &'static str {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        "pipitwgc0"
+        "runnelwgc0"
     }
 }
 
@@ -916,7 +916,7 @@ fn wg_key_pair() -> (String, String) {
 }
 
 fn init_optional_tracing() {
-    if std::env::var_os("PIPIT_PERF_LOG").is_none() {
+    if std::env::var_os("RUNNEL_PERF_LOG").is_none() {
         return;
     }
 
@@ -990,7 +990,7 @@ fn write_temp_cert_pair() -> Result<(PathBuf, PathBuf)> {
     let certified = generate_simple_self_signed(vec!["example.com".to_owned()])
         .context("failed to generate self-signed certificate")?;
     let id = NEXT_CERT_ID.fetch_add(1, Ordering::Relaxed);
-    let base = std::env::temp_dir().join(format!("pipit-mode-perf-{}-{id}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("runnel-mode-perf-{}-{id}", std::process::id()));
     let cert_path = base.with_extension("crt");
     let key_path = base.with_extension("key");
     fs::write(&cert_path, certified.cert.pem())

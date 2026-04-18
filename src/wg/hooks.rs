@@ -1094,7 +1094,7 @@ destination: 172.235.244.118
     #[test]
     fn linux_client_hook_plan_installs_split_default_routes() {
         let plan = build_client_hook_plan(
-            "pipitwg0",
+            "runnelwg0",
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
             &client_runtime(),
             &RouteInfo {
@@ -1106,22 +1106,22 @@ destination: 172.235.244.118
 
         assert_eq!(
             plan.up.first().map(String::as_str),
-            Some("ip address add 10.8.0.2 peer 10.8.0.1 dev pipitwg0")
+            Some("ip address add 10.8.0.2 peer 10.8.0.1 dev runnelwg0")
         );
         assert!(
             plan.up
                 .iter()
-                .any(|hook| hook == "ip route replace 0.0.0.0/1 dev pipitwg0")
+                .any(|hook| hook == "ip route replace 0.0.0.0/1 dev runnelwg0")
         );
         assert!(
             plan.up
                 .iter()
-                .any(|hook| hook == "ip route replace 128.0.0.0/1 dev pipitwg0")
+                .any(|hook| hook == "ip route replace 128.0.0.0/1 dev runnelwg0")
         );
         assert!(
             plan.down
                 .iter()
-                .any(|hook| hook.contains("ip link set dev pipitwg0 down"))
+                .any(|hook| hook.contains("ip link set dev runnelwg0 down"))
         );
     }
 
@@ -1131,7 +1131,7 @@ destination: 172.235.244.118
         let mut runtime = client_runtime();
         runtime.peer_allowed_ips = vec!["203.0.113.0/24".to_owned(), "198.18.0.2/32".to_owned()];
         let plan = build_client_hook_plan(
-            "pipitwg0",
+            "runnelwg0",
             IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
             &runtime,
             &RouteInfo {
@@ -1144,18 +1144,18 @@ destination: 172.235.244.118
         assert!(
             plan.up
                 .iter()
-                .any(|hook| hook == "ip route replace 203.0.113.0/24 dev pipitwg0")
+                .any(|hook| hook == "ip route replace 203.0.113.0/24 dev runnelwg0")
         );
         assert!(
             plan.up
                 .iter()
-                .any(|hook| hook == "ip route replace 198.18.0.2/32 dev pipitwg0")
+                .any(|hook| hook == "ip route replace 198.18.0.2/32 dev runnelwg0")
         );
         assert!(
             !plan
                 .up
                 .iter()
-                .any(|hook| hook == "ip route replace 0.0.0.0/1 dev pipitwg0")
+                .any(|hook| hook == "ip route replace 0.0.0.0/1 dev runnelwg0")
         );
     }
 
@@ -1178,15 +1178,15 @@ destination: 172.235.244.118
         };
 
         let HookPlan { up, down } =
-            build_server_hook_plan("pipitwg0", &runtime, Some("eth0")).unwrap();
+            build_server_hook_plan("runnelwg0", &runtime, Some("eth0")).unwrap();
         assert!(up.iter().any(|hook| hook.contains("net.ipv4.ip_forward=1")));
         assert!(
             up.iter()
-                .any(|hook| hook == "ip route replace 10.9.0.0/24 dev pipitwg0")
+                .any(|hook| hook == "ip route replace 10.9.0.0/24 dev runnelwg0")
         );
         assert!(
             !up.iter()
-                .any(|hook| hook == "ip route replace 10.8.0.2/32 dev pipitwg0")
+                .any(|hook| hook == "ip route replace 10.8.0.2/32 dev runnelwg0")
         );
         assert!(
             up.iter()

@@ -1,9 +1,9 @@
 # Sample daze-ashe config.
-# Use PIPIT_PASSWORD for the shared secret; do not commit real passwords.
+# Use RUNNEL_PASSWORD for the shared secret; do not commit real passwords.
 
 log: info
-log_file: ./logs/pipit-daze-ashe.log
-telemetry_sock: ./run/pipit-daze-ashe.sock
+log_file: ./logs/runnel-daze-ashe.log
+telemetry_sock: ./run/runnel-daze-ashe.sock
 tui: true
 
 client:

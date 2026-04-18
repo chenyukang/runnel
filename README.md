@@ -1,28 +1,28 @@
-# Pipit
+# Runnel
 
-Pipit is a compact Rust proxy and tunnel toolbox. It support a WireGuard-style UDP tunnel built on `boringtun`, and also keeps classic SOCKS and native/daze transports available for app-level proxying.
+Runnel is a compact Rust proxy and tunnel toolbox. It support a WireGuard-style UDP tunnel built on `boringtun`, and also keeps classic SOCKS and native/daze transports available for app-level proxying.
 
 The project intentionally keeps the moving parts visible:
 
-- `pipit client` runs the WG client when `client.mode: wg`, or
+- `runnel client` runs the WG client when `client.mode: wg`, or
   exposes a local SOCKS5 proxy for native/daze modes.
-  - `pipit tun` optionally captures local IP traffic through the classic native-http client path.
-- `pipit server` accepts one of several client/server modes.
+  - `runnel tun` optionally captures local IP traffic through the classic native-http client path.
+- `runnel server` accepts one of several client/server modes.
 - config files, daemon mode, status checks, telemetry sockets, and TUI dashboards
   are available from the same binary.
 
 ## Modes
 
-Pipit has two separate concerns. Keeping them separate makes the modes easier
+Runnel has two separate concerns. Keeping them separate makes the modes easier
 to reason about:
 
-1. **Client/server mode**: how `pipit client` talks to `pipit server`.
+1. **Client/server mode**: how `runnel client` talks to `runnel server`.
 2. **Client traffic intake**: whether local traffic enters through SOCKS or a
    local TUN device.
 
 ### Client/Server Modes
 
-These are the `--mode` values shared by `pipit client` and `pipit server`.
+These are the `--mode` values shared by `runnel client` and `runnel server`.
 
 | Mode | Shape | Best for | Main tradeoff |
 | --- | --- | --- | --- |
@@ -42,10 +42,10 @@ also creates its own TUN-based traffic intake.
 
 | Intake | Entry point | What it captures | Current implementation status |
 | --- | --- | --- | --- |
-| WG TUN | `pipit client` with `client.mode: wg` | System IP traffic routed into the WireGuard-style TUN device | Works with `server.mode: wg`; uses UDP transport via `boringtun` and does not use SOCKS or `pipit tun` |
-| SOCKS | `pipit client` with native/daze modes | Apps explicitly configured for `socks5://127.0.0.1:1080` | Works with `native-http`, `native-mux`, and `daze-*` |
-| macOS system proxy | `pipit client --system-proxy` | Apps that honor the macOS SOCKS proxy setting | Works with the normal SOCKS client path |
-| TUN | `pipit tun` | System IP traffic routed into a local TUN device | Architecturally a client-side intake mode; currently implemented only with `native-http` because DNS/UDP handling relies on SOCKS `UDP ASSOCIATE` |
+| WG TUN | `runnel client` with `client.mode: wg` | System IP traffic routed into the WireGuard-style TUN device | Works with `server.mode: wg`; uses UDP transport via `boringtun` and does not use SOCKS or `runnel tun` |
+| SOCKS | `runnel client` with native/daze modes | Apps explicitly configured for `socks5://127.0.0.1:1080` | Works with `native-http`, `native-mux`, and `daze-*` |
+| macOS system proxy | `runnel client --system-proxy` | Apps that honor the macOS SOCKS proxy setting | Works with the normal SOCKS client path |
+| TUN | `runnel tun` | System IP traffic routed into a local TUN device | Architecturally a client-side intake mode; currently implemented only with `native-http` because DNS/UDP handling relies on SOCKS `UDP ASSOCIATE` |
 
 ```mermaid
 flowchart TD
@@ -53,14 +53,14 @@ flowchart TD
 
     subgraph ClientHost["Client host"]
         direction TB
-        App -->|"App proxy setting"| Socks["SOCKS listener<br/>pipit client"]
-        App -->|"OS route"| ClientTun["Client TUN device<br/>pipit tun"]
+        App -->|"App proxy setting"| Socks["SOCKS listener<br/>runnel client"]
+        App -->|"OS route"| ClientTun["Client TUN device<br/>runnel tun"]
         App -->|"OS route / default route"| WgTun["WG TUN device<br/>client.mode: wg"]
 
         ClientTun --> Tun2Proxy["tun2proxy<br/>packet to SOCKS flows"]
         Tun2Proxy --> Socks
         Socks --> Policy["SOCKS routing policy<br/>proxy / direct / rule"]
-        Policy -->|"proxy"| ClientTransport["pipit client transport<br/>native-http / native-mux / daze-*"]
+        Policy -->|"proxy"| ClientTransport["runnel client transport<br/>native-http / native-mux / daze-*"]
 
         WgTun --> BoringTunClient["boringtun engine<br/>encrypt packets"]
         BoringTunClient --> WgUdp["UDP WireGuard packets<br/>usually UDP 51820"]
@@ -83,7 +83,7 @@ flowchart TD
 ```
 
 Sample config files live in [`config/`](./config/). They use documentation-only
-hosts, addresses, and placeholders; bring your own `PIPIT_PASSWORD`, certificates,
+hosts, addresses, and placeholders; bring your own `RUNNEL_PASSWORD`, certificates,
 and WG keys.
 
 ## Install And Build
@@ -92,7 +92,7 @@ and WG keys.
 cargo build --release
 ```
 
-During development you can replace `./target/release/pipit` with:
+During development you can replace `./target/release/runnel` with:
 
 ```bash
 cargo run -- ...
@@ -101,15 +101,15 @@ cargo run -- ...
 ## Quick Start: WG Mode
 
 WG mode is the recommended path for daily use. It is a WireGuard-style tunnel
-built on `boringtun`, uses UDP between `pipit client` and `pipit server`, and
+built on `boringtun`, uses UDP between `runnel client` and `runnel server`, and
 supports full-tunnel or split-tunnel routing. It does not use SOCKS,
-`pipit tun`, or the native/daze handshakes.
+`runnel tun`, or the native/daze handshakes.
 
 Generate a paired config, replacing `SERVER-IP` with the real server IP before
 running the command:
 
 ```bash
-./target/release/pipit wg-config \
+./target/release/runnel wg-config \
   --server-endpoint SERVER-IP:51820 \
   --client-tunnel-ip 10.8.0.2 \
   --server-tunnel-ip 10.8.0.1 \
@@ -118,7 +118,7 @@ running the command:
   --direct-ip "10.*" \
   --direct-ip "172.16.0.0/12" \
   --direct-ip "192.168.*" \
-  --nat-out-interface eth0 > pipit.wg.yaml
+  --nat-out-interface eth0 > runnel.wg.yaml
 ```
 
 There are also shape-only templates at
@@ -132,18 +132,18 @@ not want DNS-level ad blocking.
 Start the server first:
 
 ```bash
-sudo ./target/release/pipit \
-  --log-file /tmp/pipit-wg-server.log \
-  --config pipit.wg.yaml \
+sudo ./target/release/runnel \
+  --log-file /tmp/runnel-wg-server.log \
+  --config runnel.wg.yaml \
   server
 ```
 
 Start the client second:
 
 ```bash
-sudo ./target/release/pipit \
-  --log-file /tmp/pipit-wg-client.log \
-  --config pipit.wg.yaml \
+sudo ./target/release/runnel \
+  --log-file /tmp/runnel-wg-client.log \
+  --config runnel.wg.yaml \
   --tui \
   client
 ```
@@ -167,14 +167,14 @@ server:
 Then run the normal entry point:
 
 ```bash
-./target/release/pipit \
-  --log-file /tmp/pipit-wg-client-dry-run.log \
-  --config pipit.wg.yaml \
+./target/release/runnel \
+  --log-file /tmp/runnel-wg-client-dry-run.log \
+  --config runnel.wg.yaml \
   client
 
-./target/release/pipit \
-  --log-file /tmp/pipit-wg-server-dry-run.log \
-  --config pipit.wg.yaml \
+./target/release/runnel \
+  --log-file /tmp/runnel-wg-server-dry-run.log \
+  --config runnel.wg.yaml \
   server
 ```
 
@@ -184,10 +184,10 @@ Run a repeatable smoke check:
 
 ```bash
 # server machine
-sudo ./scripts/pipit-wg-smoke.sh --role server --config pipit.wg.yaml --start
+sudo ./scripts/runnel-wg-smoke.sh --role server --config runnel.wg.yaml --start
 
 # client machine
-sudo ./scripts/pipit-wg-smoke.sh --role client --config pipit.wg.yaml --start
+sudo ./scripts/runnel-wg-smoke.sh --role client --config runnel.wg.yaml --start
 ```
 
 WG mode notes:
@@ -215,7 +215,7 @@ system-level WG tunnel.
 Generate a certificate for the server name:
 
 ```bash
-./target/release/pipit cert \
+./target/release/runnel cert \
   --name example.com \
   --cert server.crt \
   --key server.key
@@ -224,7 +224,7 @@ Generate a certificate for the server name:
 Start the server:
 
 ```bash
-PIPIT_PASSWORD='replace-me' ./target/release/pipit server \
+RUNNEL_PASSWORD='replace-me' ./target/release/runnel server \
   --mode native-http \
   --listen 0.0.0.0:1443 \
   --cert server.crt \
@@ -234,7 +234,7 @@ PIPIT_PASSWORD='replace-me' ./target/release/pipit server \
 Start the local client:
 
 ```bash
-PIPIT_PASSWORD='replace-me' ./target/release/pipit client \
+RUNNEL_PASSWORD='replace-me' ./target/release/runnel client \
   --mode native-http \
   --listen 127.0.0.1:1080 \
   --server example.com:1443 \
@@ -250,14 +250,14 @@ socks5://127.0.0.1:1080
 
 ## Optional: Native TUN Intake
 
-`pipit tun` is the TUN intake for the classic native-http client path. Prefer WG
-for VPN-style daily use; use `pipit tun` when you specifically need the
+`runnel tun` is the TUN intake for the classic native-http client path. Prefer WG
+for VPN-style daily use; use `runnel tun` when you specifically need the
 native-http SOCKS pipeline behind a TUN device.
 
 Use a tun-specific config such as [`config/tun.yaml`](./config/tun.yaml):
 
 ```bash
-sudo PIPIT_PASSWORD='replace-me' ./target/release/pipit \
+sudo RUNNEL_PASSWORD='replace-me' ./target/release/runnel \
   --config ./config/tun.yaml \
   tun
 ```
@@ -265,15 +265,15 @@ sudo PIPIT_PASSWORD='replace-me' ./target/release/pipit \
 Preview hooks before touching routes:
 
 ```bash
-./target/release/pipit --config ./config/tun.yaml tun --dry-run
+./target/release/runnel --config ./config/tun.yaml tun --dry-run
 ```
 
 Useful helper:
 
 ```bash
-./scripts/pipit-tun.sh doctor
-sudo ./scripts/pipit-tun.sh reset
-sudo ./scripts/pipit-tun.sh reset --dry-run
+./scripts/runnel-tun.sh doctor
+sudo ./scripts/runnel-tun.sh reset
+sudo ./scripts/runnel-tun.sh reset --dry-run
 ```
 
 Important limits:
@@ -310,9 +310,9 @@ client:
   adblock:
     enabled: true
     lists:
-      - ~/.config/pipit/easylist.txt
+      - ~/.config/runnel/easylist.txt
       - https://easylist.to/easylist/easyprivacy.txt
-    cache_dir: ~/.cache/pipit/adblock
+    cache_dir: ~/.cache/runnel/adblock
     update_interval_hours: 24
     decision_cache_ttl_secs: 300
     fail_open: true
@@ -339,7 +339,7 @@ With `fail_open: true`, broken subscriptions are skipped so startup does not
 fail just because a list server is unavailable.
 
 ```bash
-PIPIT_PASSWORD='replace-me' ./target/release/pipit client \
+RUNNEL_PASSWORD='replace-me' ./target/release/runnel client \
   --mode native-http \
   --listen 127.0.0.1:1080 \
   --server example.com:1443 \
@@ -389,21 +389,21 @@ needs firewall or blackhole-route hooks and is not enforced yet.
 Most CLI flags can move into YAML and be loaded with `--config`.
 
 ```bash
-./target/release/pipit \
-  --config pipit.wg.yaml \
+./target/release/runnel \
+  --config runnel.wg.yaml \
   client
 ```
 
-If `--config` is omitted, `pipit` loads the first existing default config:
+If `--config` is omitted, `runnel` loads the first existing default config:
 
-1. `~/.pipit/config.yaml`
-2. `$XDG_CONFIG_HOME/pipit/config.yaml`
-3. `~/.config/pipit/config.yaml`
-4. `~/Library/Application Support/pipit/config.yaml` on macOS
+1. `~/.runnel/config.yaml`
+2. `$XDG_CONFIG_HOME/runnel/config.yaml`
+3. `~/.config/runnel/config.yaml`
+4. `~/Library/Application Support/runnel/config.yaml` on macOS
 5. the original sudo user's matching home config paths, when running through `sudo`
-6. `/etc/pipit/config.yaml` on Unix
+6. `/etc/runnel/config.yaml` on Unix
 
-You can also set `PIPIT_CONFIG=/path/to/config.yaml`. Working-directory config
+You can also set `RUNNEL_CONFIG=/path/to/config.yaml`. Working-directory config
 files are not loaded implicitly because configs can contain hook commands.
 
 Config precedence:
@@ -436,38 +436,38 @@ Starter files:
 Run supported service commands in the background:
 
 ```bash
-sudo ./target/release/pipit --daemon \
-  --log-file ./pipit-wg-server.log \
-  --telemetry-sock ./pipit-wg-server.sock \
-  --config pipit.wg.yaml \
+sudo ./target/release/runnel --daemon \
+  --log-file ./runnel-wg-server.log \
+  --telemetry-sock ./runnel-wg-server.sock \
+  --config runnel.wg.yaml \
   server
 
-sudo ./target/release/pipit --daemon \
-  --log-file ./pipit-wg-client.log \
-  --telemetry-sock ./pipit-wg-client.sock \
-  --config pipit.wg.yaml \
+sudo ./target/release/runnel --daemon \
+  --log-file ./runnel-wg-client.log \
+  --telemetry-sock ./runnel-wg-client.sock \
+  --config runnel.wg.yaml \
   client
 ```
 
 Check status:
 
 ```bash
-./target/release/pipit status
-./target/release/pipit status client
-./target/release/pipit status server
-./target/release/pipit status --json
+./target/release/runnel status
+./target/release/runnel status client
+./target/release/runnel status server
+./target/release/runnel status --json
 ```
 
 Stop a daemon:
 
 ```bash
-./target/release/pipit stop client
+./target/release/runnel stop client
 ```
 
 Attach a dashboard:
 
 ```bash
-./target/release/pipit tui --attach ./pipit-wg-client.sock
+./target/release/runnel tui --attach ./runnel-wg-client.sock
 ```
 
 Daemon mode is supported for `client`, `server`, and `tun`. If `--tui` is also
@@ -479,7 +479,7 @@ For the SOCKS client, macOS can temporarily point the system SOCKS proxy at the
 local listener and restore it on normal shutdown:
 
 ```bash
-PIPIT_PASSWORD='replace-me' ./target/release/pipit client \
+RUNNEL_PASSWORD='replace-me' ./target/release/runnel client \
   --mode native-http \
   --listen 127.0.0.1:1080 \
   --server example.com:1443 \

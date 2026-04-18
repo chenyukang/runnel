@@ -15,7 +15,7 @@ ROUTE_SET=(
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CONFIG_PATH="${REPO_ROOT}/pipit.tun.yaml"
+CONFIG_PATH="${REPO_ROOT}/runnel.tun.yaml"
 ASSUME_YES=0
 TAIL_LINES=40
 RESET_DRY_RUN=0
@@ -23,16 +23,16 @@ RESET_DRY_RUN=0
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/pipit-tun.sh doctor [--config PATH] [--server HOST[:PORT]] [--tail N]
-  scripts/pipit-tun.sh reset  [--config PATH] [--server HOST[:PORT]] [--yes] [--dry-run]
+  scripts/runnel-tun.sh doctor [--config PATH] [--server HOST[:PORT]] [--tail N]
+  scripts/runnel-tun.sh reset  [--config PATH] [--server HOST[:PORT]] [--yes] [--dry-run]
 
 Commands:
-  doctor  Print a macOS-oriented diagnosis of the current pipit tun state.
-  reset   Stop stale pipit/tun helper processes, remove pipit split routes, and
+  doctor  Print a macOS-oriented diagnosis of the current runnel tun state.
+  reset   Stop stale runnel/tun helper processes, remove runnel split routes, and
           bring down leftover utun interfaces that still hold 198.18.0.1.
 
 Options:
-  --config PATH   Read tun defaults from this YAML config. Default: ./pipit.tun.yaml
+  --config PATH   Read tun defaults from this YAML config. Default: ./runnel.tun.yaml
   --server SPEC   Upstream server host[:port]. Used when removing the pinned host route.
   --tail N        Tail N lines from proxy.log in doctor mode. Default: 40
   --yes, -y       Do not prompt before reset.
@@ -42,15 +42,15 @@ EOF
 }
 
 log() {
-  printf '[pipit-tun] %s\n' "$*"
+  printf '[runnel-tun] %s\n' "$*"
 }
 
 warn() {
-  printf '[pipit-tun] WARN: %s\n' "$*" >&2
+  printf '[runnel-tun] WARN: %s\n' "$*" >&2
 }
 
 die() {
-  printf '[pipit-tun] ERROR: %s\n' "$*" >&2
+  printf '[runnel-tun] ERROR: %s\n' "$*" >&2
   exit 1
 }
 
@@ -92,7 +92,7 @@ infer_server_spec_from_config() {
 
 infer_server_spec_from_processes() {
   ps -axo command= | awk '
-    /pipit/ && / tun( |$)/ {
+    /runnel/ && / tun( |$)/ {
       for (i = 1; i <= NF; ++i) {
         if ($i == "--server" && (i + 1) <= NF) {
           print $(i + 1)
@@ -127,7 +127,7 @@ route_summary() {
   route -n get "${target}" 2>/dev/null || true
 }
 
-list_utun_with_pipit_addr() {
+list_utun_with_runnel_addr() {
   local iface
   while IFS= read -r iface; do
     if ifconfig "${iface}" 2>/dev/null | grep -q 'inet 198\.18\.0\.1 '; then
@@ -151,8 +151,8 @@ print_split_routes() {
 
 print_active_processes() {
   ps -axo pid,ppid,user,etime,command | awk '
-    /pipit|tun2proxy|AmneziaVPN|wireguard-go/ &&
-    $0 !~ /scripts\/pipit-tun\.sh/ &&
+    /runnel|tun2proxy|AmneziaVPN|wireguard-go/ &&
+    $0 !~ /scripts\/runnel-tun\.sh/ &&
     $0 !~ /awk/ {
       print
     }
@@ -181,9 +181,9 @@ run_shell_or_echo() {
   fi
 }
 
-collect_pipit_tun_pids() {
+collect_runnel_tun_pids() {
   ps -axo pid=,command= | awk '
-    /pipit/ && / tun( |$)/ && $0 !~ /scripts\/pipit-tun\.sh/ {
+    /runnel/ && / tun( |$)/ && $0 !~ /scripts\/runnel-tun\.sh/ {
       print $1
     }
   ' | sort -u
@@ -259,8 +259,8 @@ doctor() {
 
   print_section "Quick Read"
   cat <<EOF
-- If default route still points to en0 but 1/8..128.0/1 point to utun233/234/235, pipit tun is actively diverting most traffic through TUN.
-- If those split routes remain after pipit/tun helper dies, the Mac may look "offline" even though Wi-Fi itself is fine.
+- If default route still points to en0 but 1/8..128.0/1 point to utun233/234/235, runnel tun is actively diverting most traffic through TUN.
+- If those split routes remain after runnel/tun helper dies, the Mac may look "offline" even though Wi-Fi itself is fine.
 - The pinned host route for ${server_host:-the upstream server} should stay on the original interface so the proxy server itself does not loop back into the tunnel.
 EOF
 }
@@ -279,15 +279,15 @@ reset() {
   while IFS= read -r iface; do
     [[ -n "${iface}" ]] || continue
     ifaces+=("${iface}")
-  done < <(list_utun_with_pipit_addr)
+  done < <(list_utun_with_runnel_addr)
 
-  local pipit_pids=()
+  local runnel_pids=()
   local tun_helper_pids=()
   local pid
   while IFS= read -r pid; do
     [[ -n "${pid}" ]] || continue
-    pipit_pids+=("${pid}")
-  done < <(collect_pipit_tun_pids)
+    runnel_pids+=("${pid}")
+  done < <(collect_runnel_tun_pids)
   while IFS= read -r pid; do
     [[ -n "${pid}" ]] || continue
     tun_helper_pids+=("${pid}")
@@ -297,7 +297,7 @@ reset() {
   printf 'server: %s\n' "${server_spec:-<unknown>}"
   printf 'server_host: %s\n' "${server_host:-<unknown>}"
   printf 'utun interfaces with 198.18.0.1: %s\n' "${ifaces[*]:-<none>}"
-  printf 'pipit tun pids: %s\n' "${pipit_pids[*]:-<none>}"
+  printf 'runnel tun pids: %s\n' "${runnel_pids[*]:-<none>}"
   printf 'tun helper pids: %s\n' "${tun_helper_pids[*]:-<none>}"
   printf 'reset dry-run: %s\n' "$( [[ "${RESET_DRY_RUN}" -eq 1 ]] && echo yes || echo no )"
 
@@ -307,7 +307,7 @@ reset() {
     [[ "${answer}" == "y" || "${answer}" == "Y" ]] || die "aborted"
   fi
 
-  term_then_kill "pipit tun" "${pipit_pids[@]}"
+  term_then_kill "runnel tun" "${runnel_pids[@]}"
   term_then_kill "tun helper" "${tun_helper_pids[@]}"
 
   local cidr
@@ -333,7 +333,7 @@ reset() {
   echo '---'
   print_split_routes
   echo '---'
-  list_utun_with_pipit_addr || true
+  list_utun_with_runnel_addr || true
 }
 
 main() {

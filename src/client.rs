@@ -41,7 +41,7 @@ pub struct ClientArgs {
     pub ca_cert: Option<PathBuf>,
     #[arg(long, value_enum, default_value_t = ProxyMode::NativeHttp)]
     pub mode: ProxyMode,
-    #[arg(long, env = "PIPIT_PASSWORD")]
+    #[arg(long, env = "RUNNEL_PASSWORD")]
     #[arg(default_value = "")]
     pub password: String,
     #[arg(long, default_value = "/connect")]
@@ -190,7 +190,7 @@ impl ClientArgs {
         }
         if self.password.trim().is_empty() {
             bail!(
-                "client password is required; pass --password, set PIPIT_PASSWORD, or set it in --config"
+                "client password is required; pass --password, set RUNNEL_PASSWORD, or set it in --config"
             );
         }
         Ok(())

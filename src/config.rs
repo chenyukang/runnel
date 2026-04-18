@@ -979,8 +979,8 @@ mod tests {
     fn yaml_parse_smoke() {
         let raw = r#"
 log: debug
-telemetry_sock: run/pipit.sock
-pid_file: run/pipit.pid
+telemetry_sock: run/runnel.sock
+pid_file: run/runnel.pid
 tui: true
 daemon: true
 domain_rules:
@@ -1023,7 +1023,7 @@ client:
     dns: 1.1.1.1
     dns_capture: true
     up:
-      - ip route replace 203.0.113.0/24 dev pipitwg0
+      - ip route replace 203.0.113.0/24 dev runnelwg0
     print_hooks: true
     dry_run: true
     skip_handshake_probe: true
@@ -1041,7 +1041,7 @@ server:
     peer_tunnel_ip: 10.8.0.2
     nat_out_interface: en0
     down:
-      - ip link set dev pipitwg0 down || true
+      - ip link set dev runnelwg0 down || true
     dry_run: true
     handshake_watchdog_secs: 0
 "#;
@@ -1049,9 +1049,12 @@ server:
         assert_eq!(parsed.log.as_deref(), Some("debug"));
         assert_eq!(
             parsed.telemetry_sock.as_deref(),
-            Some(Path::new("run/pipit.sock"))
+            Some(Path::new("run/runnel.sock"))
         );
-        assert_eq!(parsed.pid_file.as_deref(), Some(Path::new("run/pipit.pid")));
+        assert_eq!(
+            parsed.pid_file.as_deref(),
+            Some(Path::new("run/runnel.pid"))
+        );
         assert_eq!(parsed.tui, Some(true));
         assert_eq!(parsed.daemon, Some(true));
         assert_eq!(
@@ -1225,7 +1228,7 @@ server:
         let nested_raw = r#"
 client:
   mode: wg
-  telemetry-sock: /tmp/pipit.sock
+  telemetry-sock: /tmp/runnel.sock
   wg:
     endpoint: 198.51.100.10:51820
 "#;
@@ -1240,7 +1243,7 @@ client:
         assert!(message.contains("client:"), "{message}");
 
         let top_level_raw = r#"
-telemetry-sock: /tmp/pipit.sock
+telemetry-sock: /tmp/runnel.sock
 "#;
 
         let err = serde_yaml::from_str::<FileConfig>(top_level_raw)
@@ -1255,9 +1258,9 @@ telemetry-sock: /tmp/pipit.sock
 
     #[test]
     fn relative_path_uses_config_directory() {
-        let base = Path::new("/tmp/pipit");
+        let base = Path::new("/tmp/runnel");
         let resolved = resolve_path(base, Path::new("rules/rule.ls"));
-        assert_eq!(resolved, PathBuf::from("/tmp/pipit/rules/rule.ls"));
+        assert_eq!(resolved, PathBuf::from("/tmp/runnel/rules/rule.ls"));
     }
 
     #[test]
@@ -1464,7 +1467,7 @@ telemetry-sock: /tmp/pipit.sock
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "pipit-deprecated-wg-config-{}-{suffix}.yaml",
+            "runnel-deprecated-wg-config-{}-{suffix}.yaml",
             std::process::id()
         ));
         fs::write(

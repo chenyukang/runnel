@@ -573,7 +573,7 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
     let overview_lines = vec![
         Line::from(vec![
             Span::styled(
-                format!("{} pipit dashboard", SPINNER[app.spinner_index]),
+                format!("{} runnel dashboard", SPINNER[app.spinner_index]),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -1232,7 +1232,7 @@ mod tests {
             listen: None,
             upstream: None,
             path: None,
-            log_file: PathBuf::from("pipit.log"),
+            log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
         });
 
@@ -1258,7 +1258,7 @@ mod tests {
             listen: None,
             upstream: None,
             path: None,
-            log_file: PathBuf::from("pipit.log"),
+            log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
         });
 
@@ -1289,7 +1289,7 @@ mod tests {
             listen: None,
             upstream: None,
             path: None,
-            log_file: PathBuf::from("pipit.log"),
+            log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
         });
 
@@ -1316,7 +1316,7 @@ mod tests {
             listen: None,
             upstream: None,
             path: None,
-            log_file: PathBuf::from("pipit.log"),
+            log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
         });
 
@@ -1349,7 +1349,7 @@ mod tests {
             listen: None,
             upstream: None,
             path: None,
-            log_file: PathBuf::from("pipit.log"),
+            log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
         });
 
@@ -1384,7 +1384,7 @@ mod tests {
             listen: None,
             upstream: None,
             path: None,
-            log_file: PathBuf::from("pipit.log"),
+            log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
         });
 
@@ -1427,7 +1427,7 @@ mod tests {
             listen: None,
             upstream: None,
             path: None,
-            log_file: PathBuf::from("pipit.log"),
+            log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
         });
 
@@ -1453,7 +1453,7 @@ mod tests {
             listen: None,
             upstream: None,
             path: None,
-            log_file: PathBuf::from("pipit.log"),
+            log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
         };
 
@@ -1470,7 +1470,7 @@ mod tests {
             listen: None,
             upstream: None,
             path: None,
-            log_file: PathBuf::from("pipit.log"),
+            log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
         };
         let item = RecentTarget {
@@ -1496,7 +1496,7 @@ mod tests {
             listen: None,
             upstream: None,
             path: None,
-            log_file: PathBuf::from("pipit.log"),
+            log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
         };
         let item = RecentTarget {
@@ -1523,7 +1523,7 @@ mod tests {
             listen: None,
             upstream: None,
             path: None,
-            log_file: PathBuf::from("pipit.log"),
+            log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
         };
         let blocked = RecentTarget {
@@ -1557,7 +1557,7 @@ mod tests {
             listen: None,
             upstream: None,
             path: None,
-            log_file: PathBuf::from("pipit.log"),
+            log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
         });
 
@@ -1592,7 +1592,7 @@ mod tests {
             listen: None,
             upstream: None,
             path: None,
-            log_file: PathBuf::from("pipit.log"),
+            log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
         };
         let item = RecentTarget {

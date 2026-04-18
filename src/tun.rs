@@ -237,7 +237,7 @@ impl TunStateGuard {
                     match load_tun_state(&guard.path)? {
                         Some(existing) if process_alive(existing.pid) => {
                             bail!(
-                                "another pipit tun is already running (pid {}); stop it before starting a new tun session",
+                                "another runnel tun is already running (pid {}); stop it before starting a new tun session",
                                 existing.pid
                             );
                         }
@@ -430,7 +430,7 @@ fn normalize_client_args_for_tun(args: &mut ClientArgs) -> Result<()> {
     let effective_mode = args.effective_mode()?;
     if !matches!(effective_mode, ProxyMode::NativeHttp) {
         bail!(
-            "tun mode currently requires client mode=native-http because DNS and other UDP traffic rely on SOCKS UDP ASSOCIATE; resolved mode was {effective_mode}. Use a tun-specific config such as ./pipit.tun.yaml or set client.mode: native-http"
+            "tun mode currently requires client mode=native-http because DNS and other UDP traffic rely on SOCKS UDP ASSOCIATE; resolved mode was {effective_mode}. Use a tun-specific config such as ./runnel.tun.yaml or set client.mode: native-http"
         );
     }
 
@@ -507,7 +507,7 @@ impl CommandContext {
             server_ip,
             egress_interface,
             egress_gateway,
-            log_file: std::env::var("PIPIT_LOG_FILE").ok(),
+            log_file: std::env::var("RUNNEL_LOG_FILE").ok(),
             dns_upstream,
         })
     }
@@ -566,28 +566,28 @@ impl CommandContext {
     }
 
     fn apply_envs(&self, command: &mut Command) {
-        command.env("PIPIT_TUN_DEVICE", &self.device);
-        command.env("PIPIT_SOCKS_LISTEN", &self.socks_listen);
-        command.env("PIPIT_SERVER", &self.server);
-        command.env("PIPIT_SERVER_HOST", &self.server_host);
-        command.env("PIPIT_SERVER_PORT", self.server_port.to_string());
-        command.env("PIPIT_SERVER_IP", &self.server_ip);
+        command.env("RUNNEL_TUN_DEVICE", &self.device);
+        command.env("RUNNEL_SOCKS_LISTEN", &self.socks_listen);
+        command.env("RUNNEL_SERVER", &self.server);
+        command.env("RUNNEL_SERVER_HOST", &self.server_host);
+        command.env("RUNNEL_SERVER_PORT", self.server_port.to_string());
+        command.env("RUNNEL_SERVER_IP", &self.server_ip);
         if let Some(dns) = &self.dns_upstream {
-            command.env("PIPIT_DNS_UPSTREAM", dns.display());
-            command.env("PIPIT_DNS_UPSTREAM_IP", dns.upstream_ip.to_string());
-            command.env("PIPIT_DNS_UPSTREAM_PORT", dns.upstream_port.to_string());
+            command.env("RUNNEL_DNS_UPSTREAM", dns.display());
+            command.env("RUNNEL_DNS_UPSTREAM_IP", dns.upstream_ip.to_string());
+            command.env("RUNNEL_DNS_UPSTREAM_PORT", dns.upstream_port.to_string());
         }
         if let Some(dns_redirect_ip) = self.dns_redirect_ip() {
-            command.env("PIPIT_TUN_DNS_REDIRECT_IP", dns_redirect_ip);
+            command.env("RUNNEL_TUN_DNS_REDIRECT_IP", dns_redirect_ip);
         }
         if let Some(interface) = &self.egress_interface {
-            command.env("PIPIT_EGRESS_INTERFACE", interface);
+            command.env("RUNNEL_EGRESS_INTERFACE", interface);
         }
         if let Some(gateway) = &self.egress_gateway {
-            command.env("PIPIT_EGRESS_GATEWAY", gateway);
+            command.env("RUNNEL_EGRESS_GATEWAY", gateway);
         }
         if let Some(log_file) = &self.log_file {
-            command.env("PIPIT_LOG_FILE", log_file);
+            command.env("RUNNEL_LOG_FILE", log_file);
         }
     }
 }
@@ -732,7 +732,7 @@ fn default_server_bypass_route(context: &CommandContext) -> String {
 }
 
 fn detect_helper_override() -> Option<TunHelperBinary> {
-    if let Some(path) = std::env::var_os("PIPIT_TUN_HELPER") {
+    if let Some(path) = std::env::var_os("RUNNEL_TUN_HELPER") {
         let candidate = PathBuf::from(path);
         if candidate.is_file() {
             return Some(TunHelperBinary { path: candidate });
@@ -1374,28 +1374,28 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 
 fn shell_envs(context: &CommandContext) -> BTreeMap<&'static str, String> {
     let mut envs = BTreeMap::new();
-    envs.insert("PIPIT_TUN_DEVICE", context.device.clone());
-    envs.insert("PIPIT_SOCKS_LISTEN", context.socks_listen.clone());
-    envs.insert("PIPIT_SERVER", context.server.clone());
-    envs.insert("PIPIT_SERVER_HOST", context.server_host.clone());
-    envs.insert("PIPIT_SERVER_PORT", context.server_port.to_string());
-    envs.insert("PIPIT_SERVER_IP", context.server_ip.clone());
+    envs.insert("RUNNEL_TUN_DEVICE", context.device.clone());
+    envs.insert("RUNNEL_SOCKS_LISTEN", context.socks_listen.clone());
+    envs.insert("RUNNEL_SERVER", context.server.clone());
+    envs.insert("RUNNEL_SERVER_HOST", context.server_host.clone());
+    envs.insert("RUNNEL_SERVER_PORT", context.server_port.to_string());
+    envs.insert("RUNNEL_SERVER_IP", context.server_ip.clone());
     if let Some(dns) = &context.dns_upstream {
-        envs.insert("PIPIT_DNS_UPSTREAM", dns.display());
-        envs.insert("PIPIT_DNS_UPSTREAM_IP", dns.upstream_ip.to_string());
-        envs.insert("PIPIT_DNS_UPSTREAM_PORT", dns.upstream_port.to_string());
+        envs.insert("RUNNEL_DNS_UPSTREAM", dns.display());
+        envs.insert("RUNNEL_DNS_UPSTREAM_IP", dns.upstream_ip.to_string());
+        envs.insert("RUNNEL_DNS_UPSTREAM_PORT", dns.upstream_port.to_string());
     }
     if let Some(dns_redirect_ip) = context.dns_redirect_ip() {
-        envs.insert("PIPIT_TUN_DNS_REDIRECT_IP", dns_redirect_ip.to_owned());
+        envs.insert("RUNNEL_TUN_DNS_REDIRECT_IP", dns_redirect_ip.to_owned());
     }
     if let Some(interface) = &context.egress_interface {
-        envs.insert("PIPIT_EGRESS_INTERFACE", interface.clone());
+        envs.insert("RUNNEL_EGRESS_INTERFACE", interface.clone());
     }
     if let Some(gateway) = &context.egress_gateway {
-        envs.insert("PIPIT_EGRESS_GATEWAY", gateway.clone());
+        envs.insert("RUNNEL_EGRESS_GATEWAY", gateway.clone());
     }
     if let Some(log_file) = &context.log_file {
-        envs.insert("PIPIT_LOG_FILE", log_file.clone());
+        envs.insert("RUNNEL_LOG_FILE", log_file.clone());
     }
     envs
 }
@@ -1408,7 +1408,7 @@ fn plan_lines(
     down_hooks: &[String],
 ) -> Vec<String> {
     let mut lines = Vec::new();
-    lines.push("pipit tun plan".to_owned());
+    lines.push("runnel tun plan".to_owned());
     if is_auto_device(&args.device) {
         lines.push(format!("  device: {} (auto)", context.device));
     } else {
@@ -1560,27 +1560,27 @@ mod tests {
         };
         let envs = shell_envs(&context);
         assert_eq!(
-            envs.get("PIPIT_TUN_DEVICE").map(String::as_str),
+            envs.get("RUNNEL_TUN_DEVICE").map(String::as_str),
             Some("utun9")
         );
         assert_eq!(
-            envs.get("PIPIT_SOCKS_LISTEN").map(String::as_str),
+            envs.get("RUNNEL_SOCKS_LISTEN").map(String::as_str),
             Some("127.0.0.1:19080")
         );
         assert_eq!(
-            envs.get("PIPIT_SERVER_IP").map(String::as_str),
+            envs.get("RUNNEL_SERVER_IP").map(String::as_str),
             Some("93.184.216.34")
         );
         assert_eq!(
-            envs.get("PIPIT_EGRESS_INTERFACE").map(String::as_str),
+            envs.get("RUNNEL_EGRESS_INTERFACE").map(String::as_str),
             Some("en0")
         );
         assert_eq!(
-            envs.get("PIPIT_DNS_UPSTREAM_IP").map(String::as_str),
+            envs.get("RUNNEL_DNS_UPSTREAM_IP").map(String::as_str),
             Some("1.1.1.1")
         );
         assert_eq!(
-            envs.get("PIPIT_TUN_DNS_REDIRECT_IP").map(String::as_str),
+            envs.get("RUNNEL_TUN_DNS_REDIRECT_IP").map(String::as_str),
             Some("198.18.0.1")
         );
     }
@@ -1773,7 +1773,7 @@ mod tests {
                 domain_rules: Default::default(),
                 ip_rules: Default::default(),
                 adblock: Default::default(),
-                user_agent: "pipit-test".to_owned(),
+                user_agent: "runnel-test".to_owned(),
                 handshake_timeout_secs: 10,
                 connect_timeout_secs: 10,
                 max_header_size: 8192,

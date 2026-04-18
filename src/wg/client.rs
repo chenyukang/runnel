@@ -37,7 +37,7 @@ pub struct WgClientArgs {
     #[arg(long)]
     #[arg(default_value = "")]
     pub endpoint: String,
-    #[arg(long, env = "PIPIT_WG_PRIVATE_KEY")]
+    #[arg(long, env = "RUNNEL_WG_PRIVATE_KEY")]
     #[arg(default_value = "")]
     pub private_key: String,
     #[arg(long)]
@@ -279,7 +279,7 @@ fn plan_lines(
     plan: &super::hooks::HookPlan,
 ) -> Vec<String> {
     let mut lines = Vec::new();
-    lines.push("pipit wg-client plan".to_owned());
+    lines.push("runnel wg-client plan".to_owned());
     if super::is_auto_device(&args.device) {
         lines.push(format!("  device: {device} (auto)"));
     } else {
@@ -356,7 +356,7 @@ impl WgClientArgs {
         }
         if self.private_key.trim().is_empty() {
             bail!(
-                "wg client private_key is required; pass --private-key, set PIPIT_WG_PRIVATE_KEY, or set it in --config"
+                "wg client private_key is required; pass --private-key, set RUNNEL_WG_PRIVATE_KEY, or set it in --config"
             );
         }
         if self.peer_public_key.trim().is_empty() {
@@ -592,7 +592,7 @@ mod tests {
             endpoint: "198.51.100.10:51820".to_owned(),
             private_key: STANDARD.encode([1u8; 32]),
             peer_public_key: STANDARD.encode([2u8; 32]),
-            device: "pipitwg0".to_owned(),
+            device: "runnelwg0".to_owned(),
             tunnel_ip: IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2)),
             peer_tunnel_ip: IpAddr::V4(Ipv4Addr::new(10, 8, 0, 1)),
             mtu: 1420,
@@ -613,11 +613,11 @@ mod tests {
         let runtime = args.resolve().unwrap();
         let lines = plan_lines(
             &args,
-            "pipitwg0",
+            "runnelwg0",
             &runtime,
             &HookPlan {
-                up: vec!["ip route replace 203.0.113.0/24 dev pipitwg0".to_owned()],
-                down: vec!["ip route del 203.0.113.0/24 dev pipitwg0".to_owned()],
+                up: vec!["ip route replace 203.0.113.0/24 dev runnelwg0".to_owned()],
+                down: vec!["ip route del 203.0.113.0/24 dev runnelwg0".to_owned()],
             },
         );
 
@@ -626,7 +626,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line == "    - ip route replace 203.0.113.0/24 dev pipitwg0")
+                .any(|line| line == "    - ip route replace 203.0.113.0/24 dev runnelwg0")
         );
     }
 

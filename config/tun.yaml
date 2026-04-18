@@ -1,9 +1,9 @@
 # Sample TUN config.
-# Use PIPIT_PASSWORD for the embedded client shared secret.
+# Use RUNNEL_PASSWORD for the embedded client shared secret.
 
 log: info
-log_file: ./logs/pipit-tun.log
-telemetry_sock: ./run/pipit-tun.sock
+log_file: ./logs/runnel-tun.log
+telemetry_sock: ./run/runnel-tun.sock
 tui: true
 
 client:
