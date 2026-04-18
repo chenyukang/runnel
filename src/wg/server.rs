@@ -6,7 +6,8 @@ use super::{
     normalize_allowed_ips, parse_key, parse_socket_addr,
     preflight::{WgPreflightRole, check as check_preflight},
     select_device_name,
-    stats::{start_handshake_watchdog, start_stats_poller, start_unhandshaken_peer_refresher},
+    stats::{start_stats_poller, start_unhandshaken_peer_refresher},
+    tcpdump::{self, TcpdumpFilter},
     uapi::{apply_device_config, control_socket_path},
     wait_for_shutdown_signal,
 };
@@ -15,7 +16,6 @@ use clap::Args;
 use std::{net::IpAddr, time::Duration};
 use tracing::info;
 
-const DEFAULT_HANDSHAKE_WATCHDOG_SECS: u64 = 30;
 const UNHANDSHAKEN_PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug, Args)]
@@ -48,8 +48,10 @@ pub struct WgServerArgs {
     pub print_hooks: bool,
     #[arg(long)]
     pub dry_run: bool,
-    #[arg(long, default_value_t = DEFAULT_HANDSHAKE_WATCHDOG_SECS)]
-    pub handshake_watchdog_secs: u64,
+    #[arg(long)]
+    pub tcpdump: bool,
+    #[arg(long)]
+    pub tcpdump_interface: Option<String>,
 }
 
 impl Default for WgServerArgs {
@@ -68,7 +70,8 @@ impl Default for WgServerArgs {
             down: Vec::new(),
             print_hooks: false,
             dry_run: false,
-            handshake_watchdog_secs: DEFAULT_HANDSHAKE_WATCHDOG_SECS,
+            tcpdump: false,
+            tcpdump_interface: None,
         }
     }
 }
@@ -103,16 +106,20 @@ pub async fn run(args: WgServerArgs) -> Result<()> {
     let socket_path = control_socket_path(&actual_device);
     apply_device_config(&socket_path, &runtime)?;
     start_stats_poller("wg-server", socket_path.clone());
+    let _tcpdump = args.tcpdump.then(|| {
+        tcpdump::start(
+            "wg-server",
+            args.tcpdump_interface.as_deref(),
+            TcpdumpFilter::Server {
+                listen: runtime.bind,
+            },
+        )
+    });
     start_unhandshaken_peer_refresher(
         "wg-server",
         socket_path.clone(),
         runtime.clone(),
         UNHANDSHAKEN_PEER_REFRESH_INTERVAL,
-    );
-    start_handshake_watchdog(
-        "wg-server",
-        socket_path.clone(),
-        Duration::from_secs(args.handshake_watchdog_secs),
     );
     let plan = effective_hook_plan(
         plan_server_hooks(&actual_device, &runtime, args.nat_out_interface.as_deref())?,
@@ -163,8 +170,12 @@ fn plan_lines(
         args.nat_out_interface.as_deref().unwrap_or("-")
     ));
     lines.push(format!(
-        "  handshake_watchdog_secs: {}",
-        args.handshake_watchdog_secs
+        "  tcpdump: {}",
+        if args.tcpdump {
+            args.tcpdump_interface.as_deref().unwrap_or("auto")
+        } else {
+            "disabled"
+        }
     ));
     lines.push("  up hooks:".to_owned());
     if plan.up.is_empty() {
@@ -245,7 +256,8 @@ mod tests {
             down: Vec::new(),
             print_hooks: false,
             dry_run: true,
-            handshake_watchdog_secs: super::DEFAULT_HANDSHAKE_WATCHDOG_SECS,
+            tcpdump: false,
+            tcpdump_interface: None,
         };
 
         let runtime = args.resolve().unwrap();
@@ -271,7 +283,8 @@ mod tests {
             down: Vec::new(),
             print_hooks: false,
             dry_run: true,
-            handshake_watchdog_secs: super::DEFAULT_HANDSHAKE_WATCHDOG_SECS,
+            tcpdump: false,
+            tcpdump_interface: None,
         };
 
         let runtime = args.resolve().unwrap();

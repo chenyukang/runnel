@@ -6,6 +6,7 @@ pub mod keys;
 mod preflight;
 pub mod server;
 mod stats;
+mod tcpdump;
 mod uapi;
 
 use anyhow::{Context, Result, bail};

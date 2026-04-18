@@ -34,6 +34,8 @@ client:
     persistent_keepalive_secs: 25
     dns: 2606:4700:4700::1111
     dns_capture: true
+    # tcpdump: true
+    # tcpdump_interface: any
 
 server:
   mode: wg
@@ -46,3 +48,5 @@ server:
     mtu: 1420
     peer_allowed_ips:
       - fd00:8::2/128
+    # tcpdump: true
+    # tcpdump_interface: eth0

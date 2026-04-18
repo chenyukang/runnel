@@ -48,46 +48,6 @@ pub(crate) fn start_stats_poller(role: &'static str, socket_path: PathBuf) {
     });
 }
 
-pub(crate) fn start_handshake_watchdog(role: &'static str, socket_path: PathBuf, delay: Duration) {
-    if delay.is_zero() {
-        return;
-    }
-
-    let _ = tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        let path = socket_path.clone();
-        let sample = tokio::task::spawn_blocking(move || read_last_handshake_age(&path)).await;
-
-        match sample {
-            Ok(Ok(Some(_))) => {}
-            Ok(Ok(None)) => {
-                warn!(
-                    role,
-                    uapi_socket = %socket_path.display(),
-                    delay_secs = delay.as_secs(),
-                    "wg server has not observed a successful handshake yet; if the client is already trying to connect, check endpoint reachability and WG keys"
-                );
-            }
-            Ok(Err(error)) => {
-                debug!(
-                    role,
-                    uapi_socket = %socket_path.display(),
-                    error = %error,
-                    "failed to poll wg handshake watchdog"
-                );
-            }
-            Err(error) => {
-                debug!(
-                    role,
-                    uapi_socket = %socket_path.display(),
-                    error = %error,
-                    "wg handshake watchdog task failed"
-                );
-            }
-        }
-    });
-}
-
 pub(crate) fn start_unhandshaken_peer_refresher(
     role: &'static str,
     socket_path: PathBuf,

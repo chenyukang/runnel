@@ -9,6 +9,7 @@ use super::{
     preflight::{WgPreflightRole, check as check_preflight},
     select_device_name,
     stats::start_stats_poller,
+    tcpdump::{self, TcpdumpFilter},
     uapi::{apply_device_config, control_socket_path},
     wait_for_shutdown_signal,
 };
@@ -75,6 +76,10 @@ pub struct WgClientArgs {
     pub dry_run: bool,
     #[arg(long)]
     pub skip_handshake_probe: bool,
+    #[arg(long)]
+    pub tcpdump: bool,
+    #[arg(long)]
+    pub tcpdump_interface: Option<String>,
 }
 
 impl Default for WgClientArgs {
@@ -100,6 +105,8 @@ impl Default for WgClientArgs {
             print_hooks: false,
             dry_run: false,
             skip_handshake_probe: false,
+            tcpdump: false,
+            tcpdump_interface: None,
         }
     }
 }
@@ -142,6 +149,15 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
     let socket_path = control_socket_path(&actual_device);
     apply_device_config(&socket_path, &runtime)?;
     start_stats_poller("wg-client", socket_path.clone());
+    let _tcpdump = args.tcpdump.then(|| {
+        tcpdump::start(
+            "wg-client",
+            args.tcpdump_interface.as_deref(),
+            TcpdumpFilter::Client {
+                endpoint: runtime.endpoint.expect("validated wg client endpoint"),
+            },
+        )
+    });
     let adblock = Adblocker::from_config(&args.adblock).await?;
     let plan = effective_hook_plan(
         plan_client_hooks(&actual_device, &runtime)?,
@@ -330,6 +346,14 @@ fn plan_lines(
             "enabled"
         }
     ));
+    lines.push(format!(
+        "  tcpdump: {}",
+        if args.tcpdump {
+            args.tcpdump_interface.as_deref().unwrap_or("auto")
+        } else {
+            "disabled"
+        }
+    ));
     lines.push("  up hooks:".to_owned());
     if plan.up.is_empty() {
         lines.push("    - (none)".to_owned());
@@ -486,6 +510,8 @@ mod tests {
             print_hooks: false,
             dry_run: true,
             skip_handshake_probe: false,
+            tcpdump: false,
+            tcpdump_interface: None,
         };
 
         let runtime = args.resolve().unwrap();
@@ -521,6 +547,8 @@ mod tests {
             print_hooks: false,
             dry_run: true,
             skip_handshake_probe: false,
+            tcpdump: false,
+            tcpdump_interface: None,
         };
 
         let runtime = args.resolve().unwrap();
@@ -550,6 +578,8 @@ mod tests {
             print_hooks: false,
             dry_run: true,
             skip_handshake_probe: false,
+            tcpdump: false,
+            tcpdump_interface: None,
         };
 
         let runtime = args.resolve().unwrap();
@@ -579,6 +609,8 @@ mod tests {
             print_hooks: false,
             dry_run: true,
             skip_handshake_probe: false,
+            tcpdump: false,
+            tcpdump_interface: None,
         };
 
         let err = args.resolve().unwrap_err().to_string();
@@ -608,6 +640,8 @@ mod tests {
             print_hooks: true,
             dry_run: true,
             skip_handshake_probe: false,
+            tcpdump: false,
+            tcpdump_interface: None,
         };
 
         let runtime = args.resolve().unwrap();

@@ -487,7 +487,8 @@ async fn run_child_role(role: &str) -> Result<()> {
                     down: Vec::new(),
                     print_hooks: false,
                     dry_run: false,
-                    handshake_watchdog_secs: 30,
+                    tcpdump: false,
+                    tcpdump_interface: None,
                 },
             };
             server::run(args).await
@@ -542,6 +543,8 @@ async fn run_child_role(role: &str) -> Result<()> {
                     print_hooks: false,
                     dry_run: false,
                     skip_handshake_probe: false,
+                    tcpdump: false,
+                    tcpdump_interface: None,
                 },
             };
             client::run(args).await

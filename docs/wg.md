@@ -104,10 +104,31 @@ Set `client.wg.skip_handshake_probe: true` only when you intentionally need to
 start before the server is reachable.
 
 The server cannot actively probe a client because it normally starts first and
-does not know the client's UDP endpoint. Instead, it watches the WireGuard
-handshake state after startup and logs a warning if no successful handshake is
-observed within 30 seconds. Set `server.wg.handshake_watchdog_secs: 0` to
-disable that warning for intentionally idle servers.
+does not know the client's UDP endpoint. Use the client startup probe, status
+data, and packet captures when diagnosing WG reachability.
+
+## Tcpdump Events
+
+WG mode can start a sidecar `tcpdump` process and emit packet metadata into the
+same monitor/TUI event stream. This is disabled by default because it depends on
+the external `tcpdump` command and can be noisy on busy tunnels.
+
+```yaml
+client:
+  wg:
+    tcpdump: true
+    tcpdump_interface: any
+
+server:
+  wg:
+    tcpdump: true
+    tcpdump_interface: eth0
+```
+
+Client capture filters to the configured server endpoint. Server capture filters
+to the WG listen port. Events include source, destination, direction, UDP
+length, and a best-effort packet label such as `handshake-init`,
+`handshake-response`, `cookie-reply`, `keepalive`, or `data`.
 
 ## Split Tunnel Rules
 

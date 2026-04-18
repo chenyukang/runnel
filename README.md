@@ -138,12 +138,23 @@ ip route get SERVER-IP
 ```
 
 The WG endpoint must not route through another VPN or a stale tunnel interface.
-If the route is correct, use `tcpdump` on both sides. Replace `IFACE` with the
-real network interface, such as `en0` on macOS or `eth0` on Linux:
+For built-in packet evidence in the TUI/status monitor, enable tcpdump events
+on one or both sides:
 
-```bash
-sudo tcpdump -ni IFACE udp port 1443
+```yaml
+client:
+  wg:
+    tcpdump: true
+    tcpdump_interface: any
+
+server:
+  wg:
+    tcpdump: true
+    tcpdump_interface: eth0
 ```
+
+The monitor records packet direction, UDP length, and likely WG packet type,
+such as `handshake-init` and `handshake-response`.
 
 ## Other Modes
 

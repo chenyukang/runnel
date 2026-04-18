@@ -50,6 +50,8 @@ client:
     persistent_keepalive_secs: 25
     dns: 1.1.1.1
     dns_capture: true
+    # tcpdump: true
+    # tcpdump_interface: any
 
 server:
   mode: wg
@@ -63,3 +65,5 @@ server:
     peer_allowed_ips:
       - 10.8.0.2/32
     nat_out_interface: eth0
+    # tcpdump: true
+    # tcpdump_interface: eth0

@@ -126,6 +126,8 @@ pub struct WgClientConfig {
     pub print_hooks: Option<bool>,
     pub dry_run: Option<bool>,
     pub skip_handshake_probe: Option<bool>,
+    pub tcpdump: Option<bool>,
+    pub tcpdump_interface: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -144,7 +146,8 @@ pub struct WgServerConfig {
     pub down: Option<Vec<String>>,
     pub print_hooks: Option<bool>,
     pub dry_run: Option<bool>,
-    pub handshake_watchdog_secs: Option<u64>,
+    pub tcpdump: Option<bool>,
+    pub tcpdump_interface: Option<String>,
 }
 
 pub fn load(path: &Path) -> Result<(FileConfig, PathBuf)> {
@@ -598,6 +601,16 @@ fn apply_wg_client_config(
         &wg_client.skip_handshake_probe,
         should_apply("skip_handshake_probe"),
     );
+    maybe_assign(
+        &mut args.tcpdump,
+        &wg_client.tcpdump,
+        should_apply("tcpdump"),
+    );
+    maybe_assign_optional(
+        &mut args.tcpdump_interface,
+        &wg_client.tcpdump_interface,
+        should_apply("tcpdump_interface"),
+    );
 }
 
 fn apply_wg_server_config(
@@ -651,9 +664,14 @@ fn apply_wg_server_config(
         should_apply("dry_run"),
     );
     maybe_assign(
-        &mut args.handshake_watchdog_secs,
-        &wg_server.handshake_watchdog_secs,
-        should_apply("handshake_watchdog_secs"),
+        &mut args.tcpdump,
+        &wg_server.tcpdump,
+        should_apply("tcpdump"),
+    );
+    maybe_assign_optional(
+        &mut args.tcpdump_interface,
+        &wg_server.tcpdump_interface,
+        should_apply("tcpdump_interface"),
     );
 }
 
@@ -1027,6 +1045,8 @@ client:
     print_hooks: true
     dry_run: true
     skip_handshake_probe: true
+    tcpdump: true
+    tcpdump_interface: any
 tun:
   device: auto
   helper_cmd: tun2proxy-bin --tun {device} --proxy socks5://{socks}
@@ -1043,7 +1063,8 @@ server:
     down:
       - ip link set dev runnelwg0 down || true
     dry_run: true
-    handshake_watchdog_secs: 0
+    tcpdump: true
+    tcpdump_interface: en0
 "#;
         let parsed: FileConfig = serde_yaml::from_str(raw).unwrap();
         assert_eq!(parsed.log.as_deref(), Some("debug"));
@@ -1190,10 +1211,42 @@ server:
         );
         assert_eq!(
             parsed
+                .client
+                .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
+                .and_then(|cfg| cfg.tcpdump),
+            Some(true)
+        );
+        assert_eq!(
+            parsed
+                .client
+                .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
+                .and_then(|cfg| cfg.tcpdump_interface.as_deref()),
+            Some("any")
+        );
+        assert_eq!(
+            parsed
                 .server
                 .as_ref()
                 .and_then(|cfg| cfg.wg.as_ref())
                 .and_then(|cfg| cfg.nat_out_interface.as_deref()),
+            Some("en0")
+        );
+        assert_eq!(
+            parsed
+                .server
+                .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
+                .and_then(|cfg| cfg.tcpdump),
+            Some(true)
+        );
+        assert_eq!(
+            parsed
+                .server
+                .as_ref()
+                .and_then(|cfg| cfg.wg.as_ref())
+                .and_then(|cfg| cfg.tcpdump_interface.as_deref()),
             Some("en0")
         );
         assert_eq!(
@@ -1212,14 +1265,6 @@ server:
                 .and_then(|cfg| cfg.wg.as_ref())
                 .and_then(|cfg| cfg.dry_run),
             Some(true)
-        );
-        assert_eq!(
-            parsed
-                .server
-                .as_ref()
-                .and_then(|cfg| cfg.wg.as_ref())
-                .and_then(|cfg| cfg.handshake_watchdog_secs),
-            Some(0)
         );
     }
 
