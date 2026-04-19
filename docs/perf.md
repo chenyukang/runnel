@@ -13,6 +13,13 @@ Run it with:
 cargo bench --bench mode_perf
 ```
 
+To run the full suite, including the WG device/noise/obfs profiles that require
+host privileges:
+
+```bash
+sudo make perf
+```
+
 Default workload:
 
 - Warmup: 100 requests
@@ -28,7 +35,7 @@ Measured on 2026-04-17.
 Command:
 
 ```bash
-sudo RUNNEL_PERF_WG=1 cargo bench --bench mode_perf
+sudo make perf
 ```
 
 | Mode | Small req/s | Avg ms | P50 ms | P95 ms | Large throughput MiB/s | Large response | Notes |
@@ -42,41 +49,45 @@ sudo RUNNEL_PERF_WG=1 cargo bench --bench mode_perf
 
 ## WG Mode
 
-WG mode is opt-in. The benchmark driver spawns separate child processes for the
-HTTP target, WG server, and WG client, assigns tunnel IPs, and measures HTTP
-requests to the server tunnel IP from the parent process. Run it from a terminal
-with host privileges:
+WG mode is opt-in when running the bench binary directly. The benchmark driver
+spawns separate child processes for the HTTP target, WG server, and WG client,
+assigns tunnel IPs, and measures HTTP requests to the server tunnel IP from the
+parent process. The Makefile target includes every WG profile by default:
 
 ```bash
-sudo RUNNEL_PERF_WG=1 cargo bench --bench mode_perf
+sudo make perf
 ```
 
 To run only WG:
 
 ```bash
-sudo RUNNEL_PERF_MODES=wg cargo bench --bench mode_perf
+sudo make perf RUNNEL_PERF_MODES=wg
+```
+
+To compare only the noise engine without and with obfuscation:
+
+```bash
+sudo make perf RUNNEL_PERF_MODES=wg RUNNEL_PERF_WG_PROFILES=noise,mask
 ```
 
 Optional WG-specific settings:
 
 ```bash
-sudo \
+sudo make perf \
   RUNNEL_PERF_MODES=wg \
   RUNNEL_PERF_WG_CLIENT_IP=10.88.0.2 \
   RUNNEL_PERF_WG_SERVER_IP=10.88.0.1 \
   RUNNEL_PERF_WG_MTU=1420 \
-  RUNNEL_PERF_WG_READY_TIMEOUT=15 \
-  cargo bench --bench mode_perf
+  RUNNEL_PERF_WG_READY_TIMEOUT=15
 ```
 
 Device names can also be overridden:
 
 ```bash
-sudo \
+sudo make perf \
   RUNNEL_PERF_MODES=wg \
   RUNNEL_PERF_WG_SERVER_DEVICE=runnelwgs0 \
-  RUNNEL_PERF_WG_CLIENT_DEVICE=runnelwgc0 \
-  cargo bench --bench mode_perf
+  RUNNEL_PERF_WG_CLIENT_DEVICE=runnelwgc0
 ```
 
 On macOS the default device setting is `auto`. On Linux the default managed
@@ -97,6 +108,7 @@ Available variables:
 
 - `RUNNEL_PERF_MODES`: comma-separated mode list, for example `native-http,daze-czar`
 - `RUNNEL_PERF_WG`: include WG in the default mode list when set to `1`
+- `RUNNEL_PERF_WG_PROFILES`: comma-separated WG profile list, for example `noise,mask`; `all` includes `device`, `noise`, `mask`, and `stealth`
 - `RUNNEL_PERF_WARMUP`: warmup request count
 - `RUNNEL_PERF_REQUESTS`: small request count
 - `RUNNEL_PERF_LARGE_DOWNLOADS`: large download count
