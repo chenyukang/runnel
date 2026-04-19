@@ -107,11 +107,21 @@ client:
   wg:
     engine: noise
     obfs: mask
+    obfs_padding_min: 16
+    obfs_padding_max: 256
+    obfs_handshake_padding: 512
+    obfs_response_padding: 384
+    obfs_junk_packets: 2
 
 server:
   wg:
     engine: noise
     obfs: mask
+    obfs_padding_min: 16
+    obfs_padding_max: 256
+    obfs_handshake_padding: 512
+    obfs_response_padding: 384
+    obfs_junk_packets: 2
 ```
 
 ## Daily Commands

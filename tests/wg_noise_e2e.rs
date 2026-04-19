@@ -1,5 +1,22 @@
 mod support;
 
+fn obfs_profile_args() -> [&'static str; 12] {
+    [
+        "--obfs-padding-min",
+        "8",
+        "--obfs-padding-max",
+        "64",
+        "--obfs-handshake-padding",
+        "96",
+        "--obfs-response-padding",
+        "80",
+        "--obfs-junk-packets",
+        "1",
+        "--obfs-jitter-ms",
+        "0",
+    ]
+}
+
 mod linux {
     use anyhow::{Context, Result, bail, ensure};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -13,7 +30,7 @@ mod linux {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
-    use super::support::TempDir;
+    use super::{obfs_profile_args, support::TempDir};
 
     const SERVER_UNDERLAY: &str = "192.0.2.1";
     const CLIENT_UNDERLAY: &str = "192.0.2.2";
@@ -117,6 +134,7 @@ mod linux {
                 .arg("noise")
                 .arg("--obfs")
                 .arg("mask")
+                .args(obfs_profile_args())
                 .arg("--listen")
                 .arg(format!("0.0.0.0:{WG_PORT}"))
                 .arg("--private-key")
@@ -153,6 +171,7 @@ mod linux {
                 .arg("noise")
                 .arg("--obfs")
                 .arg("mask")
+                .args(obfs_profile_args())
                 .arg("--bind")
                 .arg("0.0.0.0:0")
                 .arg("--endpoint")
@@ -403,7 +422,7 @@ mod macos {
         time::{Duration, Instant},
     };
 
-    use super::support::TempDir;
+    use super::{obfs_profile_args, support::TempDir};
 
     const WG_SERVER_IP: &str = "10.89.0.1";
     const WG_CLIENT_IP: &str = "10.89.0.2";
@@ -460,6 +479,7 @@ mod macos {
                 .arg("noise")
                 .arg("--obfs")
                 .arg("mask")
+                .args(obfs_profile_args())
                 .arg("--listen")
                 .arg(format!("0.0.0.0:{port}"))
                 .arg("--private-key")
@@ -502,6 +522,7 @@ mod macos {
                 .arg("noise")
                 .arg("--obfs")
                 .arg("mask")
+                .args(obfs_profile_args())
                 .arg("--bind")
                 .arg("0.0.0.0:0")
                 .arg("--endpoint")

@@ -1,5 +1,5 @@
 use super::{
-    WgObfsMode, WgRuntimeConfig,
+    WG_OBFS_MAX_PADDING, WgObfsMode, WgObfsProfile, WgRuntimeConfig,
     client::WgClientArgs,
     dns::{DomainRuleEngine, start_dns_capture},
     hooks::{
@@ -30,7 +30,7 @@ use std::{
 use tokio::{
     io::unix::AsyncFd,
     net::UdpSocket,
-    time::{MissedTickBehavior, interval},
+    time::{MissedTickBehavior, interval, sleep},
 };
 use tracing::{debug, info, warn};
 
@@ -47,11 +47,10 @@ const TRAFFIC_SAMPLE_TICK: Duration = Duration::from_secs(1);
 const MAX_QUEUE_FLUSH: usize = 256;
 const MASK_NONCE_LEN: usize = 12;
 const MASK_LEN_LEN: usize = 4;
-const MASK_PAD_LEN: usize = 1;
+const MASK_PAD_LEN: usize = 2;
 const MASK_TAG_LEN: usize = 8;
 const MASK_HEADER_LEN: usize = MASK_NONCE_LEN + MASK_LEN_LEN + MASK_PAD_LEN;
-const MASK_MAX_PADDING: usize = 128;
-const MASK_FRAME_OVERHEAD: usize = MASK_HEADER_LEN + MASK_TAG_LEN + MASK_MAX_PADDING;
+const MASK_FRAME_OVERHEAD: usize = MASK_HEADER_LEN + MASK_TAG_LEN + WG_OBFS_MAX_PADDING as usize;
 type HmacSha256 = Hmac<Sha256>;
 
 pub(crate) async fn run_client(args: WgClientArgs, runtime: WgRuntimeConfig) -> Result<()> {
@@ -128,6 +127,7 @@ pub(crate) async fn run_client(args: WgClientArgs, runtime: WgRuntimeConfig) -> 
         Some(endpoint),
         false,
         args.obfs,
+        args.obfs_profile(),
     )
     .await
 }
@@ -165,7 +165,17 @@ pub(crate) async fn run_server(args: WgServerArgs, runtime: WgRuntimeConfig) -> 
         "wg server started"
     );
 
-    run_noise_loop("wg-server", tun, socket, runtime, None, true, args.obfs).await
+    run_noise_loop(
+        "wg-server",
+        tun,
+        socket,
+        runtime,
+        None,
+        true,
+        args.obfs,
+        args.obfs_profile(),
+    )
+    .await
 }
 
 fn open_tun_device(requested_device: &str) -> Result<(AsyncFd<TunSocket>, String)> {
@@ -191,9 +201,10 @@ async fn run_noise_loop(
     initial_endpoint: Option<SocketAddr>,
     learn_endpoint: bool,
     obfs: WgObfsMode,
+    obfs_profile: WgObfsProfile,
 ) -> Result<()> {
     let mut tunnel = runtime.new_tunnel(1);
-    let codec = NoisePacketCodec::new(obfs, &runtime);
+    let codec = NoisePacketCodec::new(obfs, obfs_profile, &runtime);
     let mut peer = NoisePeerState::new(initial_endpoint, learn_endpoint);
     let mut tun_packet = vec![0u8; MAX_IP_PACKET_SIZE];
     let mut udp_packet = vec![0u8; MAX_NOISE_UDP_PACKET_SIZE];
@@ -318,12 +329,16 @@ async fn apply_noise_action(
                 );
                 return Ok(());
             };
-            let encoded_len = codec.encode(&packet, encoded_packet)?;
-            socket
-                .send_to(&encoded_packet[..encoded_len], endpoint)
-                .await
-                .with_context(|| format!("failed to send wg noise packet to {endpoint}"))?;
-            traffic.uploaded += encoded_len as u64;
+            send_network_packet(
+                role,
+                socket,
+                codec,
+                encoded_packet,
+                endpoint,
+                &packet,
+                traffic,
+            )
+            .await?;
             Ok(())
         }
         NoiseAction::WriteTunnelV4(packet) => {
@@ -334,6 +349,54 @@ async fn apply_noise_action(
             write_tun_packet(role, tun, &packet, true, traffic);
             Ok(())
         }
+    }
+}
+
+async fn send_network_packet(
+    role: &'static str,
+    socket: &UdpSocket,
+    codec: &NoisePacketCodec,
+    encoded_packet: &mut [u8],
+    endpoint: SocketAddr,
+    packet: &[u8],
+    traffic: &mut TrafficCounters,
+) -> Result<()> {
+    if codec.has_junk_packets() {
+        for _ in 0..codec.profile.junk_packets {
+            let encoded_len = codec.encode_junk(encoded_packet)?;
+            if encoded_len > 0 {
+                maybe_obfs_jitter(codec).await;
+                socket
+                    .send_to(&encoded_packet[..encoded_len], endpoint)
+                    .await
+                    .with_context(|| {
+                        format!("failed to send wg noise junk packet to {endpoint}")
+                    })?;
+                traffic.uploaded += encoded_len as u64;
+            }
+        }
+    }
+
+    let encoded_len = codec.encode(packet, encoded_packet)?;
+    maybe_obfs_jitter(codec).await;
+    socket
+        .send_to(&encoded_packet[..encoded_len], endpoint)
+        .await
+        .with_context(|| format!("failed to send wg noise packet to {endpoint}"))?;
+    traffic.uploaded += encoded_len as u64;
+    debug!(
+        role,
+        bytes = encoded_len,
+        raw_bytes = packet.len(),
+        "wg noise packet sent"
+    );
+    Ok(())
+}
+
+async fn maybe_obfs_jitter(codec: &NoisePacketCodec) {
+    let jitter = codec.jitter();
+    if !jitter.is_zero() {
+        sleep(jitter).await;
     }
 }
 
@@ -388,13 +451,18 @@ fn domain_rules_need_dns_capture(domain_rules: &RouteRuleConfig) -> bool {
 
 pub(crate) struct NoisePacketCodec {
     mode: WgObfsMode,
+    profile: WgObfsProfile,
     mask_key: Option<[u8; 32]>,
 }
 
 impl NoisePacketCodec {
-    pub(crate) fn new(mode: WgObfsMode, runtime: &WgRuntimeConfig) -> Self {
+    pub(crate) fn new(mode: WgObfsMode, profile: WgObfsProfile, runtime: &WgRuntimeConfig) -> Self {
         let mask_key = (mode == WgObfsMode::Mask).then(|| derive_mask_key(runtime));
-        Self { mode, mask_key }
+        Self {
+            mode,
+            profile,
+            mask_key,
+        }
     }
 
     pub(crate) fn encode(&self, packet: &[u8], out: &mut [u8]) -> Result<usize> {
@@ -423,19 +491,35 @@ impl NoisePacketCodec {
         }
     }
 
+    fn has_junk_packets(&self) -> bool {
+        self.mode == WgObfsMode::Mask && self.profile.junk_packets > 0
+    }
+
+    fn jitter(&self) -> Duration {
+        if self.profile.jitter_ms == 0 {
+            return Duration::ZERO;
+        }
+        let jitter =
+            (rand::rngs::OsRng.next_u32() % (u32::from(self.profile.jitter_ms) + 1)) as u64;
+        Duration::from_millis(jitter)
+    }
+
+    fn encode_junk(&self, out: &mut [u8]) -> Result<usize> {
+        match self.mode {
+            WgObfsMode::Off => Ok(0),
+            WgObfsMode::Mask => {
+                self.encode_masked_body(&[], self.random_padding_len(None, out), out)
+            }
+        }
+    }
+
     fn encode_masked(&self, packet: &[u8], out: &mut [u8]) -> Result<usize> {
+        self.encode_masked_body(packet, self.random_padding_len(Some(packet), out), out)
+    }
+
+    fn encode_masked_body(&self, packet: &[u8], pad_len: usize, out: &mut [u8]) -> Result<usize> {
         let key = self.mask_key.expect("mask codec key is present");
-        let available_padding = out
-            .len()
-            .checked_sub(MASK_HEADER_LEN + MASK_TAG_LEN + packet.len())
-            .unwrap_or_default();
-        let max_padding = MASK_MAX_PADDING.min(available_padding);
         let mut rng = rand::rngs::OsRng;
-        let pad_len = if max_padding == 0 {
-            0
-        } else {
-            (rng.next_u32() as usize) % (max_padding + 1)
-        };
         let frame_len = MASK_HEADER_LEN + packet.len() + pad_len + MASK_TAG_LEN;
         if out.len() < frame_len {
             bail!("noise mask packet encode buffer is too small");
@@ -451,7 +535,9 @@ impl NoisePacketCodec {
         let masked_len = (packet.len() as u32) ^ u32::from_be_bytes(header_mask[..4].try_into()?);
         out[MASK_NONCE_LEN..MASK_NONCE_LEN + MASK_LEN_LEN]
             .copy_from_slice(&masked_len.to_be_bytes());
-        out[MASK_NONCE_LEN + MASK_LEN_LEN] = (pad_len as u8) ^ header_mask[4];
+        let masked_pad_len = (pad_len as u16) ^ u16::from_be_bytes(header_mask[4..6].try_into()?);
+        out[MASK_NONCE_LEN + MASK_LEN_LEN..MASK_HEADER_LEN]
+            .copy_from_slice(&masked_pad_len.to_be_bytes());
 
         let body_start = MASK_HEADER_LEN;
         let body_end = body_start + packet.len() + pad_len;
@@ -476,7 +562,9 @@ impl NoisePacketCodec {
         let masked_len =
             u32::from_be_bytes(packet[MASK_NONCE_LEN..MASK_NONCE_LEN + MASK_LEN_LEN].try_into()?);
         let payload_len = (masked_len ^ u32::from_be_bytes(header_mask[..4].try_into()?)) as usize;
-        let pad_len = (packet[MASK_NONCE_LEN + MASK_LEN_LEN] ^ header_mask[4]) as usize;
+        let masked_pad_len =
+            u16::from_be_bytes(packet[MASK_NONCE_LEN + MASK_LEN_LEN..MASK_HEADER_LEN].try_into()?);
+        let pad_len = (masked_pad_len ^ u16::from_be_bytes(header_mask[4..6].try_into()?)) as usize;
         let body_len = payload_len.checked_add(pad_len).unwrap_or(usize::MAX);
         let Some(tag_start) = MASK_HEADER_LEN.checked_add(body_len) else {
             return Ok(None);
@@ -489,6 +577,9 @@ impl NoisePacketCodec {
         if packet[tag_start..] != expected_tag[..MASK_TAG_LEN] {
             return Ok(None);
         }
+        if payload_len == 0 {
+            return Ok(None);
+        }
 
         xor_mask_body_to_out(
             &key,
@@ -497,6 +588,29 @@ impl NoisePacketCodec {
             &mut out[..payload_len],
         );
         Ok(Some(payload_len))
+    }
+
+    fn random_padding_len(&self, packet: Option<&[u8]>, out: &[u8]) -> usize {
+        let available = out
+            .len()
+            .checked_sub(MASK_HEADER_LEN + MASK_TAG_LEN + packet.map_or(0, |packet| packet.len()))
+            .unwrap_or_default();
+        let configured = packet
+            .and_then(|packet| match wireguard_message_type(packet) {
+                Some(1) => self.profile.handshake_padding,
+                Some(2) => self.profile.response_padding,
+                _ => None,
+            })
+            .map(|padding| padding as usize);
+        if let Some(padding) = configured {
+            return padding.min(available);
+        }
+        let min = usize::from(self.profile.padding_min).min(available);
+        let max = usize::from(self.profile.padding_max).min(available);
+        if max <= min {
+            return min;
+        }
+        min + (rand::rngs::OsRng.next_u32() as usize % (max - min + 1))
     }
 }
 
@@ -510,6 +624,11 @@ fn derive_mask_key(runtime: &WgRuntimeConfig) -> [u8; 32] {
     let mut key = [0u8; 32];
     key.copy_from_slice(&digest);
     key
+}
+
+fn wireguard_message_type(packet: &[u8]) -> Option<u32> {
+    let prefix: [u8; 4] = packet.get(..4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(prefix))
 }
 
 fn nonce_from_frame(frame: &[u8]) -> &[u8] {
@@ -661,11 +780,12 @@ impl TrafficCounters {
 #[cfg(test)]
 mod tests {
     use super::{
-        MASK_HEADER_LEN, MAX_NOISE_UDP_PACKET_SIZE, MAX_WG_PACKET_SIZE, NoiseAction,
+        MASK_HEADER_LEN, MASK_TAG_LEN, MAX_NOISE_UDP_PACKET_SIZE, MAX_WG_PACKET_SIZE, NoiseAction,
         NoisePacketCodec, NoisePeerState, bind_addr_for_endpoint, noise_action,
     };
     use crate::wg::{
-        WgObfsMode, WgRuntimeConfig, default_client_allowed_ips, default_server_allowed_ips,
+        WgObfsMode, WgObfsProfile, WgRuntimeConfig, default_client_allowed_ips,
+        default_server_allowed_ips,
     };
     use boringtun::x25519::{PublicKey, StaticSecret};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -734,7 +854,7 @@ mod tests {
             [0x11; 32],
             public_key([0x22; 32]),
         );
-        let codec = NoisePacketCodec::new(WgObfsMode::Off, &runtime);
+        let codec = NoisePacketCodec::new(WgObfsMode::Off, WgObfsProfile::default(), &runtime);
         let packet = b"wireguard packet";
         let mut encoded = vec![0u8; MAX_NOISE_UDP_PACKET_SIZE];
         let mut decoded = vec![0u8; MAX_WG_PACKET_SIZE];
@@ -766,8 +886,10 @@ mod tests {
             server_public,
         );
         let server_runtime = server_runtime(server_private, client_public);
-        let client_codec = NoisePacketCodec::new(WgObfsMode::Mask, &client_runtime);
-        let server_codec = NoisePacketCodec::new(WgObfsMode::Mask, &server_runtime);
+        let client_codec =
+            NoisePacketCodec::new(WgObfsMode::Mask, WgObfsProfile::default(), &client_runtime);
+        let server_codec =
+            NoisePacketCodec::new(WgObfsMode::Mask, WgObfsProfile::default(), &server_runtime);
         let packet = b"\x04\x00\x00\x00masked wireguard transport packet";
         let mut encoded = vec![0u8; MAX_NOISE_UDP_PACKET_SIZE];
         let mut decoded = vec![0u8; MAX_WG_PACKET_SIZE];
@@ -791,8 +913,10 @@ mod tests {
             public_key(server_private),
         );
         let server_runtime = server_runtime(server_private, public_key(client_private));
-        let client_codec = NoisePacketCodec::new(WgObfsMode::Mask, &client_runtime);
-        let server_codec = NoisePacketCodec::new(WgObfsMode::Mask, &server_runtime);
+        let client_codec =
+            NoisePacketCodec::new(WgObfsMode::Mask, WgObfsProfile::default(), &client_runtime);
+        let server_codec =
+            NoisePacketCodec::new(WgObfsMode::Mask, WgObfsProfile::default(), &server_runtime);
         let mut encoded = vec![0u8; MAX_NOISE_UDP_PACKET_SIZE];
         let mut decoded = vec![0u8; MAX_WG_PACKET_SIZE];
 
@@ -802,6 +926,62 @@ mod tests {
         assert!(
             server_codec
                 .decode(&encoded[..encoded_len], &mut decoded)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn packet_codec_mask_uses_profile_padding_and_junk_frames() {
+        let client_private = [0x11; 32];
+        let server_private = [0x22; 32];
+        let profile = WgObfsProfile {
+            padding_min: 7,
+            padding_max: 7,
+            handshake_padding: Some(32),
+            response_padding: Some(24),
+            junk_packets: 1,
+            jitter_ms: 0,
+        };
+        let client_runtime = client_runtime(
+            SocketAddr::from(([198, 51, 100, 10], 1443)),
+            client_private,
+            public_key(server_private),
+        );
+        let server_runtime = server_runtime(server_private, public_key(client_private));
+        let client_codec = NoisePacketCodec::new(WgObfsMode::Mask, profile, &client_runtime);
+        let server_codec = NoisePacketCodec::new(WgObfsMode::Mask, profile, &server_runtime);
+        let mut encoded = vec![0u8; MAX_NOISE_UDP_PACKET_SIZE];
+        let mut decoded = vec![0u8; MAX_WG_PACKET_SIZE];
+
+        let handshake = wg_packet(1, b"hello");
+        let encoded_len = client_codec.encode(&handshake, &mut encoded).unwrap();
+        assert_eq!(
+            encoded_len,
+            MASK_HEADER_LEN + handshake.len() + 32 + MASK_TAG_LEN
+        );
+        let decoded_len = server_codec
+            .decode(&encoded[..encoded_len], &mut decoded)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&decoded[..decoded_len], handshake);
+
+        let response = wg_packet(2, b"world");
+        let encoded_len = server_codec.encode(&response, &mut encoded).unwrap();
+        assert_eq!(
+            encoded_len,
+            MASK_HEADER_LEN + response.len() + 24 + MASK_TAG_LEN
+        );
+
+        let data = wg_packet(4, b"data");
+        let encoded_len = client_codec.encode(&data, &mut encoded).unwrap();
+        assert_eq!(encoded_len, MASK_HEADER_LEN + data.len() + 7 + MASK_TAG_LEN);
+
+        let junk_len = client_codec.encode_junk(&mut encoded).unwrap();
+        assert_eq!(junk_len, MASK_HEADER_LEN + 7 + MASK_TAG_LEN);
+        assert!(
+            server_codec
+                .decode(&encoded[..junk_len], &mut decoded)
                 .unwrap()
                 .is_none()
         );
@@ -946,6 +1126,12 @@ mod tests {
         ];
         packet.extend_from_slice(&src.octets());
         packet.extend_from_slice(&dst.octets());
+        packet
+    }
+
+    fn wg_packet(message_type: u32, body: &[u8]) -> Vec<u8> {
+        let mut packet = message_type.to_le_bytes().to_vec();
+        packet.extend_from_slice(body);
         packet
     }
 
