@@ -43,7 +43,7 @@ static EMBEDDED_TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 const MACOS_AUTO_TUN_START_INDEX: u16 = 233;
 #[cfg(not(target_os = "macos"))]
 const DEFAULT_AUTO_TUN_DEVICE: &str = "tun0";
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const MACOS_TUN_ROUTE_SET: &[&str] = &[
     "1.0.0.0/8",
     "2.0.0.0/7",
@@ -721,7 +721,7 @@ fn ensure_default_macos_server_route(context: &CommandContext) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn default_server_bypass_route(context: &CommandContext) -> String {
     match &context.egress_gateway {
         Some(gateway) if !gateway.is_empty() => format!(
@@ -998,7 +998,7 @@ fn should_fallback_to_default_egress(route: &(Option<String>, Option<String>)) -
         || route.1.as_deref() == Some(MACOS_TUN_GATEWAY_V4)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn parse_macos_route_get(output: &str) -> Result<(Option<String>, Option<String>)> {
     let mut interface = None;
     let mut gateway = None;
@@ -1470,10 +1470,14 @@ fn log_plan_lines(lines: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUTO_TUN_DEVICE, CommandContext, MACOS_TUN_GATEWAY_V4, TEST_SERVER_ENDPOINT,
-        TEST_SERVER_HOST, TEST_SERVER_IP, TunArgs, TunHelperBinary, TunHelperConfig,
-        default_down_hooks, default_server_bypass_route, default_up_hooks, is_auto_device,
-        parse_macos_route_get, parse_tun_dns_upstream, plan_lines, print_plan, shell_envs,
+        AUTO_TUN_DEVICE, CommandContext, TEST_SERVER_ENDPOINT, TEST_SERVER_HOST, TEST_SERVER_IP,
+        TunArgs, TunHelperBinary, TunHelperConfig, is_auto_device, parse_tun_dns_upstream,
+        plan_lines, print_plan, shell_envs,
+    };
+    #[cfg(target_os = "macos")]
+    use super::{
+        MACOS_TUN_GATEWAY_V4, default_down_hooks, default_server_bypass_route, default_up_hooks,
+        parse_macos_route_get,
     };
     use crate::{client::ClientArgs, mode::ProxyMode, proxy::route::FilterMode};
     use std::path::PathBuf;

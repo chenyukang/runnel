@@ -873,6 +873,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn client_runtime_v6() -> WgRuntimeConfig {
         WgRuntimeConfig {
             bind: SocketAddr::from(([0, 0, 0, 0], 0)),

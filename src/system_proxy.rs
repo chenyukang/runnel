@@ -18,7 +18,7 @@ struct ServiceProxySnapshot {
     authenticated: bool,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ServiceDnsSnapshot {
     name: String,
