@@ -107,6 +107,46 @@ The server cannot actively probe a client because it normally starts first and
 does not know the client's UDP endpoint. Use the client startup probe, status
 data, and packet captures when diagnosing WG reachability.
 
+## Engine
+
+WG mode defaults to `engine: device`, which lets boringtun own the WireGuard
+device loop and UAPI socket. For transport experiments, `engine: noise` runs the
+TUN/UDP loop in Runnel with `boringtun::noise::Tunn` directly:
+
+```yaml
+client:
+  wg:
+    engine: noise
+    # optional; both sides must match
+    obfs: mask
+    obfs_padding_min: 16
+    obfs_padding_max: 256
+    obfs_handshake_padding: 512
+    obfs_response_padding: 384
+    obfs_junk_packets: 2
+    obfs_jitter_ms: 20
+
+server:
+  wg:
+    engine: noise
+    obfs: mask
+    obfs_padding_min: 16
+    obfs_padding_max: 256
+    obfs_handshake_padding: 512
+    obfs_response_padding: 384
+    obfs_junk_packets: 2
+    obfs_jitter_ms: 20
+```
+
+The noise engine keeps the same keys, hooks, DNS capture, split routing,
+tcpdump monitor, and traffic samples. `obfs: off` is the default and emits
+standard WireGuard UDP packets. `obfs: mask` is experimental: it derives a
+shared mask key from the WG key pair, hides the WG packet header and length
+inside a small authenticated wrapper, and adds random padding. The padding
+profile can also pin handshake/response padding, send authenticated junk frames
+before real packets, and add small send jitter. It is useful for packet-shape
+experiments, but it is not a censorship-resistance guarantee.
+
 ## Tcpdump Events
 
 WG mode can start a sidecar `tcpdump` process and emit packet metadata into the

@@ -1,11 +1,12 @@
 use super::{
-    DEFAULT_TUNNEL_MTU, WgRuntimeConfig, create_device_handle, default_client_allowed_ips_for,
+    DEFAULT_TUNNEL_MTU, WgEngine, WgObfsMode, WgObfsProfile, WgRuntimeConfig, create_device_handle,
+    default_client_allowed_ips_for,
     dns::{DomainRuleEngine, start_dns_capture},
     hooks::{
         DynamicRouteManager, HookGuard, effective_hook_plan, log_plan_lines, plan_client_hooks,
         print_plan, run_hooks,
     },
-    normalize_allowed_ips, parse_key, parse_socket_addr,
+    noise, normalize_allowed_ips, parse_key, parse_socket_addr,
     preflight::{WgPreflightRole, check as check_preflight},
     select_device_name,
     stats::start_stats_poller,
@@ -33,6 +34,22 @@ const HANDSHAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, Args)]
 pub struct WgClientArgs {
+    #[arg(long, value_enum, default_value_t = WgEngine::Device)]
+    pub engine: WgEngine,
+    #[arg(long, value_enum, default_value_t = WgObfsMode::Off)]
+    pub obfs: WgObfsMode,
+    #[arg(long, default_value_t = WgObfsProfile::default().padding_min)]
+    pub obfs_padding_min: u16,
+    #[arg(long, default_value_t = WgObfsProfile::default().padding_max)]
+    pub obfs_padding_max: u16,
+    #[arg(long)]
+    pub obfs_handshake_padding: Option<u16>,
+    #[arg(long)]
+    pub obfs_response_padding: Option<u16>,
+    #[arg(long, default_value_t = WgObfsProfile::default().junk_packets)]
+    pub obfs_junk_packets: u8,
+    #[arg(long, default_value_t = WgObfsProfile::default().jitter_ms)]
+    pub obfs_jitter_ms: u16,
     #[arg(long, default_value = "0.0.0.0:0")]
     pub bind: String,
     #[arg(long)]
@@ -85,6 +102,14 @@ pub struct WgClientArgs {
 impl Default for WgClientArgs {
     fn default() -> Self {
         Self {
+            engine: WgEngine::Device,
+            obfs: WgObfsMode::Off,
+            obfs_padding_min: WgObfsProfile::default().padding_min,
+            obfs_padding_max: WgObfsProfile::default().padding_max,
+            obfs_handshake_padding: None,
+            obfs_response_padding: None,
+            obfs_junk_packets: WgObfsProfile::default().junk_packets,
+            obfs_jitter_ms: WgObfsProfile::default().jitter_ms,
             bind: "0.0.0.0:0".to_owned(),
             endpoint: String::new(),
             private_key: String::new(),
@@ -113,6 +138,8 @@ impl Default for WgClientArgs {
 
 pub async fn run(args: WgClientArgs) -> Result<()> {
     let runtime = args.resolve()?;
+    let obfs_profile = args.obfs_profile();
+    validate_engine_obfs("wg client", args.engine, args.obfs, &obfs_profile)?;
     if args.dns.is_some() && !args.dns_capture {
         warn!(
             "wg DNS capture is disabled; TUI Recent Domains requires --dns-capture or client.wg.dns_capture: true"
@@ -142,7 +169,11 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
     }
 
     if !args.skip_handshake_probe {
-        probe_server_handshake(&runtime, HANDSHAKE_PROBE_TIMEOUT).await?;
+        probe_server_handshake(&runtime, args.obfs, obfs_profile, HANDSHAKE_PROBE_TIMEOUT).await?;
+    }
+
+    if args.engine == WgEngine::Noise {
+        return noise::run_client(args, runtime).await;
     }
 
     let (_device_handle, actual_device) = create_device_handle(&args.device)?;
@@ -217,6 +248,8 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
 
 async fn probe_server_handshake(
     runtime: &WgRuntimeConfig,
+    obfs: WgObfsMode,
+    obfs_profile: WgObfsProfile,
     timeout_duration: Duration,
 ) -> Result<()> {
     let endpoint = runtime.endpoint.context("wg client endpoint missing")?;
@@ -229,6 +262,7 @@ async fn probe_server_handshake(
             )
         })?;
     let mut tunnel = runtime.new_tunnel(1);
+    let codec = noise::NoisePacketCodec::new(obfs, obfs_profile, runtime);
     let mut send_buf = [0u8; super::HANDSHAKE_BUFFER_SIZE];
     let packet = match tunnel.format_handshake_initiation(&mut send_buf, false) {
         TunnResult::WriteToNetwork(packet) => packet.to_vec(),
@@ -242,13 +276,16 @@ async fn probe_server_handshake(
             bail!("WG handshake probe unexpectedly produced a tunnel packet");
         }
     };
+    let mut encoded_buf = vec![0u8; noise::MAX_NOISE_UDP_PACKET_SIZE];
+    let encoded_len = codec.encode(&packet, &mut encoded_buf)?;
 
     socket
-        .send_to(&packet, endpoint)
+        .send_to(&encoded_buf[..encoded_len], endpoint)
         .await
         .with_context(|| format!("failed to send WG handshake probe to {endpoint}"))?;
 
-    let mut recv_buf = [0u8; super::HANDSHAKE_BUFFER_SIZE];
+    let mut recv_buf = vec![0u8; noise::MAX_NOISE_UDP_PACKET_SIZE];
+    let mut decoded_buf = [0u8; super::HANDSHAKE_BUFFER_SIZE];
     let mut decap_buf = [0u8; super::HANDSHAKE_BUFFER_SIZE];
     let probe = async {
         loop {
@@ -256,11 +293,22 @@ async fn probe_server_handshake(
             if addr != endpoint {
                 continue;
             }
-            match tunnel.decapsulate(Some(endpoint.ip()), &recv_buf[..len], &mut decap_buf) {
+            let Some(decoded_len) = codec.decode(&recv_buf[..len], &mut decoded_buf)? else {
+                continue;
+            };
+            match tunnel.decapsulate(
+                Some(endpoint.ip()),
+                &decoded_buf[..decoded_len],
+                &mut decap_buf,
+            ) {
                 TunnResult::WriteToNetwork(packet) => {
-                    socket.send_to(packet, endpoint).await.with_context(|| {
-                        format!("failed to send WG handshake probe keepalive to {endpoint}")
-                    })?;
+                    let encoded_len = codec.encode(packet, &mut encoded_buf)?;
+                    socket
+                        .send_to(&encoded_buf[..encoded_len], endpoint)
+                        .await
+                        .with_context(|| {
+                            format!("failed to send WG handshake probe keepalive to {endpoint}")
+                        })?;
                     return Ok(());
                 }
                 TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
@@ -296,6 +344,11 @@ fn plan_lines(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push("runnel wg-client plan".to_owned());
+    lines.push(format!("  engine: {}", args.engine));
+    lines.push(format!("  obfs: {}", args.obfs));
+    if args.obfs != WgObfsMode::Off {
+        lines.push(format!("  obfs_padding: {}", args.obfs_profile()));
+    }
     if super::is_auto_device(&args.device) {
         lines.push(format!("  device: {device} (auto)"));
     } else {
@@ -371,6 +424,22 @@ fn plan_lines(
         }
     }
     lines
+}
+
+fn validate_engine_obfs(
+    role: &str,
+    engine: WgEngine,
+    obfs: WgObfsMode,
+    profile: &WgObfsProfile,
+) -> Result<()> {
+    if obfs != WgObfsMode::Off && engine != WgEngine::Noise {
+        bail!("{role} --obfs requires --engine noise");
+    }
+    if obfs == WgObfsMode::Off && *profile != WgObfsProfile::default() {
+        bail!("{role} --obfs-* options require --obfs mask");
+    }
+    profile.validate(role)?;
+    Ok(())
 }
 
 impl WgClientArgs {
@@ -462,6 +531,17 @@ impl WgClientArgs {
         direct.dedup();
         Ok(direct)
     }
+
+    pub(crate) fn obfs_profile(&self) -> WgObfsProfile {
+        WgObfsProfile {
+            padding_min: self.obfs_padding_min,
+            padding_max: self.obfs_padding_max,
+            handshake_padding: self.obfs_handshake_padding,
+            response_padding: self.obfs_response_padding,
+            junk_packets: self.obfs_junk_packets,
+            jitter_ms: self.obfs_jitter_ms,
+        }
+    }
 }
 
 fn domain_rules_need_dns_capture(domain_rules: &RouteRuleConfig) -> bool {
@@ -473,8 +553,8 @@ mod tests {
     use super::{WgClientArgs, plan_lines, probe_server_handshake};
     use crate::proxy::route::RouteRuleConfig;
     use crate::wg::{
-        HANDSHAKE_BUFFER_SIZE, WgRuntimeConfig, default_client_allowed_ips,
-        default_server_allowed_ips, hooks::HookPlan,
+        HANDSHAKE_BUFFER_SIZE, WgEngine, WgObfsMode, WgObfsProfile, WgRuntimeConfig,
+        default_client_allowed_ips, default_server_allowed_ips, hooks::HookPlan, noise,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use boringtun::{
@@ -490,6 +570,14 @@ mod tests {
     #[test]
     fn client_args_resolve_runtime() {
         let args = WgClientArgs {
+            engine: WgEngine::Device,
+            obfs: WgObfsMode::Off,
+            obfs_padding_min: 0,
+            obfs_padding_max: 128,
+            obfs_handshake_padding: None,
+            obfs_response_padding: None,
+            obfs_junk_packets: 0,
+            obfs_jitter_ms: 0,
             bind: "0.0.0.0:0".to_owned(),
             endpoint: "198.51.100.10:51820".to_owned(),
             private_key: STANDARD.encode([1u8; 32]),
@@ -527,6 +615,14 @@ mod tests {
     #[test]
     fn client_args_preserve_custom_proxy_ips() {
         let args = WgClientArgs {
+            engine: WgEngine::Device,
+            obfs: WgObfsMode::Off,
+            obfs_padding_min: 0,
+            obfs_padding_max: 128,
+            obfs_handshake_padding: None,
+            obfs_response_padding: None,
+            obfs_junk_packets: 0,
+            obfs_jitter_ms: 0,
             bind: "0.0.0.0:0".to_owned(),
             endpoint: "198.51.100.10:51820".to_owned(),
             private_key: STANDARD.encode([1u8; 32]),
@@ -558,6 +654,14 @@ mod tests {
     #[test]
     fn client_args_collect_direct_ips() {
         let args = WgClientArgs {
+            engine: WgEngine::Device,
+            obfs: WgObfsMode::Off,
+            obfs_padding_min: 0,
+            obfs_padding_max: 128,
+            obfs_handshake_padding: None,
+            obfs_response_padding: None,
+            obfs_junk_packets: 0,
+            obfs_jitter_ms: 0,
             bind: "0.0.0.0:0".to_owned(),
             endpoint: "198.51.100.10:51820".to_owned(),
             private_key: STANDARD.encode([1u8; 32]),
@@ -589,6 +693,14 @@ mod tests {
     #[test]
     fn client_args_reject_dns_capture_without_dns_upstream() {
         let args = WgClientArgs {
+            engine: WgEngine::Device,
+            obfs: WgObfsMode::Off,
+            obfs_padding_min: 0,
+            obfs_padding_max: 128,
+            obfs_handshake_padding: None,
+            obfs_response_padding: None,
+            obfs_junk_packets: 0,
+            obfs_jitter_ms: 0,
             bind: "0.0.0.0:0".to_owned(),
             endpoint: "198.51.100.10:51820".to_owned(),
             private_key: STANDARD.encode([1u8; 32]),
@@ -620,6 +732,14 @@ mod tests {
     #[test]
     fn client_plan_mentions_dns_and_hooks() {
         let args = WgClientArgs {
+            engine: WgEngine::Device,
+            obfs: WgObfsMode::Off,
+            obfs_padding_min: 0,
+            obfs_padding_max: 128,
+            obfs_handshake_padding: None,
+            obfs_response_padding: None,
+            obfs_junk_packets: 0,
+            obfs_jitter_ms: 0,
             bind: "0.0.0.0:0".to_owned(),
             endpoint: "198.51.100.10:51820".to_owned(),
             private_key: STANDARD.encode([1u8; 32]),
@@ -675,13 +795,19 @@ mod tests {
         let server_task = spawn_handshake_responder(
             server_socket,
             server_runtime(endpoint.port(), server_private, client_public),
+            WgObfsMode::Off,
         );
 
         let client_runtime = client_runtime(endpoint, client_private, server_public);
 
-        probe_server_handshake(&client_runtime, Duration::from_secs(1))
-            .await
-            .unwrap();
+        probe_server_handshake(
+            &client_runtime,
+            WgObfsMode::Off,
+            WgObfsProfile::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
         server_task.await.unwrap();
     }
 
@@ -697,30 +823,83 @@ mod tests {
         let server_task = spawn_handshake_responder(
             server_socket,
             server_runtime(endpoint.port(), server_private, client_public),
+            WgObfsMode::Off,
         );
 
         let client_runtime = client_runtime(endpoint, client_private, wrong_server_public);
-        let err = probe_server_handshake(&client_runtime, Duration::from_millis(100))
-            .await
-            .expect_err("mismatched WG keys should fail the startup probe")
-            .to_string();
+        let err = probe_server_handshake(
+            &client_runtime,
+            WgObfsMode::Off,
+            WgObfsProfile::default(),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("mismatched WG keys should fail the startup probe")
+        .to_string();
 
         assert!(err.contains("WG keys may not match"), "{err}");
         server_task.await.unwrap();
     }
 
-    fn spawn_handshake_responder(socket: UdpSocket, runtime: WgRuntimeConfig) -> JoinHandle<()> {
+    #[tokio::test]
+    async fn handshake_probe_succeeds_with_mask_obfs() {
+        let client_private = [0x11u8; 32];
+        let server_private = [0x22u8; 32];
+        let client_public = public_key(client_private);
+        let server_public = public_key(server_private);
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = server_socket.local_addr().unwrap();
+        let server_task = spawn_handshake_responder(
+            server_socket,
+            server_runtime(endpoint.port(), server_private, client_public),
+            WgObfsMode::Mask,
+        );
+
+        let client_runtime = client_runtime(endpoint, client_private, server_public);
+
+        probe_server_handshake(
+            &client_runtime,
+            WgObfsMode::Mask,
+            WgObfsProfile {
+                padding_min: 4,
+                padding_max: 4,
+                handshake_padding: Some(32),
+                response_padding: Some(24),
+                junk_packets: 0,
+                jitter_ms: 0,
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        server_task.await.unwrap();
+    }
+
+    fn spawn_handshake_responder(
+        socket: UdpSocket,
+        runtime: WgRuntimeConfig,
+        obfs: WgObfsMode,
+    ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut tunnel = runtime.new_tunnel(2);
-            let mut recv_buf = [0u8; HANDSHAKE_BUFFER_SIZE];
+            let codec = noise::NoisePacketCodec::new(obfs, WgObfsProfile::default(), &runtime);
+            let mut recv_buf = vec![0u8; noise::MAX_NOISE_UDP_PACKET_SIZE];
+            let mut decoded_buf = [0u8; HANDSHAKE_BUFFER_SIZE];
             let mut send_buf = [0u8; HANDSHAKE_BUFFER_SIZE];
+            let mut encoded_buf = vec![0u8; noise::MAX_NOISE_UDP_PACKET_SIZE];
             let Ok((len, addr)) = socket.recv_from(&mut recv_buf).await else {
                 return;
             };
+            let Ok(Some(decoded_len)) = codec.decode(&recv_buf[..len], &mut decoded_buf) else {
+                return;
+            };
             if let TunnResult::WriteToNetwork(packet) =
-                tunnel.decapsulate(Some(addr.ip()), &recv_buf[..len], &mut send_buf)
+                tunnel.decapsulate(Some(addr.ip()), &decoded_buf[..decoded_len], &mut send_buf)
             {
-                let _ = socket.send_to(packet, addr).await;
+                let Ok(encoded_len) = codec.encode(packet, &mut encoded_buf) else {
+                    return;
+                };
+                let _ = socket.send_to(&encoded_buf[..encoded_len], addr).await;
             }
         })
     }

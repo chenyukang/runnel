@@ -1,9 +1,10 @@
 use super::{
-    DEFAULT_TUNNEL_MTU, WgRuntimeConfig, create_device_handle, default_server_allowed_ips,
+    DEFAULT_TUNNEL_MTU, WgEngine, WgObfsMode, WgObfsProfile, WgRuntimeConfig, create_device_handle,
+    default_server_allowed_ips,
     hooks::{
         HookGuard, effective_hook_plan, log_plan_lines, plan_server_hooks, print_plan, run_hooks,
     },
-    normalize_allowed_ips, parse_key, parse_socket_addr,
+    noise, normalize_allowed_ips, parse_key, parse_socket_addr,
     preflight::{WgPreflightRole, check as check_preflight},
     select_device_name,
     stats::{start_stats_poller, start_unhandshaken_peer_refresher},
@@ -20,6 +21,22 @@ const UNHANDSHAKEN_PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug, Args)]
 pub struct WgServerArgs {
+    #[arg(long, value_enum, default_value_t = WgEngine::Device)]
+    pub engine: WgEngine,
+    #[arg(long, value_enum, default_value_t = WgObfsMode::Off)]
+    pub obfs: WgObfsMode,
+    #[arg(long, default_value_t = WgObfsProfile::default().padding_min)]
+    pub obfs_padding_min: u16,
+    #[arg(long, default_value_t = WgObfsProfile::default().padding_max)]
+    pub obfs_padding_max: u16,
+    #[arg(long)]
+    pub obfs_handshake_padding: Option<u16>,
+    #[arg(long)]
+    pub obfs_response_padding: Option<u16>,
+    #[arg(long, default_value_t = WgObfsProfile::default().junk_packets)]
+    pub obfs_junk_packets: u8,
+    #[arg(long, default_value_t = WgObfsProfile::default().jitter_ms)]
+    pub obfs_jitter_ms: u16,
     #[arg(long, default_value = "0.0.0.0:51820")]
     pub listen: String,
     #[arg(long, env = "RUNNEL_WG_PRIVATE_KEY")]
@@ -57,6 +74,14 @@ pub struct WgServerArgs {
 impl Default for WgServerArgs {
     fn default() -> Self {
         Self {
+            engine: WgEngine::Device,
+            obfs: WgObfsMode::Off,
+            obfs_padding_min: WgObfsProfile::default().padding_min,
+            obfs_padding_max: WgObfsProfile::default().padding_max,
+            obfs_handshake_padding: None,
+            obfs_response_padding: None,
+            obfs_junk_packets: WgObfsProfile::default().junk_packets,
+            obfs_jitter_ms: WgObfsProfile::default().jitter_ms,
             listen: "0.0.0.0:51820".to_owned(),
             private_key: String::new(),
             peer_public_key: String::new(),
@@ -78,6 +103,8 @@ impl Default for WgServerArgs {
 
 pub async fn run(args: WgServerArgs) -> Result<()> {
     let runtime = args.resolve()?;
+    let obfs_profile = args.obfs_profile();
+    validate_engine_obfs("wg server", args.engine, args.obfs, &obfs_profile)?;
     if !args.dry_run {
         check_preflight(
             WgPreflightRole::Server,
@@ -100,6 +127,10 @@ pub async fn run(args: WgServerArgs) -> Result<()> {
         if args.dry_run {
             return Ok(());
         }
+    }
+
+    if args.engine == WgEngine::Noise {
+        return noise::run_server(args, runtime).await;
     }
 
     let (_device_handle, actual_device) = create_device_handle(&args.device)?;
@@ -153,6 +184,11 @@ fn plan_lines(
 ) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push("runnel wg-server plan".to_owned());
+    lines.push(format!("  engine: {}", args.engine));
+    lines.push(format!("  obfs: {}", args.obfs));
+    if args.obfs != WgObfsMode::Off {
+        lines.push(format!("  obfs_padding: {}", args.obfs_profile()));
+    }
     if super::is_auto_device(&args.device) {
         lines.push(format!("  device: {device} (auto)"));
     } else {
@@ -196,6 +232,22 @@ fn plan_lines(
     lines
 }
 
+fn validate_engine_obfs(
+    role: &str,
+    engine: WgEngine,
+    obfs: WgObfsMode,
+    profile: &WgObfsProfile,
+) -> Result<()> {
+    if obfs != WgObfsMode::Off && engine != WgEngine::Noise {
+        bail!("{role} --obfs requires --engine noise");
+    }
+    if obfs == WgObfsMode::Off && *profile != WgObfsProfile::default() {
+        bail!("{role} --obfs-* options require --obfs mask");
+    }
+    profile.validate(role)?;
+    Ok(())
+}
+
 impl WgServerArgs {
     pub fn validate_required(&self) -> Result<()> {
         if self.private_key.trim().is_empty() {
@@ -232,17 +284,37 @@ impl WgServerArgs {
         runtime.validate("wg server")?;
         Ok(runtime)
     }
+
+    pub(crate) fn obfs_profile(&self) -> WgObfsProfile {
+        WgObfsProfile {
+            padding_min: self.obfs_padding_min,
+            padding_max: self.obfs_padding_max,
+            handshake_padding: self.obfs_handshake_padding,
+            response_padding: self.obfs_response_padding,
+            junk_packets: self.obfs_junk_packets,
+            jitter_ms: self.obfs_jitter_ms,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::WgServerArgs;
+    use crate::wg::{WgEngine, WgObfsMode};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn server_args_resolve_runtime() {
         let args = WgServerArgs {
+            engine: WgEngine::Device,
+            obfs: WgObfsMode::Off,
+            obfs_padding_min: 0,
+            obfs_padding_max: 128,
+            obfs_handshake_padding: None,
+            obfs_response_padding: None,
+            obfs_junk_packets: 0,
+            obfs_jitter_ms: 0,
             listen: "0.0.0.0:51820".to_owned(),
             private_key: STANDARD.encode([3u8; 32]),
             peer_public_key: STANDARD.encode([4u8; 32]),
@@ -270,6 +342,14 @@ mod tests {
     #[test]
     fn server_args_preserve_custom_peer_allowed_ips() {
         let args = WgServerArgs {
+            engine: WgEngine::Device,
+            obfs: WgObfsMode::Off,
+            obfs_padding_min: 0,
+            obfs_padding_max: 128,
+            obfs_handshake_padding: None,
+            obfs_response_padding: None,
+            obfs_junk_packets: 0,
+            obfs_jitter_ms: 0,
             listen: "0.0.0.0:51820".to_owned(),
             private_key: STANDARD.encode([3u8; 32]),
             peer_public_key: STANDARD.encode([4u8; 32]),

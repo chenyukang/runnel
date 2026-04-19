@@ -3,6 +3,7 @@ pub mod configgen;
 mod dns;
 mod hooks;
 pub mod keys;
+mod noise;
 mod preflight;
 pub mod server;
 mod stats;
@@ -16,8 +17,13 @@ use boringtun::{
     noise::Tunn,
     x25519::{PublicKey, StaticSecret},
 };
+use clap::ValueEnum;
 use ipnet::IpNet;
-use std::net::{IpAddr, SocketAddr};
+use serde::Deserialize;
+use std::{
+    fmt,
+    net::{IpAddr, SocketAddr},
+};
 
 pub(crate) const AUTO_WG_DEVICE: &str = "auto";
 pub(crate) const DEFAULT_TUNNEL_MTU: u16 = 1420;
@@ -25,6 +31,127 @@ pub(crate) const HANDSHAKE_BUFFER_SIZE: usize = 2048;
 const WG_KEY_LEN: usize = 32;
 #[cfg(target_os = "macos")]
 const MACOS_AUTO_WG_START_INDEX: u16 = 233;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum WgEngine {
+    #[default]
+    Device,
+    Noise,
+}
+
+impl fmt::Display for WgEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Device => f.write_str("device"),
+            Self::Noise => f.write_str("noise"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum WgObfsMode {
+    #[default]
+    Off,
+    Mask,
+}
+
+impl fmt::Display for WgObfsMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Off => f.write_str("off"),
+            Self::Mask => f.write_str("mask"),
+        }
+    }
+}
+
+pub(crate) const WG_OBFS_MAX_PADDING: u16 = 1200;
+pub(crate) const WG_OBFS_MAX_JUNK_PACKETS: u8 = 8;
+pub(crate) const WG_OBFS_MAX_JITTER_MS: u16 = 1000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WgObfsProfile {
+    pub padding_min: u16,
+    pub padding_max: u16,
+    pub handshake_padding: Option<u16>,
+    pub response_padding: Option<u16>,
+    pub junk_packets: u8,
+    pub jitter_ms: u16,
+}
+
+impl Default for WgObfsProfile {
+    fn default() -> Self {
+        Self {
+            padding_min: 0,
+            padding_max: 128,
+            handshake_padding: None,
+            response_padding: None,
+            junk_packets: 0,
+            jitter_ms: 0,
+        }
+    }
+}
+
+impl WgObfsProfile {
+    pub(crate) fn validate(&self, role: &str) -> Result<()> {
+        if self.padding_min > self.padding_max {
+            bail!(
+                "{role} obfs_padding_min cannot exceed obfs_padding_max ({} > {})",
+                self.padding_min,
+                self.padding_max
+            );
+        }
+        if self.padding_max > WG_OBFS_MAX_PADDING {
+            bail!(
+                "{role} obfs_padding_max cannot exceed {WG_OBFS_MAX_PADDING}, got {}",
+                self.padding_max
+            );
+        }
+        for (label, value) in [
+            ("obfs_handshake_padding", self.handshake_padding),
+            ("obfs_response_padding", self.response_padding),
+        ] {
+            if let Some(value) = value
+                && value > WG_OBFS_MAX_PADDING
+            {
+                bail!("{role} {label} cannot exceed {WG_OBFS_MAX_PADDING}, got {value}");
+            }
+        }
+        if self.junk_packets > WG_OBFS_MAX_JUNK_PACKETS {
+            bail!(
+                "{role} obfs_junk_packets cannot exceed {WG_OBFS_MAX_JUNK_PACKETS}, got {}",
+                self.junk_packets
+            );
+        }
+        if self.jitter_ms > WG_OBFS_MAX_JITTER_MS {
+            bail!(
+                "{role} obfs_jitter_ms cannot exceed {WG_OBFS_MAX_JITTER_MS}, got {}",
+                self.jitter_ms
+            );
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for WgObfsProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}..{}", self.padding_min, self.padding_max)?;
+        if let Some(value) = self.handshake_padding {
+            write!(f, ", handshake={value}")?;
+        }
+        if let Some(value) = self.response_padding {
+            write!(f, ", response={value}")?;
+        }
+        if self.junk_packets > 0 {
+            write!(f, ", junk={}", self.junk_packets)?;
+        }
+        if self.jitter_ms > 0 {
+            write!(f, ", jitter={}ms", self.jitter_ms)?;
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WgRuntimeConfig {
@@ -55,9 +182,7 @@ impl WgRuntimeConfig {
             bail!("{role} tunnel_ip and peer_tunnel_ip must use the same IP version");
         }
         if !self.bind.ip().is_unspecified() {
-            bail!(
-                "{role} currently requires an unspecified listen address because boringtun device mode binds UDP on all interfaces"
-            );
+            bail!("{role} currently requires an unspecified listen address");
         }
         if let Some(endpoint) = self.endpoint
             && !endpoint.ip().is_ipv4()
