@@ -63,6 +63,20 @@ struct WgBenchEnv {
     client_source_ip: IpAddr,
 }
 
+#[derive(Clone, Copy)]
+struct WgBenchProfile {
+    name: &'static str,
+    engine: WgEngine,
+    obfs: WgObfsMode,
+    obfs_padding_min: u16,
+    obfs_padding_max: u16,
+    obfs_handshake_padding: Option<u16>,
+    obfs_response_padding: Option<u16>,
+    obfs_junk_packets: u8,
+    obfs_jitter_ms: u16,
+    notes: &'static str,
+}
+
 struct ChildGuard {
     child: Option<Child>,
 }
@@ -77,6 +91,58 @@ struct ModeResult {
     bytes_per_large_response: usize,
     notes: &'static str,
 }
+
+const WG_DEVICE_PROFILE: WgBenchProfile = WgBenchProfile {
+    name: "wg-device",
+    engine: WgEngine::Device,
+    obfs: WgObfsMode::Off,
+    obfs_padding_min: 0,
+    obfs_padding_max: 128,
+    obfs_handshake_padding: None,
+    obfs_response_padding: None,
+    obfs_junk_packets: 0,
+    obfs_jitter_ms: 0,
+    notes: "kernel/device engine, no obfs",
+};
+
+const WG_NOISE_PROFILE: WgBenchProfile = WgBenchProfile {
+    name: "wg-noise",
+    engine: WgEngine::Noise,
+    obfs: WgObfsMode::Off,
+    obfs_padding_min: 0,
+    obfs_padding_max: 128,
+    obfs_handshake_padding: None,
+    obfs_response_padding: None,
+    obfs_junk_packets: 0,
+    obfs_jitter_ms: 0,
+    notes: "noise engine, no obfs",
+};
+
+const WG_NOISE_MASK_PROFILE: WgBenchProfile = WgBenchProfile {
+    name: "wg-noise-mask",
+    engine: WgEngine::Noise,
+    obfs: WgObfsMode::Mask,
+    obfs_padding_min: 8,
+    obfs_padding_max: 96,
+    obfs_handshake_padding: Some(256),
+    obfs_response_padding: Some(192),
+    obfs_junk_packets: 0,
+    obfs_jitter_ms: 0,
+    notes: "noise mask, daily profile",
+};
+
+const WG_NOISE_MASK_STEALTH_PROFILE: WgBenchProfile = WgBenchProfile {
+    name: "wg-noise-mask-stealth",
+    engine: WgEngine::Noise,
+    obfs: WgObfsMode::Mask,
+    obfs_padding_min: 16,
+    obfs_padding_max: 160,
+    obfs_handshake_padding: Some(512),
+    obfs_response_padding: Some(384),
+    obfs_junk_packets: 1,
+    obfs_jitter_ms: 5,
+    notes: "noise mask, extra junk+jitter",
+};
 
 impl Drop for BenchEnv {
     fn drop(&mut self) {
@@ -149,7 +215,11 @@ async fn main() -> Result<()> {
     let modes = selected_modes();
     let mut results = Vec::new();
     for mode in modes {
-        results.push(bench_mode(mode, config).await?);
+        if matches!(mode, ProxyMode::Wg) {
+            results.extend(bench_wg_profiles(config).await?);
+        } else {
+            results.push(bench_mode(mode, config).await?);
+        }
     }
 
     print_table(&results, config);
@@ -157,10 +227,6 @@ async fn main() -> Result<()> {
 }
 
 async fn bench_mode(mode: ProxyMode, config: BenchConfig) -> Result<ModeResult> {
-    if matches!(mode, ProxyMode::Wg) {
-        return bench_wg_mode(config).await;
-    }
-
     let env = start_env(mode, config.large_body_bytes).await?;
 
     for _ in 0..config.warmup_requests {
@@ -220,14 +286,27 @@ async fn bench_mode(mode: ProxyMode, config: BenchConfig) -> Result<ModeResult> 
     })
 }
 
-async fn bench_wg_mode(config: BenchConfig) -> Result<ModeResult> {
-    let env = start_wg_env(config.large_body_bytes).await?;
+async fn bench_wg_profiles(config: BenchConfig) -> Result<Vec<ModeResult>> {
+    let profiles = selected_wg_profiles()?;
+    let mut results = Vec::with_capacity(profiles.len());
+    for profile in profiles {
+        results.push(bench_wg_profile(profile, config).await?);
+    }
+    Ok(results)
+}
+
+async fn bench_wg_profile(profile: WgBenchProfile, config: BenchConfig) -> Result<ModeResult> {
+    let env = start_wg_env(config.large_body_bytes, profile).await?;
 
     for _ in 0..config.warmup_requests {
         let body = fetch_via_wg_path(env.target_addr, env.client_source_ip, "/small")
             .await
-            .context("wg warmup request failed")?;
-        anyhow::ensure!(body.ends_with(b"ok"), "unexpected warmup response for wg");
+            .with_context(|| format!("{} warmup request failed", profile.name))?;
+        anyhow::ensure!(
+            body.ends_with(b"ok"),
+            "unexpected warmup response for {}",
+            profile.name
+        );
     }
 
     let mut latencies = Vec::with_capacity(config.small_requests);
@@ -236,8 +315,12 @@ async fn bench_wg_mode(config: BenchConfig) -> Result<ModeResult> {
         let request_started = Instant::now();
         let body = fetch_via_wg_path(env.target_addr, env.client_source_ip, "/small")
             .await
-            .context("wg small request failed")?;
-        anyhow::ensure!(body.ends_with(b"ok"), "unexpected small response for wg");
+            .with_context(|| format!("{} small request failed", profile.name))?;
+        anyhow::ensure!(
+            body.ends_with(b"ok"),
+            "unexpected small response for {}",
+            profile.name
+        );
         latencies.push(request_started.elapsed());
     }
     let small_elapsed = started.elapsed();
@@ -248,10 +331,11 @@ async fn bench_wg_mode(config: BenchConfig) -> Result<ModeResult> {
     for _ in 0..config.large_downloads {
         let body = fetch_via_wg_path(env.target_addr, env.client_source_ip, "/large")
             .await
-            .context("wg large download failed")?;
+            .with_context(|| format!("{} large download failed", profile.name))?;
         anyhow::ensure!(
             body.len() >= config.large_body_bytes,
-            "large response for wg was too small: {} bytes",
+            "large response for {} was too small: {} bytes",
+            profile.name,
             body.len()
         );
         large_bytes += body.len();
@@ -260,14 +344,14 @@ async fn bench_wg_mode(config: BenchConfig) -> Result<ModeResult> {
     let throughput_mib_s = bytes_to_mib(large_bytes) / large_elapsed.as_secs_f64();
 
     Ok(ModeResult {
-        mode: ProxyMode::Wg.as_str(),
+        mode: profile.name,
         requests_per_second,
         avg_latency_ms: average_latency_ms(&latencies),
         p50_latency_ms: percentile_latency_ms(&latencies, 0.50),
         p95_latency_ms: percentile_latency_ms(&latencies, 0.95),
         throughput_mib_s,
         bytes_per_large_response: large_bytes / config.large_downloads.max(1),
-        notes: "real TUN/device",
+        notes: profile.notes,
     })
 }
 
@@ -363,7 +447,7 @@ async fn start_env(mode: ProxyMode, large_body_bytes: usize) -> Result<BenchEnv>
     })
 }
 
-async fn start_wg_env(large_body_bytes: usize) -> Result<WgBenchEnv> {
+async fn start_wg_env(large_body_bytes: usize, profile: WgBenchProfile) -> Result<WgBenchEnv> {
     let client_tunnel_ip = env_ip("RUNNEL_PERF_WG_CLIENT_IP", "10.88.0.2")?;
     let server_tunnel_ip = env_ip("RUNNEL_PERF_WG_SERVER_IP", "10.88.0.1")?;
     anyhow::ensure!(
@@ -395,33 +479,31 @@ async fn start_wg_env(large_body_bytes: usize) -> Result<WgBenchEnv> {
     wait_for_tcp_addr(SocketAddr::new(target_probe_ip, target_port)).await?;
     ensure_child_running(target_child.as_mut(), "wg target")?;
 
-    let mut server_child = ChildGuard::new(spawn_mode_perf_child(
-        "wg-server",
-        &[
-            ("RUNNEL_PERF_WG_PORT", wg_port.to_string()),
-            ("RUNNEL_PERF_WG_SERVER_PRIVATE_KEY", server_private_key),
-            ("RUNNEL_PERF_WG_CLIENT_PUBLIC_KEY", client_public_key),
-            ("RUNNEL_PERF_WG_SERVER_DEVICE", server_device),
-            ("RUNNEL_PERF_WG_SERVER_IP", server_tunnel_ip.to_string()),
-            ("RUNNEL_PERF_WG_CLIENT_IP", client_tunnel_ip.to_string()),
-            ("RUNNEL_PERF_WG_MTU", mtu.to_string()),
-        ],
-    )?);
+    let mut server_vars = vec![
+        ("RUNNEL_PERF_WG_PORT", wg_port.to_string()),
+        ("RUNNEL_PERF_WG_SERVER_PRIVATE_KEY", server_private_key),
+        ("RUNNEL_PERF_WG_CLIENT_PUBLIC_KEY", client_public_key),
+        ("RUNNEL_PERF_WG_SERVER_DEVICE", server_device),
+        ("RUNNEL_PERF_WG_SERVER_IP", server_tunnel_ip.to_string()),
+        ("RUNNEL_PERF_WG_CLIENT_IP", client_tunnel_ip.to_string()),
+        ("RUNNEL_PERF_WG_MTU", mtu.to_string()),
+    ];
+    server_vars.extend(wg_profile_env_vars(profile));
+    let mut server_child = ChildGuard::new(spawn_mode_perf_child("wg-server", &server_vars)?);
     sleep(Duration::from_millis(500)).await;
     ensure_child_running(server_child.as_mut(), "wg server")?;
 
-    let mut client_child = ChildGuard::new(spawn_mode_perf_child(
-        "wg-client",
-        &[
-            ("RUNNEL_PERF_WG_PORT", wg_port.to_string()),
-            ("RUNNEL_PERF_WG_CLIENT_PRIVATE_KEY", client_private_key),
-            ("RUNNEL_PERF_WG_SERVER_PUBLIC_KEY", server_public_key),
-            ("RUNNEL_PERF_WG_CLIENT_DEVICE", client_device),
-            ("RUNNEL_PERF_WG_CLIENT_IP", client_tunnel_ip.to_string()),
-            ("RUNNEL_PERF_WG_SERVER_IP", server_tunnel_ip.to_string()),
-            ("RUNNEL_PERF_WG_MTU", mtu.to_string()),
-        ],
-    )?);
+    let mut client_vars = vec![
+        ("RUNNEL_PERF_WG_PORT", wg_port.to_string()),
+        ("RUNNEL_PERF_WG_CLIENT_PRIVATE_KEY", client_private_key),
+        ("RUNNEL_PERF_WG_SERVER_PUBLIC_KEY", server_public_key),
+        ("RUNNEL_PERF_WG_CLIENT_DEVICE", client_device),
+        ("RUNNEL_PERF_WG_CLIENT_IP", client_tunnel_ip.to_string()),
+        ("RUNNEL_PERF_WG_SERVER_IP", server_tunnel_ip.to_string()),
+        ("RUNNEL_PERF_WG_MTU", mtu.to_string()),
+    ];
+    client_vars.extend(wg_profile_env_vars(profile));
+    let mut client_child = ChildGuard::new(spawn_mode_perf_child("wg-client", &client_vars)?);
     sleep(Duration::from_millis(500)).await;
     ensure_child_running(client_child.as_mut(), "wg client")?;
 
@@ -452,6 +534,7 @@ async fn run_child_role(role: &str) -> Result<()> {
             Ok(())
         }
         "wg-server" => {
+            let profile = env_wg_profile()?;
             let client_tunnel_ip = env_ip("RUNNEL_PERF_WG_CLIENT_IP", "10.88.0.2")?;
             let server_tunnel_ip = env_ip("RUNNEL_PERF_WG_SERVER_IP", "10.88.0.1")?;
             let wg_port = env_u16("RUNNEL_PERF_WG_PORT")?;
@@ -474,14 +557,14 @@ async fn run_child_role(role: &str) -> Result<()> {
                 fallback_timeout_secs: 1,
                 max_fallback_body_size: 1024,
                 wg: WgServerArgs {
-                    engine: WgEngine::Device,
-                    obfs: WgObfsMode::Off,
-                    obfs_padding_min: 0,
-                    obfs_padding_max: 128,
-                    obfs_handshake_padding: None,
-                    obfs_response_padding: None,
-                    obfs_junk_packets: 0,
-                    obfs_jitter_ms: 0,
+                    engine: profile.engine,
+                    obfs: profile.obfs,
+                    obfs_padding_min: profile.obfs_padding_min,
+                    obfs_padding_max: profile.obfs_padding_max,
+                    obfs_handshake_padding: profile.obfs_handshake_padding,
+                    obfs_response_padding: profile.obfs_response_padding,
+                    obfs_junk_packets: profile.obfs_junk_packets,
+                    obfs_jitter_ms: profile.obfs_jitter_ms,
                     listen: format!("0.0.0.0:{wg_port}"),
                     private_key: env_required("RUNNEL_PERF_WG_SERVER_PRIVATE_KEY")?,
                     peer_public_key: env_required("RUNNEL_PERF_WG_CLIENT_PUBLIC_KEY")?,
@@ -502,6 +585,7 @@ async fn run_child_role(role: &str) -> Result<()> {
             server::run(args).await
         }
         "wg-client" => {
+            let profile = env_wg_profile()?;
             let client_tunnel_ip = env_ip("RUNNEL_PERF_WG_CLIENT_IP", "10.88.0.2")?;
             let server_tunnel_ip = env_ip("RUNNEL_PERF_WG_SERVER_IP", "10.88.0.1")?;
             let wg_port = env_u16("RUNNEL_PERF_WG_PORT")?;
@@ -531,14 +615,14 @@ async fn run_child_role(role: &str) -> Result<()> {
                 tun_dns_redirect_ip: None,
                 tun_dns_upstream: None,
                 wg: WgClientArgs {
-                    engine: WgEngine::Device,
-                    obfs: WgObfsMode::Off,
-                    obfs_padding_min: 0,
-                    obfs_padding_max: 128,
-                    obfs_handshake_padding: None,
-                    obfs_response_padding: None,
-                    obfs_junk_packets: 0,
-                    obfs_jitter_ms: 0,
+                    engine: profile.engine,
+                    obfs: profile.obfs,
+                    obfs_padding_min: profile.obfs_padding_min,
+                    obfs_padding_max: profile.obfs_padding_max,
+                    obfs_handshake_padding: profile.obfs_handshake_padding,
+                    obfs_response_padding: profile.obfs_response_padding,
+                    obfs_junk_packets: profile.obfs_junk_packets,
+                    obfs_jitter_ms: profile.obfs_jitter_ms,
                     bind: "0.0.0.0:0".to_owned(),
                     endpoint: format!("127.0.0.1:{wg_port}"),
                     private_key: env_required("RUNNEL_PERF_WG_CLIENT_PRIVATE_KEY")?,
@@ -775,10 +859,7 @@ fn print_table(results: &[ModeResult], config: BenchConfig) {
             result.notes,
         );
     }
-    if !results
-        .iter()
-        .any(|result| result.mode == ProxyMode::Wg.as_str())
-    {
+    if !results.iter().any(|result| result.mode.starts_with("wg")) {
         println!(
             "| wg | - | - | - | - | - | - | skipped unless RUNNEL_PERF_WG=1 or RUNNEL_PERF_MODES=wg is set because real WG mode creates a TUN/device and needs host privileges |"
         );
@@ -786,7 +867,7 @@ fn print_table(results: &[ModeResult], config: BenchConfig) {
     println!();
     println!("Tune with environment variables:");
     println!(
-        "`RUNNEL_PERF_MODES`, `RUNNEL_PERF_WG`, `RUNNEL_PERF_WARMUP`, `RUNNEL_PERF_REQUESTS`, `RUNNEL_PERF_LARGE_DOWNLOADS`, `RUNNEL_PERF_LARGE_BYTES`."
+        "`RUNNEL_PERF_MODES`, `RUNNEL_PERF_WG`, `RUNNEL_PERF_WG_PROFILES`, `RUNNEL_PERF_WARMUP`, `RUNNEL_PERF_REQUESTS`, `RUNNEL_PERF_LARGE_DOWNLOADS`, `RUNNEL_PERF_LARGE_BYTES`."
     );
 }
 
@@ -822,6 +903,114 @@ fn selected_modes() -> Vec<ProxyMode> {
     all.into_iter()
         .filter(|mode| selected.iter().any(|selected| *selected == mode.as_str()))
         .collect()
+}
+
+fn selected_wg_profiles() -> Result<Vec<WgBenchProfile>> {
+    let Some(selected) = std::env::var("RUNNEL_PERF_WG_PROFILES").ok() else {
+        return Ok(vec![
+            WG_DEVICE_PROFILE,
+            WG_NOISE_PROFILE,
+            WG_NOISE_MASK_PROFILE,
+        ]);
+    };
+    let selected: Vec<_> = selected
+        .split(',')
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+        .collect();
+    if selected.is_empty() || selected.iter().any(|profile| *profile == "all") {
+        return Ok(vec![
+            WG_DEVICE_PROFILE,
+            WG_NOISE_PROFILE,
+            WG_NOISE_MASK_PROFILE,
+            WG_NOISE_MASK_STEALTH_PROFILE,
+        ]);
+    }
+
+    selected
+        .into_iter()
+        .map(|profile| match profile {
+            "device" | "wg-device" => Ok(WG_DEVICE_PROFILE),
+            "noise" | "wg-noise" => Ok(WG_NOISE_PROFILE),
+            "mask" | "noise-mask" | "wg-noise-mask" => Ok(WG_NOISE_MASK_PROFILE),
+            "stealth" | "mask-stealth" | "wg-noise-mask-stealth" => {
+                Ok(WG_NOISE_MASK_STEALTH_PROFILE)
+            }
+            other => anyhow::bail!(
+                "unknown RUNNEL_PERF_WG_PROFILES entry {other}; expected device, noise, mask, stealth, or all"
+            ),
+        })
+        .collect()
+}
+
+fn wg_profile_env_vars(profile: WgBenchProfile) -> Vec<(&'static str, String)> {
+    vec![
+        ("RUNNEL_PERF_WG_ENGINE", profile.engine.to_string()),
+        ("RUNNEL_PERF_WG_OBFS", profile.obfs.to_string()),
+        (
+            "RUNNEL_PERF_WG_OBFS_PADDING_MIN",
+            profile.obfs_padding_min.to_string(),
+        ),
+        (
+            "RUNNEL_PERF_WG_OBFS_PADDING_MAX",
+            profile.obfs_padding_max.to_string(),
+        ),
+        (
+            "RUNNEL_PERF_WG_OBFS_HANDSHAKE_PADDING",
+            optional_u16_env_value(profile.obfs_handshake_padding),
+        ),
+        (
+            "RUNNEL_PERF_WG_OBFS_RESPONSE_PADDING",
+            optional_u16_env_value(profile.obfs_response_padding),
+        ),
+        (
+            "RUNNEL_PERF_WG_OBFS_JUNK_PACKETS",
+            profile.obfs_junk_packets.to_string(),
+        ),
+        (
+            "RUNNEL_PERF_WG_OBFS_JITTER_MS",
+            profile.obfs_jitter_ms.to_string(),
+        ),
+    ]
+}
+
+fn optional_u16_env_value(value: Option<u16>) -> String {
+    value.map(|value| value.to_string()).unwrap_or_default()
+}
+
+fn env_wg_profile() -> Result<WgBenchProfile> {
+    Ok(WgBenchProfile {
+        name: "wg-child",
+        engine: env_wg_engine()?,
+        obfs: env_wg_obfs()?,
+        obfs_padding_min: env_u16_default("RUNNEL_PERF_WG_OBFS_PADDING_MIN", 0)?,
+        obfs_padding_max: env_u16_default("RUNNEL_PERF_WG_OBFS_PADDING_MAX", 128)?,
+        obfs_handshake_padding: env_optional_u16("RUNNEL_PERF_WG_OBFS_HANDSHAKE_PADDING")?,
+        obfs_response_padding: env_optional_u16("RUNNEL_PERF_WG_OBFS_RESPONSE_PADDING")?,
+        obfs_junk_packets: env_u8_default("RUNNEL_PERF_WG_OBFS_JUNK_PACKETS", 0)?,
+        obfs_jitter_ms: env_u16_default("RUNNEL_PERF_WG_OBFS_JITTER_MS", 0)?,
+        notes: "",
+    })
+}
+
+fn env_wg_engine() -> Result<WgEngine> {
+    let value = env_string("RUNNEL_PERF_WG_ENGINE", "device").to_ascii_lowercase();
+    match value.as_str() {
+        "device" => Ok(WgEngine::Device),
+        "noise" => Ok(WgEngine::Noise),
+        other => {
+            anyhow::bail!("failed to parse RUNNEL_PERF_WG_ENGINE={other}; expected device or noise")
+        }
+    }
+}
+
+fn env_wg_obfs() -> Result<WgObfsMode> {
+    let value = env_string("RUNNEL_PERF_WG_OBFS", "off").to_ascii_lowercase();
+    match value.as_str() {
+        "off" => Ok(WgObfsMode::Off),
+        "mask" => Ok(WgObfsMode::Mask),
+        other => anyhow::bail!("failed to parse RUNNEL_PERF_WG_OBFS={other}; expected off or mask"),
+    }
 }
 
 fn average_latency_ms(samples: &[Duration]) -> f64 {
@@ -870,6 +1059,43 @@ fn env_u16(name: &str) -> Result<u16> {
     let value = env_required(name)?;
     value
         .parse()
+        .with_context(|| format!("failed to parse {name}={value} as a u16"))
+}
+
+fn env_u16_default(name: &str, default: u16) -> Result<u16> {
+    let Some(value) = std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(default);
+    };
+    value
+        .parse()
+        .with_context(|| format!("failed to parse {name}={value} as a u16"))
+}
+
+fn env_u8_default(name: &str, default: u8) -> Result<u8> {
+    let Some(value) = std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(default);
+    };
+    value
+        .parse()
+        .with_context(|| format!("failed to parse {name}={value} as a u8"))
+}
+
+fn env_optional_u16(name: &str) -> Result<Option<u16>> {
+    let Some(value) = std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    value
+        .parse()
+        .map(Some)
         .with_context(|| format!("failed to parse {name}={value} as a u16"))
 }
 
