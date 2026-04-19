@@ -142,10 +142,9 @@ If `--log-file` is omitted, service commands use role-specific files:
 `/var/log/runnel/tun.log`.
 
 If `--config` is omitted, Runnel searches the normal user config locations such
-as `~/.runnel/config.yaml`, `$XDG_CONFIG_HOME/runnel/config.yaml`,
-`~/.config/runnel/config.yaml`, macOS Application Support, sudo user's config
-paths, and `/etc/runnel/config.yaml`. You can also set
-`RUNNEL_CONFIG=/path/to/config.yaml`.
+as: `~/.runnel/config.yaml`, `$XDG_CONFIG_HOME/runnel/config.yaml`, `~/.config/runnel/config.yaml`, `/etc/runnel/config.yaml`.
+
+You can also set `RUNNEL_CONFIG=/path/to/config.yaml`.
 
 ## Troubleshooting WG Startup
 
@@ -204,7 +203,8 @@ Template configs live in [`config/`](./config/), with more notes in
 ## Development
 
 ```bash
-cargo check
-cargo test
-cargo build --release
+make check
+make test
+make release
+sudo make perf
 ```
