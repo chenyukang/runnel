@@ -1,13 +1,12 @@
 use super::wire::{client_establish_ashe, fill_random, relay_rc4, salt, server_accept_ashe};
 use crate::{
-    client::ClientArgs,
     proxy::{
         auth::{AUTH_FAILURE_BODY, AUTH_FAILURE_HINT},
         http, netlog, route,
         route::RouteDecision,
         socks5, traffic,
     },
-    server::ServerArgs,
+    runtime::{ClientRuntime, ServerRuntime},
 };
 use anyhow::{Context, Result, bail};
 use md5::Context as Md5Context;
@@ -27,25 +26,25 @@ use tracing::{info, warn};
 
 const BABOON_PATH: &str = "/sync";
 
-pub(super) async fn run_client(args: ClientArgs) -> Result<()> {
-    let router = route::Router::from_args(&args).await?;
-    let listener = TcpListener::bind(&args.listen)
+pub(super) async fn run_client(runtime: ClientRuntime) -> Result<()> {
+    let router = route::Router::from_runtime(&runtime).await?;
+    let listener = TcpListener::bind(&runtime.listen)
         .await
-        .with_context(|| format!("failed to bind {}", args.listen))?;
+        .with_context(|| format!("failed to bind {}", runtime.listen))?;
 
     info!(
-        listen = %args.listen,
-        server = %args.server,
+        listen = %runtime.listen,
+        server = %runtime.server,
         mode = "daze-baboon",
         "client listening"
     );
 
     loop {
         let (socket, peer) = listener.accept().await?;
-        let args = args.clone();
+        let runtime = runtime.clone();
         let router = router.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_client_connection(socket, peer, router, args).await {
+            if let Err(err) = handle_client_connection(socket, peer, router, runtime).await {
                 if netlog::is_noisy_disconnect(&err) {
                     info!(peer = %peer, error = %err, "daze-baboon client session ended");
                 } else {
@@ -56,29 +55,29 @@ pub(super) async fn run_client(args: ClientArgs) -> Result<()> {
     }
 }
 
-pub(super) async fn run_server(args: ServerArgs) -> Result<()> {
+pub(super) async fn run_server(runtime: ServerRuntime) -> Result<()> {
     let fallback = BaboonFallback::new(
-        &args.fallback_url,
-        Duration::from_secs(args.fallback_timeout_secs),
-        args.max_fallback_body_size,
+        &runtime.fallback_url,
+        runtime.fallback_timeout,
+        runtime.max_fallback_body_size,
     )?;
-    let listener = TcpListener::bind(&args.listen)
+    let listener = TcpListener::bind(&runtime.listen)
         .await
-        .with_context(|| format!("failed to bind {}", args.listen))?;
+        .with_context(|| format!("failed to bind {}", runtime.listen))?;
 
     info!(
-        listen = %args.listen,
+        listen = %runtime.listen,
         mode = "daze-baboon",
-        fallback = %args.fallback_url,
+        fallback = %runtime.fallback_url,
         "server listening"
     );
 
     loop {
         let (socket, peer) = listener.accept().await?;
-        let args = args.clone();
+        let runtime = runtime.clone();
         let fallback = fallback.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_server_connection(socket, peer, args, fallback).await {
+            if let Err(err) = handle_server_connection(socket, peer, runtime, fallback).await {
                 if netlog::is_noisy_disconnect(&err) {
                     info!(peer = %peer, error = %err, "daze-baboon server session ended");
                 } else {
@@ -93,23 +92,23 @@ async fn handle_client_connection(
     mut inbound: TcpStream,
     peer: SocketAddr,
     router: Arc<route::Router>,
-    args: ClientArgs,
+    runtime: ClientRuntime,
 ) -> Result<()> {
     inbound.set_nodelay(true)?;
-    let target = timeout(
-        Duration::from_secs(args.handshake_timeout_secs),
-        socks5::accept(&mut inbound),
-    )
-    .await
-    .context("SOCKS handshake timed out")??;
+    let target = timeout(runtime.handshake_timeout, socks5::accept(&mut inbound))
+        .await
+        .context("SOCKS handshake timed out")??;
     let target_string = target.to_string();
 
     match router.decide(&target).await? {
         RouteDecision::Direct => {
-            let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
-            let stats =
-                route::relay_direct_socks(inbound, &target, connect_timeout, Some("daze-baboon"))
-                    .await?;
+            let stats = route::relay_direct_socks(
+                inbound,
+                &target,
+                runtime.connect_timeout,
+                Some("daze-baboon"),
+            )
+            .await?;
             info!(peer = %peer, target = %stats.display_target, route = "direct", mode = "daze-baboon", "relay completed");
             return Ok(());
         }
@@ -126,20 +125,17 @@ async fn handle_client_connection(
         bail!("destination address too long");
     }
 
-    let mut upstream = timeout(
-        Duration::from_secs(args.connect_timeout_secs),
-        TcpStream::connect(&args.server),
-    )
-    .await
-    .context("server connect timed out")??;
+    let mut upstream = timeout(runtime.connect_timeout, TcpStream::connect(&runtime.server))
+        .await
+        .context("server connect timed out")??;
     upstream.set_nodelay(true)?;
 
-    let request = build_baboon_request(&args.password, &args.server);
+    let request = build_baboon_request(&runtime.password, &runtime.server);
     upstream.write_all(request.as_bytes()).await?;
 
     let (head, body_prefix) = timeout(
-        Duration::from_secs(args.handshake_timeout_secs),
-        http::read_head(&mut upstream, args.max_header_size),
+        runtime.handshake_timeout,
+        http::read_head(&mut upstream, runtime.max_header_size),
     )
     .await
     .context("baboon response timed out")??;
@@ -149,7 +145,7 @@ async fn handle_client_connection(
             &mut upstream,
             &body_prefix,
             response.content_length,
-            args.max_header_size,
+            runtime.max_header_size,
         )
         .await;
         let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
@@ -168,9 +164,10 @@ async fn handle_client_connection(
         );
     }
 
-    let (upload, download) = client_establish_ashe(&mut upstream, &args.password, &target_string)
-        .await
-        .with_context(|| format!("daze-baboon ashe handshake failed; {AUTH_FAILURE_HINT}"))?;
+    let (upload, download) =
+        client_establish_ashe(&mut upstream, &runtime.password, &target_string)
+            .await
+            .with_context(|| format!("daze-baboon ashe handshake failed; {AUTH_FAILURE_HINT}"))?;
 
     socks5::send_success(&mut inbound).await?;
     let stats = relay_rc4(
@@ -201,13 +198,13 @@ async fn handle_client_connection(
 async fn handle_server_connection(
     mut inbound: TcpStream,
     peer: SocketAddr,
-    args: ServerArgs,
+    runtime: ServerRuntime,
     fallback: BaboonFallback,
 ) -> Result<()> {
     inbound.set_nodelay(true)?;
     let (head, body_prefix) = timeout(
-        Duration::from_secs(args.handshake_timeout_secs),
-        http::read_head(&mut inbound, args.max_header_size),
+        runtime.handshake_timeout,
+        http::read_head(&mut inbound, runtime.max_header_size),
     )
     .await
     .context("baboon request head timed out")??;
@@ -223,7 +220,7 @@ async fn handle_server_connection(
     };
 
     if request.method == "POST" && request.path == BABOON_PATH {
-        if !validate_baboon_request(&request, &args.password) {
+        if !validate_baboon_request(&request, &runtime.password) {
             inbound
                 .write_all(&http::build_error_response(
                     401,
@@ -240,13 +237,10 @@ async fn handle_server_connection(
             )
             .await?;
 
-        let (download, upload, target) = server_accept_ashe(&mut inbound, &args).await?;
-        let outbound = timeout(
-            Duration::from_secs(args.connect_timeout_secs),
-            TcpStream::connect(&target),
-        )
-        .await
-        .context("upstream connect timed out")??;
+        let (download, upload, target) = server_accept_ashe(&mut inbound, &runtime).await?;
+        let outbound = timeout(runtime.connect_timeout, TcpStream::connect(&target))
+            .await
+            .context("upstream connect timed out")??;
         outbound.set_nodelay(true)?;
 
         let mut code = [0_u8];

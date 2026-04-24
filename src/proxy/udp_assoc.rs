@@ -1,10 +1,11 @@
 use super::{
     http::TunnelTransport,
+    remote::establish_remote_tunnel,
     route::{RouteDecision, Router},
     socks5::{self, TargetAddr},
     udp,
 };
-use crate::client::{ClientArgs, establish_remote_tunnel};
+use crate::runtime::ClientRuntime;
 use anyhow::{Context, Result, bail};
 use std::{
     collections::HashMap,
@@ -23,10 +24,10 @@ use tracing::{debug, info, warn};
 type SessionMap = Arc<Mutex<HashMap<String, mpsc::Sender<Vec<u8>>>>>;
 type BackgroundTasks = Arc<Mutex<Vec<JoinHandle<()>>>>;
 
-pub async fn handle_native_http_udp_associate(
+pub(crate) async fn handle_native_http_udp_associate(
     mut inbound: TcpStream,
     peer: SocketAddr,
-    args: ClientArgs,
+    args: ClientRuntime,
     router: Arc<Router>,
     connector: TlsConnector,
     host_header: String,
@@ -80,7 +81,7 @@ async fn run_udp_association(
     direct_sessions: SessionMap,
     remote_sessions: SessionMap,
     tasks: BackgroundTasks,
-    args: ClientArgs,
+    args: ClientRuntime,
     router: Arc<Router>,
     connector: TlsConnector,
     host_header: String,
@@ -245,7 +246,7 @@ async fn create_remote_udp_session(
     relay: Arc<UdpSocket>,
     client_addr: Arc<Mutex<Option<SocketAddr>>>,
     tasks: BackgroundTasks,
-    args: ClientArgs,
+    args: ClientRuntime,
     connector: TlsConnector,
     host_header: String,
     server_name: String,
@@ -318,7 +319,7 @@ async fn create_remote_tcp_dns_session(
     relay: Arc<UdpSocket>,
     client_addr: Arc<Mutex<Option<SocketAddr>>>,
     tasks: BackgroundTasks,
-    args: ClientArgs,
+    args: ClientRuntime,
     connector: TlsConnector,
     host_header: String,
     server_name: String,
@@ -367,7 +368,7 @@ async fn create_remote_tcp_dns_session(
 }
 
 async fn exchange_remote_dns_over_tcp(
-    args: &ClientArgs,
+    args: &ClientRuntime,
     connector: &TlsConnector,
     host_header: &str,
     server_name: &str,

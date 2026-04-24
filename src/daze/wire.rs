@@ -1,6 +1,6 @@
 use crate::{
     proxy::{auth::AUTH_FAILURE_HINT, traffic},
-    server::ServerArgs,
+    runtime::ServerRuntime,
     telemetry,
 };
 use anyhow::{Context, Result, bail};
@@ -65,43 +65,34 @@ where
 
 pub(crate) async fn server_accept_ashe<S>(
     stream: &mut S,
-    args: &ServerArgs,
+    runtime: &ServerRuntime,
 ) -> Result<(Rc4State, Rc4State, String)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut random = [0_u8; 32];
-    timeout(
-        Duration::from_secs(args.handshake_timeout_secs),
-        stream.read_exact(&mut random),
-    )
-    .await
-    .context("daze-ashe salt read timed out")??;
+    timeout(runtime.handshake_timeout, stream.read_exact(&mut random))
+        .await
+        .context("daze-ashe salt read timed out")??;
 
-    let password = salt(&args.password);
+    let password = salt(&runtime.password);
     let session_key = xor_key(&random, &password);
     let mut dec = Rc4State::new(&session_key);
     let enc = Rc4State::new(&session_key);
 
     let mut ts = [0_u8; 8];
-    timeout(
-        Duration::from_secs(args.handshake_timeout_secs),
-        stream.read_exact(&mut ts),
-    )
-    .await
-    .context("daze-ashe timestamp read timed out")??;
+    timeout(runtime.handshake_timeout, stream.read_exact(&mut ts))
+        .await
+        .context("daze-ashe timestamp read timed out")??;
     dec.apply_keystream(&mut ts);
     let timestamp = u64::from_be_bytes(ts) as i64;
     validate_timestamp(timestamp)
         .with_context(|| format!("daze-ashe authentication failed; {AUTH_FAILURE_HINT}"))?;
 
     let mut open_head = [0_u8; 2];
-    timeout(
-        Duration::from_secs(args.handshake_timeout_secs),
-        stream.read_exact(&mut open_head),
-    )
-    .await
-    .context("daze-ashe request read timed out")??;
+    timeout(runtime.handshake_timeout, stream.read_exact(&mut open_head))
+        .await
+        .context("daze-ashe request read timed out")??;
     dec.apply_keystream(&mut open_head);
     if open_head[0] != ASHE_NET_TCP {
         bail!("daze-ashe authentication failed or unsupported request type; {AUTH_FAILURE_HINT}");
@@ -109,17 +100,14 @@ where
 
     let addr_len = open_head[1] as usize;
     let mut address = vec![0_u8; addr_len];
-    timeout(
-        Duration::from_secs(args.handshake_timeout_secs),
-        stream.read_exact(&mut address),
-    )
-    .await
-    .context("daze-ashe address read timed out")??;
+    timeout(runtime.handshake_timeout, stream.read_exact(&mut address))
+        .await
+        .context("daze-ashe address read timed out")??;
     dec.apply_keystream(&mut address);
     let target = String::from_utf8(address)
         .with_context(|| format!("daze-ashe address decode failed; {AUTH_FAILURE_HINT}"))?;
 
-    if !args.allow_private_targets && is_private_literal_target(&target) {
+    if !runtime.allow_private_targets && is_private_literal_target(&target) {
         bail!("literal private IP targets are disabled by default");
     }
 
@@ -373,7 +361,7 @@ impl Rc4State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{mode::ProxyMode, wg::server::WgServerArgs};
+    use crate::runtime::ServerRuntime;
     use tokio::io::duplex;
 
     #[test]
@@ -390,28 +378,22 @@ mod tests {
     #[tokio::test]
     async fn ashe_password_mismatch_reports_auth_hint() {
         let (mut client_io, mut server_io) = duplex(1024);
-        let server_args = ServerArgs {
+        let server_runtime = ServerRuntime {
             listen: "127.0.0.1:0".to_owned(),
-            cert: None,
-            key: None,
-            mode: ProxyMode::DazeAshe,
             password: "server-secret".to_owned(),
-            path: "/connect".to_owned(),
             mux_path: "/mux".to_owned(),
-            auth_window_secs: 120,
-            handshake_timeout_secs: 1,
-            connect_timeout_secs: 10,
+            handshake_timeout: Duration::from_secs(1),
+            connect_timeout: Duration::from_secs(10),
             max_header_size: 16 * 1024,
             max_tunnel_body_size: 8 * 1024,
             allow_private_targets: true,
             fallback_url: "https://www.qq.com".to_owned(),
-            fallback_timeout_secs: 15,
+            fallback_timeout: Duration::from_secs(15),
             max_fallback_body_size: 1024 * 1024,
-            wg: WgServerArgs::default(),
         };
 
         let server_task =
-            tokio::spawn(async move { server_accept_ashe(&mut server_io, &server_args).await });
+            tokio::spawn(async move { server_accept_ashe(&mut server_io, &server_runtime).await });
         let client_err =
             match client_establish_ashe(&mut client_io, "client-secret", "example.com:80").await {
                 Ok(_) => panic!("wrong password should fail client handshake"),

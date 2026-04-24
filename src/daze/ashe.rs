@@ -1,11 +1,10 @@
 use super::wire::{client_establish_ashe, relay_rc4, server_accept_ashe};
 use crate::{
-    client::ClientArgs,
     proxy::{auth::AUTH_FAILURE_HINT, netlog, route, route::RouteDecision, socks5, traffic},
-    server::ServerArgs,
+    runtime::{ClientRuntime, ServerRuntime},
 };
 use anyhow::{Context, Result, bail};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc};
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
@@ -13,25 +12,25 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-pub(super) async fn run_client(args: ClientArgs) -> Result<()> {
-    let router = route::Router::from_args(&args).await?;
-    let listener = TcpListener::bind(&args.listen)
+pub(super) async fn run_client(runtime: ClientRuntime) -> Result<()> {
+    let router = route::Router::from_runtime(&runtime).await?;
+    let listener = TcpListener::bind(&runtime.listen)
         .await
-        .with_context(|| format!("failed to bind {}", args.listen))?;
+        .with_context(|| format!("failed to bind {}", runtime.listen))?;
 
     info!(
-        listen = %args.listen,
-        server = %args.server,
+        listen = %runtime.listen,
+        server = %runtime.server,
         mode = "daze-ashe",
         "client listening"
     );
 
     loop {
         let (socket, peer) = listener.accept().await?;
-        let args = args.clone();
+        let runtime = runtime.clone();
         let router = router.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_client_connection(socket, peer, router, args).await {
+            if let Err(err) = handle_client_connection(socket, peer, router, runtime).await {
                 if netlog::is_noisy_disconnect(&err) {
                     info!(peer = %peer, error = %err, "daze-ashe client session ended");
                 } else {
@@ -42,22 +41,22 @@ pub(super) async fn run_client(args: ClientArgs) -> Result<()> {
     }
 }
 
-pub(super) async fn run_server(args: ServerArgs) -> Result<()> {
-    let listener = TcpListener::bind(&args.listen)
+pub(super) async fn run_server(runtime: ServerRuntime) -> Result<()> {
+    let listener = TcpListener::bind(&runtime.listen)
         .await
-        .with_context(|| format!("failed to bind {}", args.listen))?;
+        .with_context(|| format!("failed to bind {}", runtime.listen))?;
 
     info!(
-        listen = %args.listen,
+        listen = %runtime.listen,
         mode = "daze-ashe",
         "server listening"
     );
 
     loop {
         let (socket, peer) = listener.accept().await?;
-        let args = args.clone();
+        let runtime = runtime.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_server_connection(socket, peer, args).await {
+            if let Err(err) = handle_server_connection(socket, peer, runtime).await {
                 if netlog::is_noisy_disconnect(&err) {
                     info!(peer = %peer, error = %err, "daze-ashe server session ended");
                 } else {
@@ -72,23 +71,23 @@ async fn handle_client_connection(
     mut inbound: TcpStream,
     peer: SocketAddr,
     router: Arc<route::Router>,
-    args: ClientArgs,
+    runtime: ClientRuntime,
 ) -> Result<()> {
     inbound.set_nodelay(true)?;
-    let target = timeout(
-        Duration::from_secs(args.handshake_timeout_secs),
-        socks5::accept(&mut inbound),
-    )
-    .await
-    .context("SOCKS handshake timed out")??;
+    let target = timeout(runtime.handshake_timeout, socks5::accept(&mut inbound))
+        .await
+        .context("SOCKS handshake timed out")??;
     let target_string = target.to_string();
 
     match router.decide(&target).await? {
         RouteDecision::Direct => {
-            let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
-            let stats =
-                route::relay_direct_socks(inbound, &target, connect_timeout, Some("daze-ashe"))
-                    .await?;
+            let stats = route::relay_direct_socks(
+                inbound,
+                &target,
+                runtime.connect_timeout,
+                Some("daze-ashe"),
+            )
+            .await?;
             info!(peer = %peer, target = %stats.display_target, route = "direct", mode = "daze-ashe", "relay completed");
             return Ok(());
         }
@@ -105,17 +104,15 @@ async fn handle_client_connection(
         bail!("destination address too long");
     }
 
-    let mut upstream = timeout(
-        Duration::from_secs(args.connect_timeout_secs),
-        TcpStream::connect(&args.server),
-    )
-    .await
-    .context("server connect timed out")??;
+    let mut upstream = timeout(runtime.connect_timeout, TcpStream::connect(&runtime.server))
+        .await
+        .context("server connect timed out")??;
     upstream.set_nodelay(true)?;
 
-    let (upload, download) = client_establish_ashe(&mut upstream, &args.password, &target_string)
-        .await
-        .with_context(|| format!("daze-ashe handshake failed; {AUTH_FAILURE_HINT}"))?;
+    let (upload, download) =
+        client_establish_ashe(&mut upstream, &runtime.password, &target_string)
+            .await
+            .with_context(|| format!("daze-ashe handshake failed; {AUTH_FAILURE_HINT}"))?;
 
     socks5::send_success(&mut inbound).await?;
     let stats = relay_rc4(
@@ -146,18 +143,15 @@ async fn handle_client_connection(
 async fn handle_server_connection(
     mut inbound: TcpStream,
     peer: SocketAddr,
-    args: ServerArgs,
+    runtime: ServerRuntime,
 ) -> Result<()> {
     inbound.set_nodelay(true)?;
 
-    let (download, upload, target) = server_accept_ashe(&mut inbound, &args).await?;
+    let (download, upload, target) = server_accept_ashe(&mut inbound, &runtime).await?;
 
-    let outbound = timeout(
-        Duration::from_secs(args.connect_timeout_secs),
-        TcpStream::connect(&target),
-    )
-    .await
-    .context("upstream connect timed out")??;
+    let outbound = timeout(runtime.connect_timeout, TcpStream::connect(&target))
+        .await
+        .context("upstream connect timed out")??;
     outbound.set_nodelay(true)?;
 
     let mut code = [0_u8];

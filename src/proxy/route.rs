@@ -1,5 +1,5 @@
 use super::{adblock::Adblocker, socks5, socks5::TargetAddr, traffic};
-use crate::client::ClientArgs;
+use crate::runtime::ClientRuntime;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -69,29 +69,30 @@ pub struct Router {
 }
 
 impl Router {
-    pub async fn from_args(args: &ClientArgs) -> Result<Arc<Self>> {
-        let should_load_inline_rules = !args.domain_rules.is_empty() || !args.ip_rules.is_empty();
-        let mut table = if matches!(args.filter, FilterMode::Rule) || should_load_inline_rules {
+    pub(crate) async fn from_runtime(runtime: &ClientRuntime) -> Result<Arc<Self>> {
+        let should_load_inline_rules =
+            !runtime.domain_rules.is_empty() || !runtime.ip_rules.is_empty();
+        let mut table = if matches!(runtime.filter, FilterMode::Rule) || should_load_inline_rules {
             RuleTable::load(
-                matches!(args.filter, FilterMode::Rule)
-                    .then_some(args.rule_file.as_deref())
+                matches!(runtime.filter, FilterMode::Rule)
+                    .then_some(runtime.rule_file.as_deref())
                     .flatten(),
-                matches!(args.filter, FilterMode::Rule)
-                    .then_some(args.cidr_file.as_deref())
+                matches!(runtime.filter, FilterMode::Rule)
+                    .then_some(runtime.cidr_file.as_deref())
                     .flatten(),
-                &args.domain_rules,
-                &args.ip_rules,
+                &runtime.domain_rules,
+                &runtime.ip_rules,
             )?
         } else {
             RuleTable::default()
         };
-        if matches!(args.filter, FilterMode::Rule) {
+        if matches!(runtime.filter, FilterMode::Rule) {
             table.direct_cidrs.extend(reserved_ip_nets());
         }
-        let adblock = Adblocker::from_config(&args.adblock).await?;
+        let adblock = Adblocker::from_config(&runtime.adblock).await?;
 
         Ok(Arc::new(Self {
-            mode: args.filter,
+            mode: runtime.filter,
             table,
             adblock,
             cache: Mutex::new(HashMap::new()),

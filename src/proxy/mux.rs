@@ -4,7 +4,7 @@ use super::{
     route::RouteDecision,
     socks5, tls,
 };
-use crate::{client::ClientArgs, server::ServerArgs};
+use crate::runtime::{ClientRuntime, ServerRuntime};
 use anyhow::{Context, Result, bail};
 use std::{
     collections::HashMap,
@@ -155,25 +155,25 @@ struct MuxClient {
 }
 
 impl MuxClient {
-    fn new(args: &ClientArgs) -> Result<Self> {
-        let connector = TlsConnector::from(tls::load_client_config(args.ca_cert.as_deref())?);
-        let (default_host, _) = tls::split_host_port(&args.server)?;
-        let server_name = args
+    fn new(runtime: &ClientRuntime) -> Result<Self> {
+        let connector = TlsConnector::from(tls::load_client_config(runtime.ca_cert.as_deref())?);
+        let (default_host, _) = tls::split_host_port(&runtime.server)?;
+        let server_name = runtime
             .server_name
             .clone()
             .unwrap_or_else(|| default_host.clone());
 
         Ok(Self {
             connector,
-            server: args.server.clone(),
+            server: runtime.server.clone(),
             server_name,
             host_header: default_host,
-            password: args.password.clone(),
-            mux_path: args.mux_path.clone(),
-            user_agent: args.user_agent.clone(),
-            handshake_timeout: Duration::from_secs(args.handshake_timeout_secs),
-            connect_timeout: Duration::from_secs(args.connect_timeout_secs),
-            max_header_size: args.max_header_size,
+            password: runtime.password.clone(),
+            mux_path: runtime.mux_path.clone(),
+            user_agent: runtime.user_agent.clone(),
+            handshake_timeout: runtime.handshake_timeout,
+            connect_timeout: runtime.connect_timeout,
+            max_header_size: runtime.max_header_size,
             session: Mutex::new(None),
             next_stream_id: AtomicU32::new(1),
         })
@@ -285,28 +285,29 @@ impl MuxClient {
     }
 }
 
-pub async fn run_client(args: ClientArgs) -> Result<()> {
-    let session = Arc::new(MuxClient::new(&args)?);
-    let router = route::Router::from_args(&args).await?;
-    let listener = TcpListener::bind(&args.listen)
+pub(crate) async fn run_client(runtime: ClientRuntime) -> Result<()> {
+    let session = Arc::new(MuxClient::new(&runtime)?);
+    let router = route::Router::from_runtime(&runtime).await?;
+    let listener = TcpListener::bind(&runtime.listen)
         .await
-        .with_context(|| format!("failed to bind {}", args.listen))?;
+        .with_context(|| format!("failed to bind {}", runtime.listen))?;
 
     info!(
-        listen = %args.listen,
-        server = %args.server,
-        mux_path = %args.mux_path,
+        listen = %runtime.listen,
+        server = %runtime.server,
+        mux_path = %runtime.mux_path,
         "client listening with mux"
     );
 
     loop {
         let (socket, peer) = listener.accept().await?;
         let session = session.clone();
-        let args = args.clone();
+        let runtime = runtime.clone();
         let router = router.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = handle_client_connection(socket, peer, session, router, args).await {
+            if let Err(err) = handle_client_connection(socket, peer, session, router, runtime).await
+            {
                 if netlog::is_noisy_disconnect(&err) {
                     info!(peer = %peer, error = %err, "mux client session ended");
                 } else {
@@ -322,24 +323,24 @@ async fn handle_client_connection(
     peer: SocketAddr,
     mux: Arc<MuxClient>,
     router: Arc<route::Router>,
-    args: ClientArgs,
+    runtime: ClientRuntime,
 ) -> Result<()> {
     inbound.set_nodelay(true)?;
 
-    let target = timeout(
-        Duration::from_secs(args.handshake_timeout_secs),
-        socks5::accept(&mut inbound),
-    )
-    .await
-    .context("SOCKS handshake timed out")??;
+    let target = timeout(runtime.handshake_timeout, socks5::accept(&mut inbound))
+        .await
+        .context("SOCKS handshake timed out")??;
     let target_string = target.to_string();
 
     match router.decide(&target).await? {
         RouteDecision::Direct => {
-            let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
-            let stats =
-                route::relay_direct_socks(inbound, &target, connect_timeout, Some("native-mux"))
-                    .await?;
+            let stats = route::relay_direct_socks(
+                inbound,
+                &target,
+                runtime.connect_timeout,
+                Some("native-mux"),
+            )
+            .await?;
             info!(peer = %peer, target = %stats.display_target, route = "direct", "mux relay completed");
             return Ok(());
         }
@@ -371,12 +372,9 @@ async fn handle_client_connection(
         bail!("mux session is not available");
     }
 
-    let first_event = timeout(
-        Duration::from_secs(args.handshake_timeout_secs),
-        stream_rx.recv(),
-    )
-    .await
-    .context("mux stream open timed out")?;
+    let first_event = timeout(runtime.handshake_timeout, stream_rx.recv())
+        .await
+        .context("mux stream open timed out")?;
 
     match first_event {
         Some(StreamEvent::Opened) => {
@@ -448,12 +446,12 @@ async fn handle_client_connection(
     Ok(())
 }
 
-pub async fn run_server_session<S>(
+pub(crate) async fn run_server_session<S>(
     mut stream: S,
     peer: SocketAddr,
     request_head: http::TunnelRequestHead,
     body_prefix: &[u8],
-    args: ServerArgs,
+    runtime: ServerRuntime,
     replay: Arc<ReplayProtector>,
 ) -> Result<()>
 where
@@ -484,7 +482,7 @@ where
         &mut stream,
         body_prefix,
         body_length,
-        args.max_tunnel_body_size,
+        runtime.max_tunnel_body_size,
     )
     .await?;
     let payload = match http::parse_tunnel_payload(&body) {
@@ -511,9 +509,9 @@ where
     };
 
     if let Err(err) = replay.validate(
-        &args.password,
+        &runtime.password,
         "POST",
-        &args.mux_path,
+        &runtime.mux_path,
         SESSION_AUTH_TARGET,
         &proof,
     ) {
@@ -528,13 +526,13 @@ where
     }
 
     stream.write_all(&http::build_tunnel_established()).await?;
-    info!(peer = %peer, path = %args.mux_path, "mux session accepted");
+    info!(peer = %peer, path = %runtime.mux_path, "mux session accepted");
 
     let (reader, writer) = tokio::io::split(stream);
     let (frame_tx, frame_rx) = mpsc::channel(256);
     let streams = Arc::new(Mutex::new(HashMap::new()));
 
-    run_server_io(reader, writer, frame_rx, frame_tx, streams, args).await
+    run_server_io(reader, writer, frame_rx, frame_tx, streams, runtime).await
 }
 
 async fn run_client_session<R, W>(
@@ -608,7 +606,7 @@ async fn run_server_io<R, W>(
     mut frame_rx: mpsc::Receiver<Frame>,
     frame_tx: mpsc::Sender<Frame>,
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<ServerStreamCommand>>>>,
-    args: ServerArgs,
+    runtime: ServerRuntime,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -649,11 +647,11 @@ where
 
                             let frame_tx = frame_tx.clone();
                             let streams = streams.clone();
-                            let args = args.clone();
+                            let runtime = runtime.clone();
 
                             tokio::spawn(async move {
                                 if let Err(err) =
-                                    handle_server_open(frame.stream_id, target, frame_tx, streams, args).await
+                                    handle_server_open(frame.stream_id, target, frame_tx, streams, runtime).await
                                 {
                                     if netlog::is_noisy_disconnect(&err) {
                                         info!(stream_id = frame.stream_id, error = %err, "mux stream ended");
@@ -716,9 +714,9 @@ async fn handle_server_open(
     target: String,
     frame_tx: mpsc::Sender<Frame>,
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<ServerStreamCommand>>>>,
-    args: ServerArgs,
+    runtime: ServerRuntime,
 ) -> Result<()> {
-    if !args.allow_private_targets && is_private_literal_target(&target) {
+    if !runtime.allow_private_targets && is_private_literal_target(&target) {
         let _ = frame_tx
             .send(Frame::open_err(
                 stream_id,
@@ -728,12 +726,7 @@ async fn handle_server_open(
         return Ok(());
     }
 
-    let outbound = match timeout(
-        Duration::from_secs(args.connect_timeout_secs),
-        TcpStream::connect(&target),
-    )
-    .await
-    {
+    let outbound = match timeout(runtime.connect_timeout, TcpStream::connect(&target)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(err)) => {
             let _ = frame_tx

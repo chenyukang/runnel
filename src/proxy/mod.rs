@@ -3,6 +3,7 @@ pub mod auth;
 pub mod http;
 pub mod mux;
 pub mod netlog;
+pub(crate) mod remote;
 pub mod route;
 pub mod socks5;
 pub mod tls;

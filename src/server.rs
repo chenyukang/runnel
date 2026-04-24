@@ -4,6 +4,7 @@ use crate::{
         auth::{AUTH_FAILURE_BODY, AUTH_FAILURE_HINT, AuthProof, ReplayProtector},
         http, mux, netlog, tls, traffic, udp,
     },
+    runtime::ServerRuntime,
     wg,
 };
 use anyhow::{Context, Result, bail};
@@ -78,7 +79,7 @@ pub async fn run(args: ServerArgs) -> Result<()> {
     match args.mode {
         ProxyMode::NativeHttp | ProxyMode::NativeMux => {}
         ProxyMode::DazeAshe | ProxyMode::DazeBaboon | ProxyMode::DazeCzar => {
-            return crate::daze::run_server(args).await;
+            return crate::daze::run_server(ServerRuntime::from_args(&args), args.mode).await;
         }
         ProxyMode::Wg => unreachable!("wg mode is dispatched before native server startup"),
     }
@@ -171,7 +172,15 @@ async fn handle_connection(
     if matches!(args.mode, ProxyMode::NativeMux)
         && let Some(mux_head) = http::parse_tunnel_request_head(&head, &args.mux_path)?
     {
-        return mux::run_server_session(stream, peer, mux_head, &body_prefix, args, replay).await;
+        return mux::run_server_session(
+            stream,
+            peer,
+            mux_head,
+            &body_prefix,
+            ServerRuntime::from_args(&args),
+            replay,
+        )
+        .await;
     }
 
     if matches!(args.mode, ProxyMode::NativeHttp)

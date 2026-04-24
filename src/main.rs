@@ -1,16 +1,24 @@
+mod cli_daemon;
+mod cli_service;
+
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use cli_daemon::{
+    maybe_create_pid_file, reload_daemon_process, resolve_pid_file_for_role,
+    status_daemon_processes, stop_daemon_process,
+};
+use cli_service::{
+    absolute_path, command_role, dashboard_context, default_log_file_for_command, monitor_context,
+    resolve_attach_socket, resolve_socket_for_service,
+};
 use runnel::{cert, client, config, server, telemetry, tui, tun, wg};
-use serde::Serialize;
 use std::{
     collections::BTreeSet,
-    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
-use tokio::time::sleep;
 use tracing::error;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -19,7 +27,6 @@ const DAEMON_STARTUP_CHECK: Duration = Duration::from_millis(1200);
 const DAEMON_STARTUP_POLL: Duration = Duration::from_millis(100);
 const DEFAULT_LOG_DIR: &str = "/var/log/runnel";
 const DEFAULT_RUN_LOG_FILE: &str = "/var/log/runnel/run.log";
-const SERVICE_ROLES: &[&str] = &["client", "server", "tun"];
 
 #[derive(Debug, Parser)]
 #[command(
@@ -619,280 +626,6 @@ fn init_tracing(
     })
 }
 
-fn dashboard_context(cli: &Cli, log_file: PathBuf) -> Option<tui::DashboardContext> {
-    if !cli.tui {
-        return None;
-    }
-
-    let context = match &cli.command {
-        Commands::Client(args) => {
-            let mode = args.effective_mode().ok();
-            tui::DashboardContext {
-                command_label: "client".to_owned(),
-                mode_label: mode
-                    .map(|mode| mode.to_string())
-                    .unwrap_or_else(|| "-".to_owned()),
-                listen: Some(if matches!(mode, Some(runnel::mode::ProxyMode::Wg)) {
-                    args.wg.bind.clone()
-                } else {
-                    args.listen.clone()
-                }),
-                upstream: Some(if matches!(mode, Some(runnel::mode::ProxyMode::Wg)) {
-                    args.wg.endpoint.clone()
-                } else {
-                    args.server.clone()
-                }),
-                path: Some(match mode {
-                    Some(runnel::mode::ProxyMode::NativeMux) => args.mux_path.clone(),
-                    Some(runnel::mode::ProxyMode::Wg) => args.wg.device.clone(),
-                    _ => args.path.clone(),
-                }),
-                log_file,
-                log_filter: cli.log.clone(),
-            }
-        }
-        Commands::Server(args) => tui::DashboardContext {
-            command_label: "server".to_owned(),
-            mode_label: args.mode.to_string(),
-            listen: Some(if matches!(args.mode, runnel::mode::ProxyMode::Wg) {
-                args.wg.listen.clone()
-            } else {
-                args.listen.clone()
-            }),
-            upstream: Some(if matches!(args.mode, runnel::mode::ProxyMode::Wg) {
-                args.wg.peer_tunnel_ip.to_string()
-            } else {
-                args.fallback_url.clone()
-            }),
-            path: Some(match args.mode {
-                runnel::mode::ProxyMode::NativeMux => args.mux_path.clone(),
-                runnel::mode::ProxyMode::Wg => args.wg.device.clone(),
-                _ => args.path.clone(),
-            }),
-            log_file,
-            log_filter: cli.log.clone(),
-        },
-        Commands::Tun(args) => tui::DashboardContext {
-            command_label: "tun".to_owned(),
-            mode_label: args
-                .client
-                .effective_mode()
-                .ok()
-                .map(|mode| mode.to_string())
-                .unwrap_or_else(|| "-".to_owned()),
-            listen: Some(args.client.listen.clone()),
-            upstream: Some(args.client.server.clone()),
-            path: Some(args.device.clone()),
-            log_file,
-            log_filter: cli.log.clone(),
-        },
-        Commands::WgClient(args) => tui::DashboardContext {
-            command_label: "wg-client".to_owned(),
-            mode_label: "wg".to_owned(),
-            listen: Some(args.bind.clone()),
-            upstream: Some(args.endpoint.clone()),
-            path: Some(args.device.clone()),
-            log_file,
-            log_filter: cli.log.clone(),
-        },
-        Commands::WgServer(args) => tui::DashboardContext {
-            command_label: "wg-server".to_owned(),
-            mode_label: "wg".to_owned(),
-            listen: Some(args.listen.clone()),
-            upstream: Some(args.peer_tunnel_ip.to_string()),
-            path: Some(args.device.clone()),
-            log_file,
-            log_filter: cli.log.clone(),
-        },
-        Commands::WgConfig(_)
-        | Commands::WgKeygen(_)
-        | Commands::Cert(_)
-        | Commands::Tui(_)
-        | Commands::Stop(_)
-        | Commands::Reload(_)
-        | Commands::Status(_) => {
-            return None;
-        }
-    };
-
-    Some(context)
-}
-
-fn monitor_context(cli: &Cli, log_file: PathBuf) -> Option<telemetry::MonitorContext> {
-    let pid = std::process::id();
-    let context = match &cli.command {
-        Commands::Client(args) => {
-            let mode = args.effective_mode().ok();
-            telemetry::MonitorContext {
-                command_label: "client".to_owned(),
-                mode_label: mode
-                    .map(|mode| mode.to_string())
-                    .unwrap_or_else(|| "-".to_owned()),
-                listen: Some(if matches!(mode, Some(runnel::mode::ProxyMode::Wg)) {
-                    args.wg.bind.clone()
-                } else {
-                    args.listen.clone()
-                }),
-                upstream: Some(if matches!(mode, Some(runnel::mode::ProxyMode::Wg)) {
-                    args.wg.endpoint.clone()
-                } else {
-                    args.server.clone()
-                }),
-                path: Some(match mode {
-                    Some(runnel::mode::ProxyMode::NativeMux) => args.mux_path.clone(),
-                    Some(runnel::mode::ProxyMode::Wg) => args.wg.device.clone(),
-                    _ => args.path.clone(),
-                }),
-                log_file,
-                log_filter: cli.log.clone(),
-                pid,
-            }
-        }
-        Commands::Server(args) => telemetry::MonitorContext {
-            command_label: "server".to_owned(),
-            mode_label: args.mode.to_string(),
-            listen: Some(if matches!(args.mode, runnel::mode::ProxyMode::Wg) {
-                args.wg.listen.clone()
-            } else {
-                args.listen.clone()
-            }),
-            upstream: Some(if matches!(args.mode, runnel::mode::ProxyMode::Wg) {
-                args.wg.peer_tunnel_ip.to_string()
-            } else {
-                args.fallback_url.clone()
-            }),
-            path: Some(match args.mode {
-                runnel::mode::ProxyMode::NativeMux => args.mux_path.clone(),
-                runnel::mode::ProxyMode::Wg => args.wg.device.clone(),
-                _ => args.path.clone(),
-            }),
-            log_file,
-            log_filter: cli.log.clone(),
-            pid,
-        },
-        Commands::Tun(args) => telemetry::MonitorContext {
-            command_label: "tun".to_owned(),
-            mode_label: args
-                .client
-                .effective_mode()
-                .ok()
-                .map(|mode| mode.to_string())
-                .unwrap_or_else(|| "-".to_owned()),
-            listen: Some(args.client.listen.clone()),
-            upstream: Some(args.client.server.clone()),
-            path: Some(args.device.clone()),
-            log_file,
-            log_filter: cli.log.clone(),
-            pid,
-        },
-        Commands::WgClient(args) => telemetry::MonitorContext {
-            command_label: "wg-client".to_owned(),
-            mode_label: "wg".to_owned(),
-            listen: Some(args.bind.clone()),
-            upstream: Some(args.endpoint.clone()),
-            path: Some(args.device.clone()),
-            log_file,
-            log_filter: cli.log.clone(),
-            pid,
-        },
-        Commands::WgServer(args) => telemetry::MonitorContext {
-            command_label: "wg-server".to_owned(),
-            mode_label: "wg".to_owned(),
-            listen: Some(args.listen.clone()),
-            upstream: Some(args.peer_tunnel_ip.to_string()),
-            path: Some(args.device.clone()),
-            log_file,
-            log_filter: cli.log.clone(),
-            pid,
-        },
-        Commands::WgConfig(_)
-        | Commands::WgKeygen(_)
-        | Commands::Cert(_)
-        | Commands::Tui(_)
-        | Commands::Stop(_)
-        | Commands::Reload(_)
-        | Commands::Status(_) => {
-            return None;
-        }
-    };
-
-    Some(context)
-}
-
-fn resolve_socket_for_service(cli: &Cli, log_file: &Path) -> Result<PathBuf> {
-    if let Some(path) = &cli.telemetry_sock {
-        return absolute_path(path);
-    }
-
-    let role = command_role(&cli.command).context("telemetry socket is not supported")?;
-    default_socket_path(log_file, role)
-}
-
-fn resolve_attach_socket(
-    log_file: &Path,
-    global_socket: Option<PathBuf>,
-    attach: Option<PathBuf>,
-) -> Result<PathBuf> {
-    if let Some(path) = attach.or(global_socket) {
-        return absolute_path(&path);
-    }
-
-    let client = default_socket_path(log_file, "client")?;
-    let server = default_socket_path(log_file, "server")?;
-    let tun = default_socket_path(log_file, "tun")?;
-    let wg_client = default_socket_path(log_file, "wg-client")?;
-    let wg_server = default_socket_path(log_file, "wg-server")?;
-
-    let mut found = Vec::new();
-    if client.exists() {
-        found.push(client);
-    }
-    if server.exists() {
-        found.push(server);
-    }
-    if tun.exists() {
-        found.push(tun);
-    }
-    if wg_client.exists() {
-        found.push(wg_client);
-    }
-    if wg_server.exists() {
-        found.push(wg_server);
-    }
-
-    match found.len() {
-        0 => default_socket_path(log_file, "client"),
-        1 => Ok(found.remove(0)),
-        _ => anyhow::bail!("multiple telemetry sockets exist; pass --attach explicitly"),
-    }
-}
-
-fn default_socket_path(log_file: &Path, role: &str) -> Result<PathBuf> {
-    default_sidecar_path(log_file, role, "sock")
-}
-
-fn default_pid_path(log_file: &Path, role: &str) -> Result<PathBuf> {
-    default_sidecar_path(log_file, role, "pid")
-}
-
-fn default_sidecar_path(log_file: &Path, role: &str, ext: &str) -> Result<PathBuf> {
-    let log_file = absolute_path(log_file)?;
-    let parent = log_file
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let stem = log_file
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("runnel");
-    let file_name = if stem == role {
-        format!("{stem}.{ext}")
-    } else {
-        format!("{stem}.{role}.{ext}")
-    };
-    Ok(parent.join(file_name))
-}
-
 fn should_override(matches: &clap::ArgMatches, id: &str) -> bool {
     !matches.value_source(id).is_some_and(|source| {
         matches!(
@@ -911,66 +644,6 @@ fn value_from_command_or_env(matches: &clap::ArgMatches, id: &str) -> bool {
     })
 }
 
-fn default_log_file_for_command(command: &Commands) -> PathBuf {
-    if let Some(role) = command_role(command) {
-        return default_log_file_for_role(role);
-    }
-
-    match command {
-        Commands::Stop(args) => args
-            .role
-            .map(|role| default_log_file_for_role(role.as_str()))
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_RUN_LOG_FILE)),
-        Commands::Reload(args) => args
-            .role
-            .map(|role| default_log_file_for_role(role.as_str()))
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_RUN_LOG_FILE)),
-        Commands::Status(args) => args
-            .role
-            .map(|role| default_log_file_for_role(role.as_str()))
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_RUN_LOG_FILE)),
-        Commands::WgConfig(_) | Commands::WgKeygen(_) | Commands::Cert(_) | Commands::Tui(_) => {
-            PathBuf::from(DEFAULT_RUN_LOG_FILE)
-        }
-        Commands::Client(_)
-        | Commands::Server(_)
-        | Commands::Tun(_)
-        | Commands::WgClient(_)
-        | Commands::WgServer(_) => unreachable!("service commands are handled by command_role"),
-    }
-}
-
-fn default_log_file_for_role(role: &str) -> PathBuf {
-    Path::new(DEFAULT_LOG_DIR).join(format!("{role}.log"))
-}
-
-fn absolute_path(path: &Path) -> Result<PathBuf> {
-    if path.is_absolute() {
-        return Ok(path.to_path_buf());
-    }
-
-    Ok(std::env::current_dir()
-        .context("failed to read current directory")?
-        .join(path))
-}
-
-fn command_role(command: &Commands) -> Option<&'static str> {
-    match command {
-        Commands::Client(_) => Some("client"),
-        Commands::Server(_) => Some("server"),
-        Commands::Tun(_) => Some("tun"),
-        Commands::WgClient(_) => Some("wg-client"),
-        Commands::WgServer(_) => Some("wg-server"),
-        Commands::WgConfig(_)
-        | Commands::WgKeygen(_)
-        | Commands::Cert(_)
-        | Commands::Tui(_)
-        | Commands::Stop(_)
-        | Commands::Reload(_)
-        | Commands::Status(_) => None,
-    }
-}
-
 fn run_utility_command(command: &Commands) -> Option<Result<()>> {
     match command {
         Commands::WgConfig(args) => Some(wg::configgen::run_config(args.clone())),
@@ -980,893 +653,12 @@ fn run_utility_command(command: &Commands) -> Option<Result<()>> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct StatusTarget {
-    label: String,
-    pid_file: Option<PathBuf>,
-    telemetry_socket: Option<PathBuf>,
-}
-
-#[derive(Debug, Serialize)]
-struct StatusReport {
-    services: Vec<ServiceStatus>,
-}
-
-#[derive(Debug, Serialize)]
-struct ServiceStatus {
-    role: String,
-    state: String,
-    pid_file: Option<PathBuf>,
-    telemetry_sock: Option<PathBuf>,
-    pid_from_file: Option<u32>,
-    runtime: Option<RuntimeStatus>,
-    detail: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct RuntimeStatus {
-    command: String,
-    mode: String,
-    pid: u32,
-    listen: Option<String>,
-    upstream: Option<String>,
-    path: Option<String>,
-    log_file: PathBuf,
-    log_filter: String,
-    uptime_secs: u64,
-    total_relays: u64,
-    total_errors: u64,
-    total_warnings: u64,
-    total_uploaded: u64,
-    total_downloaded: u64,
-    last_event_age_ms: Option<u64>,
-    last_warning_age_ms: Option<u64>,
-    last_traffic_age_ms: Option<u64>,
-}
-
-impl From<telemetry::DashboardSnapshot> for RuntimeStatus {
-    fn from(snapshot: telemetry::DashboardSnapshot) -> Self {
-        Self {
-            command: snapshot.context.command_label,
-            mode: snapshot.context.mode_label,
-            pid: snapshot.context.pid,
-            listen: snapshot.context.listen,
-            upstream: snapshot.context.upstream,
-            path: snapshot.context.path,
-            log_file: snapshot.context.log_file,
-            log_filter: snapshot.context.log_filter,
-            uptime_secs: snapshot.uptime_secs,
-            total_relays: snapshot.total_relays,
-            total_errors: snapshot.total_errors,
-            total_warnings: snapshot.total_warnings,
-            total_uploaded: snapshot.total_uploaded,
-            total_downloaded: snapshot.total_downloaded,
-            last_event_age_ms: snapshot.last_event_age_ms,
-            last_warning_age_ms: snapshot.last_warning_age_ms,
-            last_traffic_age_ms: snapshot.last_traffic_age_ms,
-        }
-    }
-}
-
-async fn status_daemon_processes(
-    log_file: &Path,
-    configured_pid_file: Option<PathBuf>,
-    configured_socket: Option<PathBuf>,
-    args: StatusArgs,
-    use_role_default_log_files: bool,
-) -> Result<()> {
-    #[cfg(not(unix))]
-    {
-        let _ = (
-            log_file,
-            configured_pid_file,
-            configured_socket,
-            args,
-            use_role_default_log_files,
-        );
-        anyhow::bail!("runnel status is only supported on unix platforms");
-    }
-
-    #[cfg(unix)]
-    {
-        let include_not_running =
-            args.role.is_some() || configured_pid_file.is_some() || configured_socket.is_some();
-        let targets = resolve_status_targets(
-            log_file,
-            configured_pid_file,
-            configured_socket,
-            args.role,
-            use_role_default_log_files,
-        )?;
-        let mut services = Vec::with_capacity(targets.len());
-        for target in targets {
-            let service = inspect_status_target(target).await?;
-            if should_show_status_state(&service.state, include_not_running) {
-                services.push(service);
-            }
-        }
-        let report = StatusReport { services };
-        if args.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&report).context("failed to encode status JSON")?
-            );
-        } else {
-            print_status_report(&report);
-        }
-        Ok(())
-    }
-}
-
-fn resolve_status_targets(
-    log_file: &Path,
-    configured_pid_file: Option<PathBuf>,
-    configured_socket: Option<PathBuf>,
-    role: Option<ServiceRole>,
-    use_role_default_log_files: bool,
-) -> Result<Vec<StatusTarget>> {
-    if let Some(role) = role {
-        let log_file = if use_role_default_log_files
-            && configured_pid_file.is_none()
-            && configured_socket.is_none()
-        {
-            default_log_file_for_role(role.as_str())
-        } else {
-            log_file.to_path_buf()
-        };
-        return Ok(vec![StatusTarget {
-            label: role.as_str().to_owned(),
-            pid_file: Some(match configured_pid_file {
-                Some(path) => absolute_path(&path)?,
-                None => default_pid_path(&log_file, role.as_str())?,
-            }),
-            telemetry_socket: Some(match configured_socket {
-                Some(path) => absolute_path(&path)?,
-                None => default_socket_path(&log_file, role.as_str())?,
-            }),
-        }]);
-    }
-
-    if configured_pid_file.is_some() || configured_socket.is_some() {
-        return Ok(vec![StatusTarget {
-            label: "service".to_owned(),
-            pid_file: configured_pid_file
-                .as_deref()
-                .map(absolute_path)
-                .transpose()?,
-            telemetry_socket: configured_socket
-                .as_deref()
-                .map(absolute_path)
-                .transpose()?,
-        }]);
-    }
-
-    let defaults = SERVICE_ROLES
-        .iter()
-        .map(|role| {
-            if use_role_default_log_files {
-                default_status_target(&default_log_file_for_role(role), role)
-            } else {
-                default_status_target(log_file, role)
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let discovered = discover_status_targets()?;
-    Ok(merge_status_targets(defaults, discovered))
-}
-
-fn default_status_target(log_file: &Path, role: &str) -> Result<StatusTarget> {
-    Ok(StatusTarget {
-        label: role.to_owned(),
-        pid_file: Some(default_pid_path(log_file, role)?),
-        telemetry_socket: Some(default_socket_path(log_file, role)?),
-    })
-}
-
-fn merge_status_targets(
-    defaults: Vec<StatusTarget>,
-    discovered: Vec<StatusTarget>,
-) -> Vec<StatusTarget> {
-    let active_discovered = discovered
-        .into_iter()
-        .filter(status_target_is_active)
-        .collect::<Vec<_>>();
-
-    let mut seen = BTreeSet::new();
-    let mut merged = Vec::new();
-    for default in defaults {
-        let mut found_active = false;
-        for target in active_discovered
-            .iter()
-            .filter(|target| target.label == default.label)
-        {
-            found_active = true;
-            push_status_target_once(&mut merged, &mut seen, target.clone());
-        }
-        if !found_active {
-            push_status_target_once(&mut merged, &mut seen, default);
-        }
-    }
-    for target in active_discovered {
-        push_status_target_once(&mut merged, &mut seen, target);
-    }
-
-    merged
-}
-
-fn push_status_target_once(
-    targets: &mut Vec<StatusTarget>,
-    seen: &mut BTreeSet<(String, Option<PathBuf>, Option<PathBuf>)>,
-    target: StatusTarget,
-) {
-    let key = status_target_key(&target);
-    if seen.insert(key) {
-        targets.push(target);
-    }
-}
-
-fn status_target_is_active(target: &StatusTarget) -> bool {
-    status_target_has_live_pid(target) || status_target_has_connectable_socket(target)
-}
-
-fn status_target_has_live_pid(target: &StatusTarget) -> bool {
-    let Some(path) = &target.pid_file else {
-        return false;
-    };
-    let Ok(pid) = read_pid_file(path) else {
-        return false;
-    };
-    process_exists(pid).unwrap_or(false)
-}
-
-#[cfg(unix)]
-fn status_target_has_connectable_socket(target: &StatusTarget) -> bool {
-    let Some(path) = &target.telemetry_socket else {
-        return false;
-    };
-    std::os::unix::net::UnixStream::connect(path).is_ok()
-}
-
-#[cfg(not(unix))]
-fn status_target_has_connectable_socket(_target: &StatusTarget) -> bool {
-    false
-}
-
-fn status_target_key(target: &StatusTarget) -> (String, Option<PathBuf>, Option<PathBuf>) {
-    (
-        target.label.clone(),
-        target.pid_file.clone(),
-        target.telemetry_socket.clone(),
-    )
-}
-
-fn discover_status_targets() -> Result<Vec<StatusTarget>> {
-    let mut dirs = vec![
-        std::env::current_dir().context("failed to read current directory")?,
-        std::env::temp_dir(),
-    ];
-    #[cfg(unix)]
-    dirs.push(PathBuf::from("/tmp"));
-
-    let mut seen_dirs = BTreeSet::new();
-    let mut seen_targets = BTreeSet::new();
-    let mut targets = Vec::new();
-    for dir in dirs {
-        let dir = dir.canonicalize().unwrap_or(dir);
-        if seen_dirs.insert(dir.clone()) {
-            discover_status_targets_in_dir(&dir, &mut seen_targets, &mut targets)?;
-        }
-    }
-    Ok(targets)
-}
-
-fn discover_status_targets_in_dir(
-    dir: &Path,
-    seen_targets: &mut BTreeSet<(String, PathBuf)>,
-    targets: &mut Vec<StatusTarget>,
-) -> Result<()> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Ok(());
-    };
-
-    for entry in entries {
-        let entry = entry.with_context(|| format!("failed to read {}", dir.display()))?;
-        let path = entry.path();
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Some((stem, role, compact)) = parse_sidecar_file_name(file_name) else {
-            continue;
-        };
-        let key = (role.to_owned(), dir.join(stem));
-        if !seen_targets.insert(key) {
-            continue;
-        }
-
-        let (pid_file, telemetry_socket) = if compact {
-            (
-                dir.join(format!("{stem}.pid")),
-                dir.join(format!("{stem}.sock")),
-            )
-        } else {
-            (
-                dir.join(format!("{stem}.{role}.pid")),
-                dir.join(format!("{stem}.{role}.sock")),
-            )
-        };
-        targets.push(StatusTarget {
-            label: role.to_owned(),
-            pid_file: pid_file.exists().then_some(pid_file),
-            telemetry_socket: telemetry_socket.exists().then_some(telemetry_socket),
-        });
-    }
-
-    Ok(())
-}
-
-fn parse_sidecar_file_name(file_name: &str) -> Option<(&str, &'static str, bool)> {
-    for role in SERVICE_ROLES {
-        for ext in ["pid", "sock"] {
-            let compact = format!("{role}.{ext}");
-            if file_name == compact {
-                return Some((role, *role, true));
-            }
-
-            let suffix = format!(".{role}.{ext}");
-            if let Some(stem) = file_name.strip_suffix(&suffix) {
-                return Some((stem, *role, false));
-            }
-        }
-    }
-    None
-}
-
-#[cfg(unix)]
-async fn inspect_status_target(target: StatusTarget) -> Result<ServiceStatus> {
-    let mut notes = Vec::new();
-
-    let pid_file_exists = target.pid_file.as_ref().is_some_and(|path| path.exists());
-    let (pid_from_file, pid_alive) = match &target.pid_file {
-        Some(path) if path.exists() => match read_pid_file(path) {
-            Ok(pid) => {
-                let alive = process_exists(pid)?;
-                if !alive {
-                    notes.push(format!("stale pid file {}", path.display()));
-                }
-                (Some(pid), Some(alive))
-            }
-            Err(err) => {
-                notes.push(format!("{err:#}"));
-                (None, None)
-            }
-        },
-        Some(path) => {
-            notes.push(format!("pid file not found: {}", path.display()));
-            (None, None)
-        }
-        None => (None, None),
-    };
-
-    let runtime = match &target.telemetry_socket {
-        Some(path) if path.exists() => match telemetry::attach_socket(path).await {
-            Ok((snapshot, _receiver)) => Some(RuntimeStatus::from(snapshot)),
-            Err(err) => {
-                notes.push(format!(
-                    "failed to query telemetry socket {}: {err:#}",
-                    path.display()
-                ));
-                None
-            }
-        },
-        Some(path) => {
-            notes.push(format!("telemetry socket not found: {}", path.display()));
-            None
-        }
-        None => None,
-    };
-
-    if let (Some(pid), Some(runtime)) = (pid_from_file, runtime.as_ref())
-        && pid != runtime.pid
-    {
-        notes.push(format!(
-            "pid file reports {}, telemetry reports {}",
-            pid, runtime.pid
-        ));
-    }
-
-    let role = runtime
-        .as_ref()
-        .map(|runtime| runtime.command.clone())
-        .unwrap_or_else(|| target.label.clone());
-    let state = classify_service_state(
-        target.pid_file.is_some(),
-        pid_file_exists,
-        pid_from_file,
-        pid_alive,
-        runtime.as_ref(),
-    );
-
-    Ok(ServiceStatus {
-        role,
-        state: state.to_owned(),
-        pid_file: target.pid_file,
-        telemetry_sock: target.telemetry_socket,
-        pid_from_file,
-        runtime,
-        detail: (!notes.is_empty()).then(|| notes.join("; ")),
-    })
-}
-
-fn classify_service_state(
-    expects_pid_file: bool,
-    pid_file_exists: bool,
-    pid_from_file: Option<u32>,
-    pid_alive: Option<bool>,
-    runtime: Option<&RuntimeStatus>,
-) -> &'static str {
-    if let Some(runtime) = runtime {
-        if expects_pid_file {
-            return match (pid_from_file, pid_alive) {
-                (Some(pid), Some(true)) if pid == runtime.pid => "running",
-                _ => "degraded",
-            };
-        }
-        return "running";
-    }
-
-    if matches!(pid_alive, Some(true)) {
-        return "degraded";
-    }
-
-    if expects_pid_file && (pid_file_exists || pid_from_file.is_some()) {
-        return "stale";
-    }
-
-    "not-running"
-}
-
-fn should_show_status_state(state: &str, include_not_running: bool) -> bool {
-    include_not_running || state != "not-running"
-}
-
-fn print_status_report(report: &StatusReport) {
-    if report.services.is_empty() {
-        println!("no running services");
-        return;
-    }
-
-    for (index, service) in report.services.iter().enumerate() {
-        if index > 0 {
-            println!();
-        }
-
-        println!("{}: {}", service.role, service.state);
-        if let Some(pid) = service
-            .runtime
-            .as_ref()
-            .map(|runtime| runtime.pid)
-            .or(service.pid_from_file)
-        {
-            println!("  pid: {pid}");
-        }
-        if let Some(runtime) = &service.runtime {
-            println!("  mode: {}", runtime.mode);
-            if let Some(listen) = &runtime.listen {
-                println!("  listen: {listen}");
-            }
-            if let Some(upstream) = &runtime.upstream {
-                println!("  upstream: {upstream}");
-            }
-            if let Some(path) = &runtime.path {
-                println!("  path: {path}");
-            }
-            println!("  uptime: {}", format_duration(runtime.uptime_secs));
-            println!(
-                "  traffic: up {} down {}",
-                format_bytes(runtime.total_uploaded),
-                format_bytes(runtime.total_downloaded)
-            );
-            println!(
-                "  health: relays {} warnings {} errors {}",
-                runtime.total_relays, runtime.total_warnings, runtime.total_errors
-            );
-            println!(
-                "  log: {} ({})",
-                runtime.log_file.display(),
-                runtime.log_filter
-            );
-        }
-        if let Some(pid_file) = &service.pid_file {
-            println!("  pid_file: {}", pid_file.display());
-        }
-        if let Some(telemetry_sock) = &service.telemetry_sock {
-            println!("  telemetry_sock: {}", telemetry_sock.display());
-        }
-        if let Some(detail) = &service.detail {
-            println!("  detail: {detail}");
-        }
-    }
-}
-
-fn format_duration(total_secs: u64) -> String {
-    let hours = total_secs / 3600;
-    let minutes = (total_secs % 3600) / 60;
-    let seconds = total_secs % 60;
-    if hours > 0 {
-        format!("{hours}h{minutes:02}m{seconds:02}s")
-    } else if minutes > 0 {
-        format!("{minutes}m{seconds:02}s")
-    } else {
-        format!("{seconds}s")
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{} {}", bytes, UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
-
-fn resolve_pid_file_for_role(
-    log_file: &Path,
-    configured_pid_file: Option<PathBuf>,
-    role: &str,
-) -> Result<PathBuf> {
-    if let Some(path) = configured_pid_file {
-        return absolute_path(&path);
-    }
-    default_pid_path(log_file, role)
-}
-
-fn maybe_create_pid_file(cli: &Cli, log_file: &Path) -> Result<Option<PidFileGuard>> {
-    let Some(role) = command_role(&cli.command) else {
-        return Ok(None);
-    };
-    if !cli.daemon && cli.pid_file.is_none() {
-        return Ok(None);
-    }
-
-    let path = resolve_pid_file_for_role(log_file, cli.pid_file.clone(), role)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    if path.exists() {
-        match read_pid_file(&path) {
-            Ok(pid) if process_exists(pid)? => {
-                anyhow::bail!(
-                    "another {} daemon is already running with pid {} (pid file: {})",
-                    role,
-                    pid,
-                    path.display()
-                );
-            }
-            Ok(_) | Err(_) => {
-                let _ = fs::remove_file(&path);
-            }
-        }
-    }
-
-    fs::write(&path, format!("{}\n", std::process::id()))
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(Some(PidFileGuard { path }))
-}
-
-async fn stop_daemon_process(
-    log_file: &Path,
-    configured_pid_file: Option<PathBuf>,
-    args: StopArgs,
-    use_role_default_log_files: bool,
-) -> Result<()> {
-    #[cfg(not(unix))]
-    {
-        let _ = (
-            log_file,
-            configured_pid_file,
-            args,
-            use_role_default_log_files,
-        );
-        anyhow::bail!("runnel stop is only supported on unix platforms");
-    }
-
-    #[cfg(unix)]
-    {
-        let pid_file = resolve_stop_pid_file(
-            log_file,
-            configured_pid_file,
-            args.role,
-            use_role_default_log_files,
-        )?;
-        let pid = read_pid_file(&pid_file)?;
-        if !process_exists(pid)? {
-            let _ = fs::remove_file(&pid_file);
-            println!(
-                "runnel daemon is not running (removed stale pid file {})",
-                pid_file.display()
-            );
-            return Ok(());
-        }
-
-        send_sigterm(pid)?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(args.wait_secs);
-        loop {
-            if !process_exists(pid)? {
-                let _ = fs::remove_file(&pid_file);
-                println!(
-                    "runnel daemon stopped pid={} pid_file={}",
-                    pid,
-                    pid_file.display()
-                );
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                anyhow::bail!(
-                    "timed out waiting {}s for pid {} to exit; try again or stop it manually",
-                    args.wait_secs,
-                    pid
-                );
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    }
-}
-
-async fn reload_daemon_process(
-    cli: &Cli,
-    config_path: Option<PathBuf>,
-    args: ReloadArgs,
-    use_role_default_log_files: bool,
-) -> Result<()> {
-    #[cfg(not(unix))]
-    {
-        let _ = (cli, config_path, args, use_role_default_log_files);
-        anyhow::bail!("runnel reload is only supported on unix platforms");
-    }
-
-    #[cfg(unix)]
-    {
-        let role = resolve_reload_role(
-            &cli.log_file,
-            cli.pid_file.clone(),
-            args.role,
-            use_role_default_log_files,
-        )?;
-        let log_file = if use_role_default_log_files && cli.pid_file.is_none() {
-            default_log_file_for_role(role.as_str())
-        } else {
-            cli.log_file.clone()
-        };
-        stop_daemon_process(
-            &log_file,
-            cli.pid_file.clone(),
-            StopArgs {
-                role: Some(role),
-                wait_secs: args.wait_secs,
-            },
-            use_role_default_log_files,
-        )
-        .await?;
-        start_reloaded_daemon(cli, config_path.as_deref(), role, &log_file)?;
-        println!("runnel daemon reloaded role={}", role.as_str());
-        Ok(())
-    }
-}
-
-fn resolve_reload_role(
-    log_file: &Path,
-    configured_pid_file: Option<PathBuf>,
-    role: Option<ServiceRole>,
-    use_role_default_log_files: bool,
-) -> Result<ServiceRole> {
-    if let Some(role) = role {
-        return Ok(role);
-    }
-
-    if configured_pid_file.is_some() {
-        anyhow::bail!("reload requires a role when --pid-file is set");
-    }
-
-    let pid_file = resolve_stop_pid_file(log_file, None, None, use_role_default_log_files)?;
-    role_from_pid_file(&pid_file).with_context(|| {
-        format!(
-            "failed to infer daemon role from pid file {}; pass `reload client`, `reload server`, `reload tun`, `reload wg-client`, or `reload wg-server`",
-            pid_file.display()
-        )
-    })
-}
-
-fn start_reloaded_daemon(
-    cli: &Cli,
-    config_path: Option<&Path>,
-    role: ServiceRole,
-    log_file: &Path,
-) -> Result<()> {
-    let executable = std::env::current_exe().context("failed to locate current executable")?;
-    let args = reload_start_args(cli, config_path, role, log_file);
-    let status = Command::new(executable)
-        .args(&args)
-        .status()
-        .context("failed to start reloaded daemon process")?;
-    if !status.success() {
-        anyhow::bail!("reloaded daemon startup command exited with {status}");
-    }
-    Ok(())
-}
-
-fn reload_start_args(
-    cli: &Cli,
-    config_path: Option<&Path>,
-    role: ServiceRole,
-    log_file: &Path,
-) -> Vec<OsString> {
-    let mut args = Vec::new();
-    args.push("--log".into());
-    args.push(cli.log.clone().into());
-    args.push("--log-file".into());
-    args.push(log_file.as_os_str().to_owned());
-    if let Some(path) = &cli.telemetry_sock {
-        args.push("--telemetry-sock".into());
-        args.push(path.as_os_str().to_owned());
-    }
-    if let Some(path) = &cli.pid_file {
-        args.push("--pid-file".into());
-        args.push(path.as_os_str().to_owned());
-    }
-    if let Some(path) = config_path {
-        args.push("--config".into());
-        args.push(path.as_os_str().to_owned());
-    }
-    args.push("--daemon".into());
-    args.push(role.as_str().into());
-    args
-}
-
-fn role_from_pid_file(path: &Path) -> Option<ServiceRole> {
-    let file_name = path.file_name()?.to_str()?;
-    for role in [
-        ServiceRole::Client,
-        ServiceRole::Server,
-        ServiceRole::Tun,
-        ServiceRole::WgClient,
-        ServiceRole::WgServer,
-    ] {
-        if file_name == format!("{}.pid", role.as_str())
-            || file_name.ends_with(&format!(".{}.pid", role.as_str()))
-        {
-            return Some(role);
-        }
-    }
-    None
-}
-
-fn resolve_stop_pid_file(
-    log_file: &Path,
-    configured_pid_file: Option<PathBuf>,
-    role: Option<ServiceRole>,
-    use_role_default_log_files: bool,
-) -> Result<PathBuf> {
-    if let Some(path) = configured_pid_file {
-        return absolute_path(&path);
-    }
-    if let Some(role) = role {
-        let log_file = if use_role_default_log_files {
-            default_log_file_for_role(role.as_str())
-        } else {
-            log_file.to_path_buf()
-        };
-        return default_pid_path(&log_file, role.as_str());
-    }
-
-    let client =
-        default_pid_path_for_role_or_log_file(log_file, "client", use_role_default_log_files)?;
-    let server =
-        default_pid_path_for_role_or_log_file(log_file, "server", use_role_default_log_files)?;
-    let tun = default_pid_path_for_role_or_log_file(log_file, "tun", use_role_default_log_files)?;
-    let wg_client =
-        default_pid_path_for_role_or_log_file(log_file, "wg-client", use_role_default_log_files)?;
-    let wg_server =
-        default_pid_path_for_role_or_log_file(log_file, "wg-server", use_role_default_log_files)?;
-    let mut found = Vec::new();
-    if client.exists() {
-        found.push(client);
-    }
-    if server.exists() {
-        found.push(server);
-    }
-    if tun.exists() {
-        found.push(tun);
-    }
-    if wg_client.exists() {
-        found.push(wg_client);
-    }
-    if wg_server.exists() {
-        found.push(wg_server);
-    }
-
-    match found.len() {
-        0 => anyhow::bail!(
-            "no pid file found; pass `stop client`, `stop server`, `stop tun`, `stop wg-client`, `stop wg-server`, or `--pid-file`"
-        ),
-        1 => Ok(found.remove(0)),
-        _ => anyhow::bail!(
-            "multiple pid files exist; pass `stop client`, `stop server`, `stop tun`, `stop wg-client`, `stop wg-server`, or `--pid-file`"
-        ),
-    }
-}
-
-fn default_pid_path_for_role_or_log_file(
-    log_file: &Path,
-    role: &str,
-    use_role_default_log_files: bool,
-) -> Result<PathBuf> {
-    if use_role_default_log_files {
-        default_pid_path(&default_log_file_for_role(role), role)
-    } else {
-        default_pid_path(log_file, role)
-    }
-}
-
-fn read_pid_file(path: &Path) -> Result<u32> {
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read pid file {}", path.display()))?;
-    raw.trim()
-        .parse::<u32>()
-        .with_context(|| format!("invalid pid in {}", path.display()))
-}
-
-#[cfg(unix)]
-fn process_exists(pid: u32) -> Result<bool> {
-    let pid = pid as i32;
-    let rc = unsafe { libc::kill(pid, 0) };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(code) if code == libc::ESRCH => Ok(false),
-        Some(code) if code == libc::EPERM => Ok(true),
-        _ => Err(err).with_context(|| format!("failed to inspect process {}", pid)),
-    }
-}
-
-#[cfg(unix)]
-fn send_sigterm(pid: u32) -> Result<()> {
-    let pid = pid as i32;
-    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-    if rc == 0 {
-        return Ok(());
-    }
-    Err(std::io::Error::last_os_error())
-        .with_context(|| format!("failed to send SIGTERM to {}", pid))
-}
-
-struct PidFileGuard {
-    path: PathBuf,
-}
-
-impl Drop for PidFileGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, ReloadArgs, RuntimeStatus, ServiceRole, StatusArgs, classify_service_state,
-        command_role, default_config_paths_for, default_log_file_for_command,
-        default_log_file_for_role, first_existing_config_path, read_file_tail, reload_start_args,
-        resolve_reload_role, resolve_status_targets, role_from_pid_file, run_utility_command,
-        should_show_status_state, wait_for_daemon_startup,
+        Cli, Commands, ReloadArgs, ServiceRole, StatusArgs, cli_daemon, cli_service,
+        default_config_paths_for, first_existing_config_path, read_file_tail, run_utility_command,
+        wait_for_daemon_startup,
     };
     use runnel::wg;
     use std::{
@@ -1955,7 +747,8 @@ mod tests {
     #[test]
     fn status_targets_default_to_all_roles() {
         let targets =
-            resolve_status_targets(Path::new("proxy.log"), None, None, None, false).unwrap();
+            cli_daemon::resolve_status_targets(Path::new("proxy.log"), None, None, None, false)
+                .unwrap();
         let labels = targets
             .iter()
             .map(|target| target.label.as_str())
@@ -1970,15 +763,15 @@ mod tests {
     #[test]
     fn service_commands_default_to_role_log_files() {
         assert_eq!(
-            default_log_file_for_role("client"),
+            cli_service::default_log_file_for_role("client"),
             PathBuf::from("/var/log/runnel/client.log")
         );
         assert_eq!(
-            default_log_file_for_role("server"),
+            cli_service::default_log_file_for_role("server"),
             PathBuf::from("/var/log/runnel/server.log")
         );
         assert_eq!(
-            default_log_file_for_command(&Commands::Status(StatusArgs {
+            cli_service::default_log_file_for_command(&Commands::Status(StatusArgs {
                 role: Some(ServiceRole::Client),
                 json: false,
             })),
@@ -1989,7 +782,8 @@ mod tests {
     #[test]
     fn status_defaults_can_use_role_log_files() {
         let targets =
-            resolve_status_targets(Path::new("ignored.log"), None, None, None, true).unwrap();
+            cli_daemon::resolve_status_targets(Path::new("ignored.log"), None, None, None, true)
+                .unwrap();
         let server = targets
             .iter()
             .find(|target| target.label == "server")
@@ -2011,16 +805,16 @@ mod tests {
 
     #[test]
     fn status_hides_not_running_services_by_default() {
-        assert!(!should_show_status_state("not-running", false));
-        assert!(should_show_status_state("running", false));
-        assert!(should_show_status_state("degraded", false));
-        assert!(should_show_status_state("stale", false));
-        assert!(should_show_status_state("not-running", true));
+        assert!(!cli_daemon::should_show_status_state("not-running", false));
+        assert!(cli_daemon::should_show_status_state("running", false));
+        assert!(cli_daemon::should_show_status_state("degraded", false));
+        assert!(cli_daemon::should_show_status_state("stale", false));
+        assert!(cli_daemon::should_show_status_state("not-running", true));
     }
 
     #[test]
     fn status_target_uses_role_specific_overrides() {
-        let targets = resolve_status_targets(
+        let targets = cli_daemon::resolve_status_targets(
             Path::new("proxy.log"),
             Some(Path::new("custom.pid").to_path_buf()),
             Some(Path::new("custom.sock").to_path_buf()),
@@ -2059,11 +853,11 @@ mod tests {
             nat_out_interface: None,
             json: false,
         });
-        assert!(command_role(&config).is_none());
+        assert!(cli_service::command_role(&config).is_none());
         assert!(run_utility_command(&config).is_some_and(|result| result.is_ok()));
 
         let keygen = Commands::WgKeygen(wg::keys::WgKeygenArgs { json: false });
-        assert!(command_role(&keygen).is_none());
+        assert!(cli_service::command_role(&keygen).is_none());
         assert!(run_utility_command(&keygen).is_some());
     }
 
@@ -2084,7 +878,7 @@ mod tests {
         };
 
         assert_eq!(
-            reload_start_args(
+            cli_daemon::reload_start_args(
                 &cli,
                 Some(Path::new("config.yaml")),
                 ServiceRole::WgClient,
@@ -2110,22 +904,22 @@ mod tests {
     #[test]
     fn reload_role_can_be_inferred_from_wg_pid_file() {
         assert_eq!(
-            role_from_pid_file(Path::new("server.pid")),
+            cli_daemon::role_from_pid_file(Path::new("server.pid")),
             Some(ServiceRole::Server)
         );
         assert_eq!(
-            role_from_pid_file(Path::new("proxy.wg-client.pid")),
+            cli_daemon::role_from_pid_file(Path::new("proxy.wg-client.pid")),
             Some(ServiceRole::WgClient)
         );
         assert_eq!(
-            role_from_pid_file(Path::new("proxy.wg-server.pid")),
+            cli_daemon::role_from_pid_file(Path::new("proxy.wg-server.pid")),
             Some(ServiceRole::WgServer)
         );
     }
 
     #[test]
     fn reload_requires_role_with_custom_pid_file() {
-        let error = resolve_reload_role(
+        let error = cli_daemon::resolve_reload_role(
             Path::new("proxy.log"),
             Some(PathBuf::from("custom.pid")),
             None,
@@ -2143,13 +937,13 @@ mod tests {
             wait_secs: 10,
         });
 
-        assert!(command_role(&command).is_none());
+        assert!(cli_service::command_role(&command).is_none());
         assert!(run_utility_command(&command).is_none());
     }
 
     #[test]
     fn status_state_is_running_when_pid_and_runtime_match() {
-        let runtime = RuntimeStatus {
+        let runtime = cli_daemon::RuntimeStatus {
             command: "client".to_owned(),
             mode: "native-http".to_owned(),
             pid: 42,
@@ -2169,14 +963,14 @@ mod tests {
             last_traffic_age_ms: None,
         };
         assert_eq!(
-            classify_service_state(true, true, Some(42), Some(true), Some(&runtime)),
+            cli_daemon::classify_service_state(true, true, Some(42), Some(true), Some(&runtime)),
             "running"
         );
     }
 
     #[test]
     fn status_state_is_degraded_when_runtime_disagrees_with_pid_file() {
-        let runtime = RuntimeStatus {
+        let runtime = cli_daemon::RuntimeStatus {
             command: "tun".to_owned(),
             mode: "native-http".to_owned(),
             pid: 77,
@@ -2196,7 +990,7 @@ mod tests {
             last_traffic_age_ms: None,
         };
         assert_eq!(
-            classify_service_state(true, true, Some(42), Some(true), Some(&runtime)),
+            cli_daemon::classify_service_state(true, true, Some(42), Some(true), Some(&runtime)),
             "degraded"
         );
     }
@@ -2204,7 +998,7 @@ mod tests {
     #[test]
     fn status_state_is_stale_when_only_pid_file_remains() {
         assert_eq!(
-            classify_service_state(true, true, Some(42), Some(false), None),
+            cli_daemon::classify_service_state(true, true, Some(42), Some(false), None),
             "stale"
         );
     }

@@ -1,8 +1,7 @@
 use super::wire::{client_establish_ashe, relay_rc4, server_accept_ashe};
 use crate::{
-    client::ClientArgs,
     proxy::{netlog, route, route::RouteDecision, socks5, traffic},
-    server::ServerArgs,
+    runtime::{ClientRuntime, ServerRuntime},
 };
 use anyhow::{Context, Result, bail};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
@@ -65,12 +64,12 @@ struct CzarClient {
 }
 
 impl CzarClient {
-    fn new(args: &ClientArgs) -> Self {
+    fn new(runtime: &ClientRuntime) -> Self {
         Self {
-            server: args.server.clone(),
-            password: args.password.clone(),
-            connect_timeout: Duration::from_secs(args.connect_timeout_secs),
-            handshake_timeout: Duration::from_secs(args.handshake_timeout_secs),
+            server: runtime.server.clone(),
+            password: runtime.password.clone(),
+            connect_timeout: runtime.connect_timeout,
+            handshake_timeout: runtime.handshake_timeout,
             session: Mutex::new(None),
         }
     }
@@ -176,28 +175,29 @@ impl CzarClient {
     }
 }
 
-pub async fn run_client(args: ClientArgs) -> Result<()> {
-    let client = Arc::new(CzarClient::new(&args));
-    let router = route::Router::from_args(&args).await?;
-    let listener = TcpListener::bind(&args.listen)
+pub async fn run_client(runtime: ClientRuntime) -> Result<()> {
+    let client = Arc::new(CzarClient::new(&runtime));
+    let router = route::Router::from_runtime(&runtime).await?;
+    let listener = TcpListener::bind(&runtime.listen)
         .await
-        .with_context(|| format!("failed to bind {}", args.listen))?;
+        .with_context(|| format!("failed to bind {}", runtime.listen))?;
 
     info!(
-        listen = %args.listen,
-        server = %args.server,
+        listen = %runtime.listen,
+        server = %runtime.server,
         mode = "daze-czar",
         "client listening"
     );
 
     loop {
         let (socket, peer) = listener.accept().await?;
-        let args = args.clone();
+        let runtime = runtime.clone();
         let client = client.clone();
         let router = router.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = handle_client_connection(socket, peer, client, router, args).await {
+            if let Err(err) = handle_client_connection(socket, peer, client, router, runtime).await
+            {
                 if netlog::is_noisy_disconnect(&err) {
                     info!(peer = %peer, error = %err, "daze-czar client session ended");
                 } else {
@@ -208,23 +208,23 @@ pub async fn run_client(args: ClientArgs) -> Result<()> {
     }
 }
 
-pub async fn run_server(args: ServerArgs) -> Result<()> {
-    let listener = TcpListener::bind(&args.listen)
+pub async fn run_server(runtime: ServerRuntime) -> Result<()> {
+    let listener = TcpListener::bind(&runtime.listen)
         .await
-        .with_context(|| format!("failed to bind {}", args.listen))?;
+        .with_context(|| format!("failed to bind {}", runtime.listen))?;
 
     info!(
-        listen = %args.listen,
+        listen = %runtime.listen,
         mode = "daze-czar",
         "server listening"
     );
 
     loop {
         let (socket, peer) = listener.accept().await?;
-        let args = args.clone();
+        let runtime = runtime.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = handle_server_connection(socket, peer, args).await {
+            if let Err(err) = handle_server_connection(socket, peer, runtime).await {
                 if netlog::is_noisy_disconnect(&err) {
                     info!(peer = %peer, error = %err, "daze-czar server connection ended");
                 } else {
@@ -240,7 +240,7 @@ async fn handle_client_connection(
     peer: SocketAddr,
     client: Arc<CzarClient>,
     router: Arc<route::Router>,
-    args: ClientArgs,
+    runtime: ClientRuntime,
 ) -> Result<()> {
     inbound.set_nodelay(true)?;
     let target = timeout(client.handshake_timeout, socks5::accept(&mut inbound))
@@ -250,10 +250,13 @@ async fn handle_client_connection(
 
     match router.decide(&target).await? {
         RouteDecision::Direct => {
-            let connect_timeout = Duration::from_secs(args.connect_timeout_secs);
-            let stats =
-                route::relay_direct_socks(inbound, &target, connect_timeout, Some("daze-czar"))
-                    .await?;
+            let stats = route::relay_direct_socks(
+                inbound,
+                &target,
+                runtime.connect_timeout,
+                Some("daze-czar"),
+            )
+            .await?;
             info!(peer = %peer, target = %stats.display_target, route = "direct", mode = "daze-czar", "relay completed");
             return Ok(());
         }
@@ -303,7 +306,7 @@ async fn handle_client_connection(
 async fn handle_server_connection(
     socket: TcpStream,
     peer: SocketAddr,
-    args: ServerArgs,
+    runtime: ServerRuntime,
 ) -> Result<()> {
     socket.set_nodelay(true)?;
 
@@ -324,9 +327,9 @@ async fn handle_server_connection(
     ));
 
     while let Some(stream) = accept_rx.recv().await {
-        let args = args.clone();
+        let runtime = runtime.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_server_stream(stream, args).await {
+            if let Err(err) = handle_server_stream(stream, runtime).await {
                 if netlog::is_noisy_disconnect(&err) {
                     info!(peer = %peer, error = %err, "daze-czar stream ended");
                 } else {
@@ -339,14 +342,11 @@ async fn handle_server_connection(
     Ok(())
 }
 
-async fn handle_server_stream(mut inbound: DuplexStream, args: ServerArgs) -> Result<()> {
-    let (download, upload, target) = server_accept_ashe(&mut inbound, &args).await?;
-    let outbound = timeout(
-        Duration::from_secs(args.connect_timeout_secs),
-        TcpStream::connect(&target),
-    )
-    .await
-    .context("upstream connect timed out")??;
+async fn handle_server_stream(mut inbound: DuplexStream, runtime: ServerRuntime) -> Result<()> {
+    let (download, upload, target) = server_accept_ashe(&mut inbound, &runtime).await?;
+    let outbound = timeout(runtime.connect_timeout, TcpStream::connect(&target))
+        .await
+        .context("upstream connect timed out")??;
     outbound.set_nodelay(true)?;
 
     let mut code = [0_u8];
