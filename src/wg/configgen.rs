@@ -16,6 +16,14 @@ const DEFAULT_ADBLOCK_LISTS: &[&str] = &[
     "https://easylist.to/easylist/easyprivacy.txt",
     "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt",
 ];
+const DEFAULT_WG_ENGINE: &str = "noise";
+const DEFAULT_WG_OBFS: &str = "mask";
+const DEFAULT_WG_OBFS_PADDING_MIN: u16 = 8;
+const DEFAULT_WG_OBFS_PADDING_MAX: u16 = 96;
+const DEFAULT_WG_OBFS_HANDSHAKE_PADDING: u16 = 256;
+const DEFAULT_WG_OBFS_RESPONSE_PADDING: u16 = 192;
+const DEFAULT_WG_OBFS_JUNK_PACKETS: u8 = 0;
+const DEFAULT_WG_OBFS_JITTER_MS: u16 = 0;
 
 #[derive(Clone, Debug, Args)]
 pub struct WgConfigArgs {
@@ -76,6 +84,14 @@ struct GeneratedWgServerSection {
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct GeneratedWgClientConfig {
+    engine: &'static str,
+    obfs: &'static str,
+    obfs_padding_min: u16,
+    obfs_padding_max: u16,
+    obfs_handshake_padding: u16,
+    obfs_response_padding: u16,
+    obfs_junk_packets: u8,
+    obfs_jitter_ms: u16,
     endpoint: String,
     private_key: String,
     peer_public_key: String,
@@ -87,10 +103,19 @@ struct GeneratedWgClientConfig {
     dns: Option<IpAddr>,
     #[serde(skip_serializing_if = "is_false")]
     dns_capture: bool,
+    skip_handshake_probe: bool,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct GeneratedWgServerConfig {
+    engine: &'static str,
+    obfs: &'static str,
+    obfs_padding_min: u16,
+    obfs_padding_max: u16,
+    obfs_handshake_padding: u16,
+    obfs_response_padding: u16,
+    obfs_junk_packets: u8,
+    obfs_jitter_ms: u16,
     listen: String,
     private_key: String,
     peer_public_key: String,
@@ -142,6 +167,14 @@ fn generate_config(args: &WgConfigArgs) -> Result<GeneratedWgConfig> {
                 block: Vec::new(),
             },
             wg: GeneratedWgClientConfig {
+                engine: DEFAULT_WG_ENGINE,
+                obfs: DEFAULT_WG_OBFS,
+                obfs_padding_min: DEFAULT_WG_OBFS_PADDING_MIN,
+                obfs_padding_max: DEFAULT_WG_OBFS_PADDING_MAX,
+                obfs_handshake_padding: DEFAULT_WG_OBFS_HANDSHAKE_PADDING,
+                obfs_response_padding: DEFAULT_WG_OBFS_RESPONSE_PADDING,
+                obfs_junk_packets: DEFAULT_WG_OBFS_JUNK_PACKETS,
+                obfs_jitter_ms: DEFAULT_WG_OBFS_JITTER_MS,
                 endpoint: server_endpoint.to_string(),
                 private_key: client_keys.private_key,
                 peer_public_key: server_keys.public_key,
@@ -151,11 +184,20 @@ fn generate_config(args: &WgConfigArgs) -> Result<GeneratedWgConfig> {
                 persistent_keepalive_secs: args.persistent_keepalive_secs,
                 dns,
                 dns_capture,
+                skip_handshake_probe: false,
             },
         },
         server: GeneratedWgServerSection {
             mode: "wg",
             wg: GeneratedWgServerConfig {
+                engine: DEFAULT_WG_ENGINE,
+                obfs: DEFAULT_WG_OBFS,
+                obfs_padding_min: DEFAULT_WG_OBFS_PADDING_MIN,
+                obfs_padding_max: DEFAULT_WG_OBFS_PADDING_MAX,
+                obfs_handshake_padding: DEFAULT_WG_OBFS_HANDSHAKE_PADDING,
+                obfs_response_padding: DEFAULT_WG_OBFS_RESPONSE_PADDING,
+                obfs_junk_packets: DEFAULT_WG_OBFS_JUNK_PACKETS,
+                obfs_jitter_ms: DEFAULT_WG_OBFS_JITTER_MS,
                 listen,
                 private_key: server_keys.private_key,
                 peer_public_key: client_keys.public_key,
@@ -202,6 +244,7 @@ mod tests {
     use super::{WgConfigArgs, generate_config};
     use crate::config::FileConfig;
     use crate::wg::keys::public_key_from_private_key;
+    use crate::wg::{WgEngine, WgObfsMode};
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
@@ -223,6 +266,17 @@ mod tests {
         let generated = generate_config(&args).unwrap();
         assert_eq!(generated.client.mode, "wg");
         assert_eq!(generated.server.mode, "wg");
+        assert_eq!(generated.client.wg.engine, "noise");
+        assert_eq!(generated.server.wg.engine, "noise");
+        assert_eq!(generated.client.wg.obfs, "mask");
+        assert_eq!(generated.server.wg.obfs, "mask");
+        assert_eq!(generated.client.wg.obfs_padding_min, 8);
+        assert_eq!(generated.client.wg.obfs_padding_max, 96);
+        assert_eq!(generated.client.wg.obfs_handshake_padding, 256);
+        assert_eq!(generated.client.wg.obfs_response_padding, 192);
+        assert_eq!(generated.client.wg.obfs_junk_packets, 0);
+        assert_eq!(generated.client.wg.obfs_jitter_ms, 0);
+        assert!(!generated.client.wg.skip_handshake_probe);
         assert_eq!(generated.client.wg.endpoint, "198.51.100.10:51820");
         assert_eq!(generated.server.wg.listen, "0.0.0.0:51820");
         assert!(generated.client.adblock.enabled);
@@ -257,14 +311,21 @@ mod tests {
         let adblock = client.adblock.as_ref().expect("generated adblock section");
         assert_eq!(adblock.enabled, Some(true));
         assert_eq!(adblock.lists.len(), 3);
-        assert_eq!(
-            parsed
-                .client
-                .as_ref()
-                .and_then(|cfg| cfg.wg.as_ref())
-                .and_then(|cfg| cfg.endpoint.as_deref()),
-            Some("198.51.100.10:51820")
-        );
+        let client_wg = parsed
+            .client
+            .as_ref()
+            .and_then(|cfg| cfg.wg.as_ref())
+            .expect("generated client wg section");
+        assert_eq!(client_wg.engine, Some(WgEngine::Noise));
+        assert_eq!(client_wg.obfs, Some(WgObfsMode::Mask));
+        assert_eq!(client_wg.obfs_padding_min, Some(8));
+        assert_eq!(client_wg.obfs_padding_max, Some(96));
+        assert_eq!(client_wg.obfs_handshake_padding, Some(256));
+        assert_eq!(client_wg.obfs_response_padding, Some(192));
+        assert_eq!(client_wg.obfs_junk_packets, Some(0));
+        assert_eq!(client_wg.obfs_jitter_ms, Some(0));
+        assert_eq!(client_wg.skip_handshake_probe, Some(false));
+        assert_eq!(client_wg.endpoint.as_deref(), Some("198.51.100.10:51820"));
         assert_eq!(
             parsed
                 .server

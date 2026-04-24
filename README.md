@@ -97,31 +97,31 @@ server:
 More WG details, including dry-run hooks and DNS behavior, live in
 [`docs/wg.md`](./docs/wg.md).
 
-WG mode defaults to boringtun's device engine. There is also an experimental
-low-level noise engine for transport experiments. Its optional `mask`
-obfuscation wraps WireGuard UDP packets in a keyed frame with random padding;
-enable it on both sides:
+If WG engine fields are omitted entirely, the runtime defaults to boringtun's
+device engine. Fresh configs from `runnel wg-config` now emit `engine: noise`
+with `obfs: mask` by default. The optional `mask` obfuscation wraps WireGuard
+UDP packets in a keyed frame with random padding; enable it on both sides:
 
 ```yaml
 client:
   wg:
     engine: noise
     obfs: mask
-    obfs_padding_min: 16
-    obfs_padding_max: 256
-    obfs_handshake_padding: 512
-    obfs_response_padding: 384
-    obfs_junk_packets: 2
+    obfs_padding_min: 8
+    obfs_padding_max: 96
+    obfs_handshake_padding: 256
+    obfs_response_padding: 192
+    obfs_junk_packets: 0
 
 server:
   wg:
     engine: noise
     obfs: mask
-    obfs_padding_min: 16
-    obfs_padding_max: 256
-    obfs_handshake_padding: 512
-    obfs_response_padding: 384
-    obfs_junk_packets: 2
+    obfs_padding_min: 8
+    obfs_padding_max: 96
+    obfs_handshake_padding: 256
+    obfs_response_padding: 192
+    obfs_junk_packets: 0
 ```
 
 ## Daily Commands

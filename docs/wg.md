@@ -109,43 +109,45 @@ data, and packet captures when diagnosing WG reachability.
 
 ## Engine
 
-WG mode defaults to `engine: device`, which lets boringtun own the WireGuard
-device loop and UAPI socket. For transport experiments, `engine: noise` runs the
-TUN/UDP loop in Runnel with `boringtun::noise::Tunn` directly:
+When no WG engine is configured, the runtime still defaults to `engine: device`,
+which lets boringtun own the WireGuard device loop and UAPI socket. Fresh
+configs from `runnel wg-config` emit `engine: noise` with `obfs: mask` by
+default, so both sides are ready for the in-process TUN/UDP loop:
 
 ```yaml
 client:
   wg:
     engine: noise
-    # optional; both sides must match
     obfs: mask
-    obfs_padding_min: 16
-    obfs_padding_max: 256
-    obfs_handshake_padding: 512
-    obfs_response_padding: 384
-    obfs_junk_packets: 2
-    obfs_jitter_ms: 20
+    obfs_padding_min: 8
+    obfs_padding_max: 96
+    obfs_handshake_padding: 256
+    obfs_response_padding: 192
+    obfs_junk_packets: 0
+    obfs_jitter_ms: 0
 
 server:
   wg:
     engine: noise
     obfs: mask
-    obfs_padding_min: 16
-    obfs_padding_max: 256
-    obfs_handshake_padding: 512
-    obfs_response_padding: 384
-    obfs_junk_packets: 2
-    obfs_jitter_ms: 20
+    obfs_padding_min: 8
+    obfs_padding_max: 96
+    obfs_handshake_padding: 256
+    obfs_response_padding: 192
+    obfs_junk_packets: 0
+    obfs_jitter_ms: 0
 ```
 
 The noise engine keeps the same keys, hooks, DNS capture, split routing,
-tcpdump monitor, and traffic samples. `obfs: off` is the default and emits
-standard WireGuard UDP packets. `obfs: mask` is experimental: it derives a
-shared mask key from the WG key pair, hides the WG packet header and length
-inside a small authenticated wrapper, and adds random padding. The padding
-profile can also pin handshake/response padding, send authenticated junk frames
-before real packets, and add small send jitter. It is useful for packet-shape
-experiments, but it is not a censorship-resistance guarantee.
+tcpdump monitor, and traffic samples. If you explicitly use `engine: noise` but
+omit `obfs`, the runtime default is still `obfs: off`, which sends plain
+WireGuard payloads over the in-process UDP loop. Generated configs now choose
+`obfs: mask` by default. `obfs: mask` is experimental: it derives a shared mask
+key from the WG key pair, hides the WG packet header and length inside a small
+authenticated wrapper, and adds random padding. The padding profile can also
+pin handshake/response padding, send authenticated junk frames before real
+packets, and add small send jitter. It is useful for packet-shape experiments,
+but it is not a censorship-resistance guarantee.
 
 ## Tcpdump Events
 
