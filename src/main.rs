@@ -324,10 +324,10 @@ async fn main() -> Result<()> {
                 (Commands::Cert(args), "cert") => {
                     config::apply_cert(args, &file_config, sub_matches, &base_dir);
                 }
-                (Commands::Tui(args), "tui") => {
-                    if should_override(sub_matches, "attach") && args.attach.is_none() {
-                        args.attach = cli.telemetry_sock.clone();
-                    }
+                (Commands::Tui(args), "tui")
+                    if should_override(sub_matches, "attach") && args.attach.is_none() =>
+                {
+                    args.attach = cli.telemetry_sock.clone();
                 }
                 (Commands::Stop(_), "stop")
                 | (Commands::Reload(_), "reload")

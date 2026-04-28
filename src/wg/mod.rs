@@ -336,10 +336,6 @@ pub(crate) fn select_device_name(requested_device: &str) -> Result<String> {
 
 pub(crate) fn create_device_handle(requested_device: &str) -> Result<(DeviceHandle, String)> {
     let requested_device = select_device_name(requested_device)?;
-    #[cfg(not(target_os = "macos"))]
-    let requested_device = requested_device;
-    #[cfg(target_os = "macos")]
-    let requested_device = requested_device;
     let config = DeviceConfig::default();
 
     let handle = DeviceHandle::new(&requested_device, config)
@@ -387,7 +383,7 @@ pub(crate) async fn wait_for_shutdown_signal() -> Result<()> {
             }
             _ = terminate.recv() => {}
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]

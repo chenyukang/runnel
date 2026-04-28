@@ -52,7 +52,7 @@ pub fn maybe_activate(args: &ClientArgs) -> Result<Option<SystemProxyGuard>> {
 
     #[cfg(target_os = "macos")]
     {
-        return SystemProxyGuard::activate(args).map(Some);
+        SystemProxyGuard::activate(args).map(Some)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -69,7 +69,7 @@ pub fn maybe_activate_tun_dns(servers: &[String]) -> Result<Option<SystemDnsGuar
 
     #[cfg(target_os = "macos")]
     {
-        return SystemDnsGuard::activate(servers).map(Some);
+        SystemDnsGuard::activate(servers).map(Some)
     }
 
     #[cfg(not(target_os = "macos"))]

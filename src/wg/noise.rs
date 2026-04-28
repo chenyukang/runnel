@@ -193,6 +193,7 @@ fn open_tun_device(requested_device: &str) -> Result<(AsyncFd<TunSocket>, String
     Ok((tun, actual_device))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_noise_loop(
     role: &'static str,
     tun: AsyncFd<TunSocket>,
@@ -252,6 +253,7 @@ async fn run_noise_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn flush_queued_packets(
     role: &'static str,
     tunnel: &mut Tunn,
@@ -305,6 +307,7 @@ async fn read_tun_packet(tun: &AsyncFd<TunSocket>, dst: &mut [u8]) -> Result<usi
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_noise_action(
     role: &'static str,
     tun: &AsyncFd<TunSocket>,
@@ -565,7 +568,7 @@ impl NoisePacketCodec {
         let masked_pad_len =
             u16::from_be_bytes(packet[MASK_NONCE_LEN + MASK_LEN_LEN..MASK_HEADER_LEN].try_into()?);
         let pad_len = (masked_pad_len ^ u16::from_be_bytes(header_mask[4..6].try_into()?)) as usize;
-        let body_len = payload_len.checked_add(pad_len).unwrap_or(usize::MAX);
+        let body_len = payload_len.saturating_add(pad_len);
         let Some(tag_start) = MASK_HEADER_LEN.checked_add(body_len) else {
             return Ok(None);
         };
@@ -591,10 +594,9 @@ impl NoisePacketCodec {
     }
 
     fn random_padding_len(&self, packet: Option<&[u8]>, out: &[u8]) -> usize {
-        let available = out
-            .len()
-            .checked_sub(MASK_HEADER_LEN + MASK_TAG_LEN + packet.map_or(0, |packet| packet.len()))
-            .unwrap_or_default();
+        let available = out.len().saturating_sub(
+            MASK_HEADER_LEN + MASK_TAG_LEN + packet.map_or(0, |packet| packet.len()),
+        );
         let configured = packet
             .and_then(|packet| match wireguard_message_type(packet) {
                 Some(1) => self.profile.handshake_padding,

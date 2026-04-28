@@ -833,7 +833,7 @@ fn render_wave(
     );
 }
 
-fn rotate_history(history: &mut Vec<u64>) {
+fn rotate_history(history: &mut [u64]) {
     history.rotate_left(1);
     if let Some(last) = history.last_mut() {
         *last = 0;
@@ -966,12 +966,8 @@ fn link_from_target(target: &str) -> String {
     }
 }
 
-fn recent_targets_title(context: &DashboardContext) -> &'static str {
-    if recent_targets_are_domain_events(context) {
-        "Recent Domains"
-    } else {
-        "Recent Domains"
-    }
+fn recent_targets_title(_context: &DashboardContext) -> &'static str {
+    "Recent Domains"
 }
 
 fn recent_targets_activity_header(context: &DashboardContext) -> &'static str {
@@ -1143,7 +1139,7 @@ fn sample_thread_count(pid: u32) -> Option<usize> {
             .lines()
             .filter(|line| !line.trim().is_empty())
             .count();
-        return Some(count.max(1));
+        Some(count.max(1))
     }
 
     #[cfg(target_os = "linux")]
@@ -1155,10 +1151,10 @@ fn sample_thread_count(pid: u32) -> Option<usize> {
         if !output.status.success() {
             return None;
         }
-        return String::from_utf8_lossy(&output.stdout)
+        String::from_utf8_lossy(&output.stdout)
             .trim()
             .parse::<usize>()
-            .ok();
+            .ok()
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

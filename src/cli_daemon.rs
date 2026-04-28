@@ -747,11 +747,12 @@ pub(super) fn reload_start_args(
     role: ServiceRole,
     log_file: &Path,
 ) -> Vec<OsString> {
-    let mut args = Vec::new();
-    args.push("--log".into());
-    args.push(cli.log.clone().into());
-    args.push("--log-file".into());
-    args.push(log_file.as_os_str().to_owned());
+    let mut args: Vec<OsString> = vec![
+        "--log".into(),
+        cli.log.clone().into(),
+        "--log-file".into(),
+        log_file.as_os_str().to_owned(),
+    ];
     if let Some(path) = &cli.telemetry_sock {
         args.push("--telemetry-sock".into());
         args.push(path.as_os_str().to_owned());

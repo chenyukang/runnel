@@ -670,7 +670,7 @@ fn default_up_hooks(context: &CommandContext) -> Result<Vec<String>> {
                     )
                 }),
         );
-        return Ok(hooks);
+        Ok(hooks)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -691,7 +691,7 @@ fn default_down_hooks(context: &CommandContext) -> Result<Vec<String>> {
             .collect();
         hooks.push("route -q -n delete -host {server_ip} >/dev/null 2>&1 || true".to_owned());
         hooks.push("ifconfig {device} down >/dev/null 2>&1 || true".to_owned());
-        return Ok(hooks);
+        Ok(hooks)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -850,7 +850,7 @@ async fn resolve_device_name(requested: &str) -> Result<String> {
 
     #[cfg(target_os = "macos")]
     {
-        return pick_available_macos_utun().await;
+        pick_available_macos_utun().await
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -960,7 +960,7 @@ async fn detect_egress_route(server_ip: &str) -> Result<(Option<String>, Option<
                 return Ok(default_route);
             }
         }
-        return Ok(route);
+        Ok(route)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1037,7 +1037,7 @@ fn activate_tun_dns_override(
                 "redirected macOS system DNS into the tun session"
             );
         }
-        return Ok(guard);
+        Ok(guard)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1360,7 +1360,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
             }
             _ = terminate.recv() => {}
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]

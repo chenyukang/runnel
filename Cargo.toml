@@ -1,6 +1,6 @@
 [package]
 name = "runnel-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A Rust proxy and tunnel toolbox with WireGuard-style, TUN, SOCKS, and TLS-based transports."

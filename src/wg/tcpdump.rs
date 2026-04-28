@@ -228,10 +228,10 @@ fn parse_udp_length(line: &str) -> Option<u64> {
 }
 
 fn parse_direction(tokens: &[&str]) -> Option<&'static str> {
-    if tokens.iter().any(|token| *token == "In") {
+    if tokens.contains(&"In") {
         return Some("in");
     }
-    if tokens.iter().any(|token| *token == "Out") {
+    if tokens.contains(&"Out") {
         return Some("out");
     }
     None

@@ -95,6 +95,7 @@ pub struct RecentTargetSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 enum WireMessage {
     Snapshot(DashboardSnapshot),
     Event(TraceEvent),
@@ -727,7 +728,7 @@ fn age_millis(instant: Instant) -> u64 {
     instant.elapsed().as_millis() as u64
 }
 
-fn rotate_history(history: &mut Vec<u64>) {
+fn rotate_history(history: &mut [u64]) {
     history.rotate_left(1);
     if let Some(last) = history.last_mut() {
         *last = 0;

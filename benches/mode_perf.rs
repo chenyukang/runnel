@@ -918,7 +918,7 @@ fn selected_wg_profiles() -> Result<Vec<WgBenchProfile>> {
         .map(str::trim)
         .filter(|profile| !profile.is_empty())
         .collect();
-    if selected.is_empty() || selected.iter().any(|profile| *profile == "all") {
+    if selected.is_empty() || selected.contains(&"all") {
         return Ok(vec![
             WG_DEVICE_PROFILE,
             WG_NOISE_PROFILE,

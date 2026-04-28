@@ -75,6 +75,7 @@ pub(crate) async fn handle_native_http_udp_associate(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_udp_association(
     relay: Arc<UdpSocket>,
     client_addr: Arc<Mutex<Option<SocketAddr>>>,
@@ -241,6 +242,7 @@ async fn create_direct_udp_session(
     Ok(tx)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_remote_udp_session(
     target: TargetAddr,
     relay: Arc<UdpSocket>,
@@ -313,6 +315,7 @@ async fn create_remote_udp_session(
     Ok(tx)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_remote_tcp_dns_session(
     response_target: TargetAddr,
     upstream_target: TargetAddr,

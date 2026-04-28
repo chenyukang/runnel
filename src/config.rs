@@ -200,7 +200,7 @@ fn reject_deprecated_wg_sections(config: &Value, path: &Path) -> Result<()> {
         ("wg_client", "client.wg with client.mode: wg"),
         ("wg_server", "server.wg with server.mode: wg"),
     ] {
-        if mapping.contains_key(&Value::String(key.to_owned())) {
+        if mapping.contains_key(Value::String(key.to_owned())) {
             bail!(
                 "{} uses deprecated top-level `{}`; move it under `{}`",
                 path.display(),
@@ -213,6 +213,7 @@ fn reject_deprecated_wg_sections(config: &Value, path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn apply_globals(
     log: &mut String,
     log_file: &mut PathBuf,

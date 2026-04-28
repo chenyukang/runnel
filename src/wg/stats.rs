@@ -12,7 +12,7 @@ use super::{
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) fn start_stats_poller(role: &'static str, socket_path: PathBuf) {
-    let _ = tokio::spawn(async move {
+    std::mem::drop(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(STATS_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut previous = None;
@@ -45,7 +45,7 @@ pub(crate) fn start_stats_poller(role: &'static str, socket_path: PathBuf) {
                 }
             }
         }
-    });
+    }));
 }
 
 pub(crate) fn start_unhandshaken_peer_refresher(
@@ -58,7 +58,7 @@ pub(crate) fn start_unhandshaken_peer_refresher(
         return;
     }
 
-    let _ = tokio::spawn(async move {
+    std::mem::drop(tokio::spawn(async move {
         let start = tokio::time::Instant::now() + interval;
         let mut ticker = tokio::time::interval_at(start, interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -128,7 +128,7 @@ pub(crate) fn start_unhandshaken_peer_refresher(
                 }
             }
         }
-    });
+    }));
 }
 
 fn traffic_delta(previous: Option<WgDeviceStats>, current: WgDeviceStats) -> Option<(u64, u64)> {

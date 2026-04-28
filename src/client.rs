@@ -345,7 +345,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
             }
             _ = terminate.recv() => {}
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]
