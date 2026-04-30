@@ -220,6 +220,21 @@ async fn run_noise_loop(
     let shutdown = wait_for_shutdown_signal();
     tokio::pin!(shutdown);
 
+    if let Some(endpoint) = peer.endpoint() {
+        let action = noise_action(tunnel.format_handshake_initiation(&mut out_packet, false));
+        apply_noise_action(
+            role,
+            &tun,
+            &socket,
+            &codec,
+            &mut encoded_packet,
+            Some(endpoint),
+            action,
+            &mut traffic,
+        )
+        .await?;
+    }
+
     loop {
         tokio::select! {
             result = &mut shutdown => return result,
@@ -369,24 +384,34 @@ async fn send_network_packet(
             let encoded_len = codec.encode_junk(encoded_packet)?;
             if encoded_len > 0 {
                 maybe_obfs_jitter(codec).await;
-                socket
-                    .send_to(&encoded_packet[..encoded_len], endpoint)
-                    .await
-                    .with_context(|| {
-                        format!("failed to send wg noise junk packet to {endpoint}")
-                    })?;
-                traffic.uploaded += encoded_len as u64;
+                if !send_udp_packet(
+                    role,
+                    socket,
+                    endpoint,
+                    &encoded_packet[..encoded_len],
+                    traffic,
+                )
+                .await
+                {
+                    return Ok(());
+                }
             }
         }
     }
 
     let encoded_len = codec.encode(packet, encoded_packet)?;
     maybe_obfs_jitter(codec).await;
-    socket
-        .send_to(&encoded_packet[..encoded_len], endpoint)
-        .await
-        .with_context(|| format!("failed to send wg noise packet to {endpoint}"))?;
-    traffic.uploaded += encoded_len as u64;
+    if !send_udp_packet(
+        role,
+        socket,
+        endpoint,
+        &encoded_packet[..encoded_len],
+        traffic,
+    )
+    .await
+    {
+        return Ok(());
+    }
     debug!(
         role,
         bytes = encoded_len,
@@ -394,6 +419,30 @@ async fn send_network_packet(
         "wg noise packet sent"
     );
     Ok(())
+}
+
+async fn send_udp_packet(
+    role: &'static str,
+    socket: &UdpSocket,
+    endpoint: SocketAddr,
+    packet: &[u8],
+    traffic: &mut TrafficCounters,
+) -> bool {
+    match socket.send_to(packet, endpoint).await {
+        Ok(sent) => {
+            traffic.uploaded += sent as u64;
+            true
+        }
+        Err(error) => {
+            warn!(
+                role,
+                endpoint = %endpoint,
+                error = %error,
+                "wg noise UDP send failed"
+            );
+            false
+        }
+    }
 }
 
 async fn maybe_obfs_jitter(codec: &NoisePacketCodec) {

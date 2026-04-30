@@ -51,6 +51,10 @@ sudo runnel --config runnel.yaml client --tui
 With no `--log-file`, these write to `/var/log/runnel/server.log` and
 `/var/log/runnel/client.log`.
 
+Log timestamps default to UTC. Use `--log-timezone Asia/Shanghai`, environment
+variable `RUNNEL_LOG_TIMEZONE=+08:00`, or YAML `log_timezone: +08:00` when you
+want local Beijing-time logs.
+
 Check the tunnel:
 
 ```bash
@@ -68,6 +72,9 @@ client:
   adblock:
     enabled: false
 ```
+
+Adblock filter lists load in the background so tunnel startup is not delayed by
+subscription downloads.
 
 Domain rules and IP rules:
 

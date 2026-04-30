@@ -684,6 +684,7 @@ pub(super) async fn reload_daemon_process(
         } else {
             cli.log_file.clone()
         };
+        check_reloaded_daemon_config(cli, config_path.as_deref(), role, &log_file)?;
         stop_daemon_process(
             &log_file,
             cli.pid_file.clone(),
@@ -741,17 +742,58 @@ fn start_reloaded_daemon(
     Ok(())
 }
 
+fn check_reloaded_daemon_config(
+    cli: &Cli,
+    config_path: Option<&Path>,
+    role: ServiceRole,
+    log_file: &Path,
+) -> Result<()> {
+    let executable = std::env::current_exe().context("failed to locate current executable")?;
+    let args = reload_check_args(cli, config_path, role, log_file);
+    let status = Command::new(executable)
+        .args(&args)
+        .status()
+        .context("failed to check reloaded daemon configuration")?;
+    if !status.success() {
+        anyhow::bail!(
+            "reloaded daemon configuration check exited with {status}; old daemon was not stopped"
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn reload_start_args(
     cli: &Cli,
     config_path: Option<&Path>,
     role: ServiceRole,
     log_file: &Path,
 ) -> Vec<OsString> {
+    let mut args = reload_base_args(cli, config_path, log_file);
+    args.push("--daemon".into());
+    args.push(role.as_str().into());
+    args
+}
+
+fn reload_check_args(
+    cli: &Cli,
+    config_path: Option<&Path>,
+    role: ServiceRole,
+    log_file: &Path,
+) -> Vec<OsString> {
+    let mut args = reload_base_args(cli, config_path, log_file);
+    args.push("--check-config-only".into());
+    args.push(role.as_str().into());
+    args
+}
+
+fn reload_base_args(cli: &Cli, config_path: Option<&Path>, log_file: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "--log".into(),
         cli.log.clone().into(),
         "--log-file".into(),
         log_file.as_os_str().to_owned(),
+        "--log-timezone".into(),
+        cli.log_timezone.clone().into(),
     ];
     if let Some(path) = &cli.telemetry_sock {
         args.push("--telemetry-sock".into());
@@ -765,8 +807,6 @@ pub(super) fn reload_start_args(
         args.push("--config".into());
         args.push(path.as_os_str().to_owned());
     }
-    args.push("--daemon".into());
-    args.push(role.as_str().into());
     args
 }
 

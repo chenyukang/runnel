@@ -14,13 +14,14 @@ use adblock::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 
 use super::socks5::TargetAddr;
 
 const DEFAULT_UPDATE_INTERVAL_HOURS: u64 = 24;
 const DEFAULT_DECISION_CACHE_TTL_SECS: u64 = 300;
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -68,7 +69,7 @@ impl AdblockConfig {
 }
 
 pub struct Adblocker {
-    engine: Engine,
+    engine: RwLock<Option<Engine>>,
     cache: Mutex<HashMap<String, CachedDecision>>,
     cache_ttl: Duration,
 }
@@ -85,40 +86,17 @@ impl Adblocker {
             return Ok(None);
         }
 
-        let mut filter_set = FilterSet::new(false);
-        let mut loaded = 0usize;
-        for source in &config.lists {
-            match load_list_source(source, config).await {
-                Ok(Some(content)) => {
-                    filter_set.add_filter_list(
-                        &content,
-                        ParseOptions {
-                            rule_types: RuleTypes::NetworkOnly,
-                            ..ParseOptions::default()
-                        },
-                    );
-                    loaded += 1;
-                }
-                Ok(None) => {}
-                Err(err) if config.fail_open => {
-                    warn!(source = %source, error = %err, "adblock list skipped");
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        if loaded == 0 {
-            warn!("adblock is enabled but no filter lists were loaded; continuing without adblock");
-            return Ok(None);
-        }
-
-        let engine = Engine::from_filter_set(filter_set, true);
-        info!(lists = loaded, "adblock engine loaded");
-        Ok(Some(Arc::new(Self {
-            engine,
+        let adblocker = Arc::new(Self {
+            engine: RwLock::new(None),
             cache: Mutex::new(HashMap::new()),
             cache_ttl: Duration::from_secs(config.decision_cache_ttl_secs),
-        })))
+        });
+        spawn_loader(adblocker.clone(), config.clone());
+        info!(
+            lists = config.lists.len(),
+            "adblock engine loading in background"
+        );
+        Ok(Some(adblocker))
     }
 
     pub async fn blocks_target(&self, target: &TargetAddr) -> bool {
@@ -151,7 +129,9 @@ impl Adblocker {
             return cached.blocked;
         }
 
-        let blocked = self.check_domain(&domain, scheme);
+        let Some(blocked) = self.check_domain(&domain, scheme).await else {
+            return false;
+        };
         self.cache.lock().await.insert(
             cache_key,
             CachedDecision {
@@ -162,11 +142,13 @@ impl Adblocker {
         blocked
     }
 
-    fn check_domain(&self, domain: &str, scheme: &str) -> bool {
+    async fn check_domain(&self, domain: &str, scheme: &str) -> Option<bool> {
+        let engine = self.engine.read().await;
+        let engine = engine.as_ref()?;
         let url = format!("{scheme}://{domain}/");
         let request = Request::preparsed(&url, domain, "", "other", true);
-        let result = self.engine.check_network_request(&request);
-        result.matched && result.exception.is_none()
+        let result = engine.check_network_request(&request);
+        Some(result.matched && result.exception.is_none())
     }
 
     #[cfg(test)]
@@ -180,11 +162,71 @@ impl Adblocker {
             },
         );
         Arc::new(Self {
-            engine: Engine::from_filter_set(filter_set, true),
+            engine: RwLock::new(Some(Engine::from_filter_set(filter_set, true))),
             cache: Mutex::new(HashMap::new()),
             cache_ttl: Duration::from_secs(DEFAULT_DECISION_CACHE_TTL_SECS),
         })
     }
+}
+
+fn spawn_loader(adblocker: Arc<Adblocker>, config: AdblockConfig) {
+    drop(tokio::spawn(async move {
+        match load_filter_engine(&config).await {
+            Ok(Some((engine, loaded))) => {
+                *adblocker.engine.write().await = Some(engine);
+                adblocker.cache.lock().await.clear();
+                info!(lists = loaded, "adblock engine loaded");
+            }
+            Ok(None) => {
+                warn!(
+                    "adblock is enabled but no filter lists were loaded; continuing without adblock"
+                );
+            }
+            Err(err) => {
+                warn!(error = %err, "adblock engine failed to load in background");
+            }
+        }
+    }));
+}
+
+async fn load_filter_engine(config: &AdblockConfig) -> Result<Option<(Engine, usize)>> {
+    let mut contents = Vec::new();
+    for source in &config.lists {
+        match load_list_source(source, config).await {
+            Ok(Some(content)) => {
+                contents.push(content);
+            }
+            Ok(None) => {}
+            Err(err) if config.fail_open => {
+                warn!(source = %source, error = %err, "adblock list skipped");
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    let loaded = contents.len();
+    if loaded == 0 {
+        return Ok(None);
+    }
+
+    let engine = tokio::task::spawn_blocking(move || build_filter_engine(contents))
+        .await
+        .context("adblock engine build task failed")?;
+    Ok(Some((engine, loaded)))
+}
+
+fn build_filter_engine(contents: Vec<String>) -> Engine {
+    let mut filter_set = FilterSet::new(false);
+    for content in contents {
+        filter_set.add_filter_list(
+            &content,
+            ParseOptions {
+                rule_types: RuleTypes::NetworkOnly,
+                ..ParseOptions::default()
+            },
+        );
+    }
+    Engine::from_filter_set(filter_set, true)
 }
 
 async fn load_list_source(source: &str, config: &AdblockConfig) -> Result<Option<String>> {
@@ -257,7 +299,13 @@ async fn load_url_list(source: &str, config: &AdblockConfig) -> Result<Option<St
 }
 
 async fn download_list(source: &str) -> Result<String> {
-    let response = reqwest::get(source)
+    let client = reqwest::Client::builder()
+        .timeout(DOWNLOAD_TIMEOUT)
+        .build()
+        .context("failed to build adblock list HTTP client")?;
+    let response = client
+        .get(source)
+        .send()
         .await
         .with_context(|| format!("failed to download adblock list {source}"))?
         .error_for_status()
@@ -350,6 +398,58 @@ mod tests {
         assert!(adblock.blocks_domain("ads.example").await);
         assert!(adblock.blocks_domain("cdn.ads.example").await);
         assert!(!adblock.blocks_domain("example.com").await);
+    }
+
+    #[tokio::test]
+    async fn from_config_starts_before_lists_are_loaded() {
+        let suffix = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config = AdblockConfig {
+            lists: vec![
+                std::env::temp_dir()
+                    .join(format!("missing-runnel-adblock-{suffix}.txt"))
+                    .display()
+                    .to_string(),
+            ],
+            fail_open: false,
+            ..AdblockConfig::default()
+        };
+
+        let adblock = Adblocker::from_config(&config).await.unwrap().unwrap();
+
+        assert!(!adblock.blocks_domain("ads.example").await);
+    }
+
+    #[tokio::test]
+    async fn from_config_loads_lists_in_background() {
+        let suffix = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "runnel-adblock-background-{}-{suffix}.txt",
+            std::process::id()
+        ));
+        tokio::fs::write(&path, "||ads.example^\n").await.unwrap();
+        let config = AdblockConfig {
+            lists: vec![path.display().to_string()],
+            ..AdblockConfig::default()
+        };
+
+        let adblock = Adblocker::from_config(&config).await.unwrap().unwrap();
+        let mut loaded = false;
+        for _ in 0..20 {
+            if adblock.blocks_domain("ads.example").await {
+                loaded = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let _ = tokio::fs::remove_file(path).await;
+        assert!(loaded);
     }
 
     #[test]

@@ -316,6 +316,10 @@ If `--log-file` is omitted, service commands use role-specific log files under
 `/var/log/runnel/server.log`. Explicit `--log-file` and YAML `log_file` values
 still take precedence.
 
+Log timestamps default to UTC. Set `--log-timezone local`,
+`RUNNEL_LOG_TIMEZONE=+08:00`, or YAML `log_timezone: Asia/Shanghai` to write
+timestamps in a preferred timezone.
+
 Daemon mode is supported for `client`, `server`, and `tun`. If `--tui` is also
 set, daemon mode disables the inline TUI.
 

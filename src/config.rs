@@ -27,6 +27,7 @@ use crate::{
 pub struct FileConfig {
     pub log: Option<String>,
     pub log_file: Option<PathBuf>,
+    pub log_timezone: Option<String>,
     pub telemetry_sock: Option<PathBuf>,
     pub pid_file: Option<PathBuf>,
     pub tui: Option<bool>,
@@ -37,6 +38,31 @@ pub struct FileConfig {
     pub server: Option<ServerConfig>,
     pub tun: Option<TunConfig>,
     pub cert: Option<CertConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct GlobalConfig {
+    pub log: Option<String>,
+    pub log_file: Option<PathBuf>,
+    pub log_timezone: Option<String>,
+    pub telemetry_sock: Option<PathBuf>,
+    pub pid_file: Option<PathBuf>,
+    pub tui: Option<bool>,
+    pub daemon: Option<bool>,
+}
+
+impl From<&FileConfig> for GlobalConfig {
+    fn from(config: &FileConfig) -> Self {
+        Self {
+            log: config.log.clone(),
+            log_file: config.log_file.clone(),
+            log_timezone: config.log_timezone.clone(),
+            telemetry_sock: config.telemetry_sock.clone(),
+            pid_file: config.pid_file.clone(),
+            tui: config.tui,
+            daemon: config.daemon,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -170,6 +196,21 @@ pub struct WgServerConfig {
 }
 
 pub fn load(path: &Path) -> Result<(FileConfig, PathBuf)> {
+    let (raw_config, absolute, base_dir) = load_raw(path)?;
+    reject_deprecated_wg_sections(&raw_config, &absolute)?;
+    let config: FileConfig = serde_yaml::from_value(raw_config)
+        .with_context(|| format!("failed to parse {}", absolute.display()))?;
+    Ok((config, base_dir))
+}
+
+pub fn load_globals(path: &Path) -> Result<(GlobalConfig, PathBuf)> {
+    let (raw_config, absolute, base_dir) = load_raw(path)?;
+    let config: GlobalConfig = serde_yaml::from_value(raw_config)
+        .with_context(|| format!("failed to parse global options in {}", absolute.display()))?;
+    Ok((config, base_dir))
+}
+
+fn load_raw(path: &Path) -> Result<(Value, PathBuf, PathBuf)> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -181,14 +222,11 @@ pub fn load(path: &Path) -> Result<(FileConfig, PathBuf)> {
         .with_context(|| format!("failed to read {}", absolute.display()))?;
     let raw_config: Value = serde_yaml::from_str(&contents)
         .with_context(|| format!("failed to parse {}", absolute.display()))?;
-    reject_deprecated_wg_sections(&raw_config, &absolute)?;
-    let config: FileConfig = serde_yaml::from_value(raw_config)
-        .with_context(|| format!("failed to parse {}", absolute.display()))?;
     let base_dir = absolute
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    Ok((config, base_dir))
+    Ok((raw_config, absolute, base_dir))
 }
 
 fn reject_deprecated_wg_sections(config: &Value, path: &Path) -> Result<()> {
@@ -217,11 +255,40 @@ fn reject_deprecated_wg_sections(config: &Value, path: &Path) -> Result<()> {
 pub fn apply_globals(
     log: &mut String,
     log_file: &mut PathBuf,
+    log_timezone: &mut String,
     telemetry_sock: &mut Option<PathBuf>,
     pid_file: &mut Option<PathBuf>,
     tui: &mut bool,
     daemon: &mut bool,
     config: &FileConfig,
+    matches: &ArgMatches,
+    base_dir: &Path,
+) {
+    let config = GlobalConfig::from(config);
+    apply_global_config(
+        log,
+        log_file,
+        log_timezone,
+        telemetry_sock,
+        pid_file,
+        tui,
+        daemon,
+        &config,
+        matches,
+        base_dir,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_global_config(
+    log: &mut String,
+    log_file: &mut PathBuf,
+    log_timezone: &mut String,
+    telemetry_sock: &mut Option<PathBuf>,
+    pid_file: &mut Option<PathBuf>,
+    tui: &mut bool,
+    daemon: &mut bool,
+    config: &GlobalConfig,
     matches: &ArgMatches,
     base_dir: &Path,
 ) {
@@ -231,6 +298,11 @@ pub fn apply_globals(
             *log_file = resolve_path(base_dir, path);
         }
     }
+    maybe_assign(
+        log_timezone,
+        &config.log_timezone,
+        should_override(matches, "log_timezone"),
+    );
     if should_override(matches, "telemetry_sock") {
         if let Some(path) = &config.telemetry_sock {
             *telemetry_sock = Some(resolve_path(base_dir, path));
@@ -1058,7 +1130,7 @@ fn resolve_path(base_dir: &Path, path: &Path) -> PathBuf {
 mod tests {
     use super::{
         ClientConfig, FileConfig, ServerConfig, WgServerConfig, apply_adblock_to_wg,
-        apply_common_route_rules_to_wg, load, maybe_assign_optional, resolve_path,
+        apply_common_route_rules_to_wg, load, load_globals, maybe_assign_optional, resolve_path,
         validate_active_client_credentials, validate_active_server_credentials,
         validate_wg_client_pair,
     };
@@ -1084,6 +1156,7 @@ mod tests {
     fn yaml_parse_smoke() {
         let raw = r#"
 log: debug
+log_timezone: Asia/Shanghai
 telemetry_sock: run/runnel.sock
 pid_file: run/runnel.pid
 tui: true
@@ -1171,6 +1244,7 @@ server:
 "#;
         let parsed: FileConfig = serde_yaml::from_str(raw).unwrap();
         assert_eq!(parsed.log.as_deref(), Some("debug"));
+        assert_eq!(parsed.log_timezone.as_deref(), Some("Asia/Shanghai"));
         assert_eq!(
             parsed.telemetry_sock.as_deref(),
             Some(Path::new("run/runnel.sock"))
@@ -1456,6 +1530,40 @@ telemetry-sock: /tmp/runnel.sock
             "{message}"
         );
         assert!(message.contains("telemetry_sock"), "{message}");
+    }
+
+    #[test]
+    fn load_globals_ignores_unknown_fields_for_management_commands() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "runnel-global-config-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        fs::write(
+            &path,
+            r#"
+log: debug
+log_file: logs/client.log
+log_timezone: Asia/Shanghai
+future_option: true
+client:
+  future_client_option: true
+"#,
+        )
+        .unwrap();
+
+        let (config, base_dir) = load_globals(&path).unwrap();
+
+        assert_eq!(base_dir, dir);
+        assert_eq!(config.log.as_deref(), Some("debug"));
+        assert_eq!(config.log_file, Some(PathBuf::from("logs/client.log")));
+        assert_eq!(config.log_timezone.as_deref(), Some("Asia/Shanghai"));
+        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]

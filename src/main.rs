@@ -19,8 +19,9 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use tracing::error;
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{EnvFilter, fmt, fmt::time::FormatTime, prelude::*};
 
 const DAEMON_ENV: &str = "RUNNEL_DAEMONIZED";
 const DAEMON_STARTUP_CHECK: Duration = Duration::from_millis(1200);
@@ -45,6 +46,14 @@ struct Cli {
         help = "Write logs to this file; service commands default to /var/log/runnel/<role>.log"
     )]
     log_file: PathBuf,
+    #[arg(
+        long,
+        global = true,
+        env = "RUNNEL_LOG_TIMEZONE",
+        default_value = "utc",
+        help = "Timezone for log timestamps: utc, local, +08:00, or Asia/Shanghai"
+    )]
+    log_timezone: String,
     #[arg(long, global = true)]
     telemetry_sock: Option<PathBuf>,
     #[arg(long, global = true)]
@@ -53,6 +62,8 @@ struct Cli {
     tui: bool,
     #[arg(long, global = true)]
     daemon: bool,
+    #[arg(long, global = true, hide = true)]
+    check_config_only: bool,
     #[arg(long, global = true, env = "RUNNEL_CONFIG")]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -290,49 +301,65 @@ async fn main() -> Result<()> {
     let mut log_file_from_config = false;
     let config_path = cli.config.clone().or_else(discover_default_config_path);
     if let Some(config_path) = &config_path {
-        let (file_config, base_dir) = config::load(config_path)?;
-        log_file_from_config = !log_file_from_cli_or_env && file_config.log_file.is_some();
-        config::apply_globals(
-            &mut cli.log,
-            &mut cli.log_file,
-            &mut cli.telemetry_sock,
-            &mut cli.pid_file,
-            &mut cli.tui,
-            &mut cli.daemon,
-            &file_config,
-            &matches,
-            &base_dir,
-        );
-        if let Some((name, sub_matches)) = matches.subcommand() {
-            match (&mut cli.command, name) {
-                (Commands::Client(args), "client") => {
-                    config::apply_client(args, &file_config, sub_matches, &base_dir)?;
+        if command_requires_strict_config(&cli.command) {
+            let (file_config, base_dir) = config::load(config_path)?;
+            log_file_from_config = !log_file_from_cli_or_env && file_config.log_file.is_some();
+            config::apply_globals(
+                &mut cli.log,
+                &mut cli.log_file,
+                &mut cli.log_timezone,
+                &mut cli.telemetry_sock,
+                &mut cli.pid_file,
+                &mut cli.tui,
+                &mut cli.daemon,
+                &file_config,
+                &matches,
+                &base_dir,
+            );
+            if let Some((name, sub_matches)) = matches.subcommand() {
+                match (&mut cli.command, name) {
+                    (Commands::Client(args), "client") => {
+                        config::apply_client(args, &file_config, sub_matches, &base_dir)?;
+                    }
+                    (Commands::Server(args), "server") => {
+                        config::apply_server(args, &file_config, sub_matches, &base_dir)?;
+                    }
+                    (Commands::Tun(args), "tun") => {
+                        config::apply_tun(args, &file_config, sub_matches, &base_dir)?;
+                    }
+                    (Commands::WgClient(args), "wg-client") => {
+                        config::apply_wg_client(args, &file_config, sub_matches, &base_dir)?;
+                    }
+                    (Commands::WgServer(args), "wg-server") => {
+                        config::apply_wg_server(args, &file_config, sub_matches, &base_dir)?;
+                    }
+                    (Commands::Cert(args), "cert") => {
+                        config::apply_cert(args, &file_config, sub_matches, &base_dir);
+                    }
+                    _ => {}
                 }
-                (Commands::Server(args), "server") => {
-                    config::apply_server(args, &file_config, sub_matches, &base_dir)?;
-                }
-                (Commands::Tun(args), "tun") => {
-                    config::apply_tun(args, &file_config, sub_matches, &base_dir)?;
-                }
-                (Commands::WgClient(args), "wg-client") => {
-                    config::apply_wg_client(args, &file_config, sub_matches, &base_dir)?;
-                }
-                (Commands::WgServer(args), "wg-server") => {
-                    config::apply_wg_server(args, &file_config, sub_matches, &base_dir)?;
-                }
-                (Commands::WgConfig(_), "wg-config") | (Commands::WgKeygen(_), "wg-keygen") => {}
-                (Commands::Cert(args), "cert") => {
-                    config::apply_cert(args, &file_config, sub_matches, &base_dir);
-                }
-                (Commands::Tui(args), "tui")
-                    if should_override(sub_matches, "attach") && args.attach.is_none() =>
-                {
-                    args.attach = cli.telemetry_sock.clone();
-                }
-                (Commands::Stop(_), "stop")
-                | (Commands::Reload(_), "reload")
-                | (Commands::Status(_), "status") => {}
-                _ => {}
+            }
+        } else {
+            let (global_config, base_dir) = config::load_globals(config_path)?;
+            log_file_from_config = !log_file_from_cli_or_env && global_config.log_file.is_some();
+            config::apply_global_config(
+                &mut cli.log,
+                &mut cli.log_file,
+                &mut cli.log_timezone,
+                &mut cli.telemetry_sock,
+                &mut cli.pid_file,
+                &mut cli.tui,
+                &mut cli.daemon,
+                &global_config,
+                &matches,
+                &base_dir,
+            );
+            if let Some(("tui", sub_matches)) = matches.subcommand()
+                && let Commands::Tui(args) = &mut cli.command
+                && should_override(sub_matches, "attach")
+                && args.attach.is_none()
+            {
+                args.attach = cli.telemetry_sock.clone();
             }
         }
     }
@@ -342,6 +369,9 @@ async fn main() -> Result<()> {
         cli.log_file = default_log_file_for_command(&cli.command);
     }
     validate_daemon_mode(&cli)?;
+    if cli.check_config_only {
+        return Ok(());
+    }
     if should_spawn_daemon(&cli) {
         spawn_daemon_process(&cli)?;
         return Ok(());
@@ -379,7 +409,12 @@ async fn main() -> Result<()> {
         return result;
     }
     telemetry::init_channel(2048);
-    let observability = init_tracing(&cli.log, &cli.log_file, !cli.tui && !cli.daemon)?;
+    let observability = init_tracing(
+        &cli.log,
+        &cli.log_file,
+        &cli.log_timezone,
+        !cli.tui && !cli.daemon,
+    )?;
     tun::set_embedded_tui(cli.tui);
     let _pid_file = maybe_create_pid_file(&cli, &observability.log_file)?;
     if let Some(context) = monitor_context(&cli, observability.log_file.clone()) {
@@ -571,9 +606,132 @@ struct ObservabilityGuard {
     log_file: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LogTimer {
+    offset: UtcOffset,
+}
+
+impl FormatTime for LogTimer {
+    fn format_time(&self, writer: &mut fmt::format::Writer<'_>) -> std::fmt::Result {
+        let now = OffsetDateTime::now_utc().to_offset(self.offset);
+        let formatted = now.format(&Rfc3339).map_err(|_| std::fmt::Error)?;
+        writer.write_str(&formatted)
+    }
+}
+
+fn log_timer(timezone: &str) -> Result<LogTimer> {
+    Ok(LogTimer {
+        offset: parse_log_timezone(timezone)?,
+    })
+}
+
+fn parse_log_timezone(timezone: &str) -> Result<UtcOffset> {
+    let value = timezone.trim();
+    if value.is_empty() {
+        anyhow::bail!("log timezone cannot be empty");
+    }
+
+    let lower = value.to_ascii_lowercase();
+    match lower.as_str() {
+        "utc" | "z" | "gmt" => return Ok(UtcOffset::UTC),
+        "local" => {
+            return UtcOffset::current_local_offset().context(
+                "failed to determine local timezone offset; use a fixed offset like +08:00",
+            );
+        }
+        "asia/shanghai" | "shanghai" => return east_8_offset(),
+        _ => {}
+    }
+
+    let fixed = lower
+        .strip_prefix("utc")
+        .or_else(|| lower.strip_prefix("gmt"))
+        .unwrap_or(value);
+    parse_fixed_log_offset(fixed)
+}
+
+fn east_8_offset() -> Result<UtcOffset> {
+    UtcOffset::from_hms(8, 0, 0).context("failed to build +08:00 log timezone offset")
+}
+
+fn parse_fixed_log_offset(value: &str) -> Result<UtcOffset> {
+    let (sign, digits) = match value.as_bytes().first() {
+        Some(b'+') => (1_i8, &value[1..]),
+        Some(b'-') => (-1_i8, &value[1..]),
+        _ => anyhow::bail!(
+            "unsupported log timezone `{value}`; expected utc, local, +08:00, or Asia/Shanghai"
+        ),
+    };
+
+    let (hours, minutes, seconds) = if digits.contains(':') {
+        parse_colon_log_offset(digits, value)?
+    } else {
+        parse_compact_log_offset(digits, value)?
+    };
+
+    if hours > 23 || minutes > 59 || seconds > 59 {
+        anyhow::bail!("invalid log timezone `{value}`; offset must be within +/-23:59:59");
+    }
+
+    UtcOffset::from_hms(
+        sign * hours as i8,
+        sign * minutes as i8,
+        sign * seconds as i8,
+    )
+    .with_context(|| format!("invalid log timezone offset `{value}`"))
+}
+
+fn parse_colon_log_offset(value: &str, original: &str) -> Result<(u8, u8, u8)> {
+    let parts = value.split(':').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [hours, minutes] => Ok((
+            parse_log_offset_component(hours, "hours", original)?,
+            parse_log_offset_component(minutes, "minutes", original)?,
+            0,
+        )),
+        [hours, minutes, seconds] => Ok((
+            parse_log_offset_component(hours, "hours", original)?,
+            parse_log_offset_component(minutes, "minutes", original)?,
+            parse_log_offset_component(seconds, "seconds", original)?,
+        )),
+        _ => anyhow::bail!("invalid log timezone `{original}`; expected +HH:MM or +HH:MM:SS"),
+    }
+}
+
+fn parse_compact_log_offset(value: &str, original: &str) -> Result<(u8, u8, u8)> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        anyhow::bail!("invalid log timezone `{original}`; expected +HH, +HHMM, or +HHMMSS");
+    }
+
+    match value.len() {
+        1 | 2 => Ok((parse_log_offset_component(value, "hours", original)?, 0, 0)),
+        4 => Ok((
+            parse_log_offset_component(&value[..2], "hours", original)?,
+            parse_log_offset_component(&value[2..], "minutes", original)?,
+            0,
+        )),
+        6 => Ok((
+            parse_log_offset_component(&value[..2], "hours", original)?,
+            parse_log_offset_component(&value[2..4], "minutes", original)?,
+            parse_log_offset_component(&value[4..], "seconds", original)?,
+        )),
+        _ => anyhow::bail!("invalid log timezone `{original}`; expected +HH, +HHMM, or +HHMMSS"),
+    }
+}
+
+fn parse_log_offset_component(value: &str, label: &str, original: &str) -> Result<u8> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        anyhow::bail!("invalid {label} in log timezone `{original}`");
+    }
+    value
+        .parse::<u8>()
+        .with_context(|| format!("invalid {label} in log timezone `{original}`"))
+}
+
 fn init_tracing(
     default_filter: &str,
     log_file: &Path,
+    log_timezone: &str,
     mirror_to_stderr: bool,
 ) -> Result<ObservabilityGuard> {
     let log_file = absolute_path(log_file)?;
@@ -588,18 +746,12 @@ fn init_tracing(
     let filter_for_file = EnvFilter::new(filter_directives.clone());
     let filter_for_stderr = EnvFilter::new(filter_directives);
 
-    let directory = log_file
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let file_name = log_file
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("log file path must end with a file name")?;
-    let file_appender = tracing_appender::rolling::never(directory, file_name);
+    let file_appender = build_log_file_appender(&log_file)?;
     let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
+    let timer = log_timer(log_timezone)?;
 
     let file_layer = fmt::layer()
+        .with_timer(timer)
         .with_target(false)
         .with_ansi(false)
         .compact()
@@ -607,6 +759,7 @@ fn init_tracing(
         .with_filter(filter_for_file);
     let stderr_layer = mirror_to_stderr.then(|| {
         fmt::layer()
+            .with_timer(timer)
             .with_target(false)
             .compact()
             .with_writer(std::io::stderr)
@@ -624,6 +777,30 @@ fn init_tracing(
         _file_guard: file_guard,
         log_file,
     })
+}
+
+fn build_log_file_appender(
+    log_file: &Path,
+) -> Result<tracing_appender::rolling::RollingFileAppender> {
+    let directory = log_file
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let file_name = log_file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("log file path must end with a file name")?;
+
+    tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::NEVER)
+        .filename_prefix(file_name)
+        .build(&directory)
+        .with_context(|| {
+            format!(
+                "failed to open log file {}; run with sudo or set --log-file to a writable path",
+                log_file.display()
+            )
+        })
 }
 
 fn should_override(matches: &clap::ArgMatches, id: &str) -> bool {
@@ -653,11 +830,24 @@ fn run_utility_command(command: &Commands) -> Option<Result<()>> {
     }
 }
 
+fn command_requires_strict_config(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Server(_)
+            | Commands::Client(_)
+            | Commands::Tun(_)
+            | Commands::WgClient(_)
+            | Commands::WgServer(_)
+            | Commands::Cert(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, ReloadArgs, ServiceRole, StatusArgs, cli_daemon, cli_service,
-        default_config_paths_for, first_existing_config_path, read_file_tail, run_utility_command,
+        Cli, Commands, ReloadArgs, ServiceRole, StatusArgs, StopArgs, build_log_file_appender,
+        cli_daemon, cli_service, command_requires_strict_config, default_config_paths_for,
+        first_existing_config_path, parse_log_timezone, read_file_tail, run_utility_command,
         wait_for_daemon_startup,
     };
     use runnel::wg;
@@ -745,6 +935,24 @@ mod tests {
     }
 
     #[test]
+    fn log_file_appender_reports_open_errors() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "runnel-log-open-error-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+
+        let error = build_log_file_appender(&path).unwrap_err();
+
+        assert!(format!("{error:#}").contains("failed to open log file"));
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn status_targets_default_to_all_roles() {
         let targets =
             cli_daemon::resolve_status_targets(Path::new("proxy.log"), None, None, None, false)
@@ -780,6 +988,23 @@ mod tests {
     }
 
     #[test]
+    fn log_timezone_accepts_common_values() {
+        assert_eq!(parse_log_timezone("utc").unwrap(), time::UtcOffset::UTC);
+        assert_eq!(
+            parse_log_timezone("Asia/Shanghai").unwrap(),
+            time::UtcOffset::from_hms(8, 0, 0).unwrap()
+        );
+        assert_eq!(
+            parse_log_timezone("+08:00").unwrap(),
+            time::UtcOffset::from_hms(8, 0, 0).unwrap()
+        );
+        assert_eq!(
+            parse_log_timezone("UTC-0530").unwrap(),
+            time::UtcOffset::from_hms(-5, -30, 0).unwrap()
+        );
+    }
+
+    #[test]
     fn status_defaults_can_use_role_log_files() {
         let targets =
             cli_daemon::resolve_status_targets(Path::new("ignored.log"), None, None, None, true)
@@ -810,6 +1035,26 @@ mod tests {
         assert!(cli_daemon::should_show_status_state("degraded", false));
         assert!(cli_daemon::should_show_status_state("stale", false));
         assert!(cli_daemon::should_show_status_state("not-running", true));
+    }
+
+    #[test]
+    fn management_commands_use_lenient_global_config() {
+        assert!(!command_requires_strict_config(&Commands::Stop(StopArgs {
+            role: None,
+            wait_secs: 10,
+        })));
+        assert!(!command_requires_strict_config(&Commands::Status(
+            StatusArgs {
+                role: None,
+                json: false,
+            }
+        )));
+        assert!(!command_requires_strict_config(&Commands::Reload(
+            ReloadArgs {
+                role: Some(ServiceRole::Client),
+                wait_secs: 10,
+            }
+        )));
     }
 
     #[test]
@@ -866,10 +1111,12 @@ mod tests {
         let cli = Cli {
             log: "debug".to_owned(),
             log_file: PathBuf::from("runnel.log"),
+            log_timezone: "Asia/Shanghai".to_owned(),
             telemetry_sock: Some(PathBuf::from("runnel.sock")),
             pid_file: Some(PathBuf::from("runnel.pid")),
             tui: false,
             daemon: false,
+            check_config_only: false,
             config: Some(PathBuf::from("config.yaml")),
             command: Commands::Reload(ReloadArgs {
                 role: Some(ServiceRole::WgClient),
@@ -889,6 +1136,8 @@ mod tests {
                 OsString::from("debug"),
                 OsString::from("--log-file"),
                 OsString::from("runnel.log"),
+                OsString::from("--log-timezone"),
+                OsString::from("Asia/Shanghai"),
                 OsString::from("--telemetry-sock"),
                 OsString::from("runnel.sock"),
                 OsString::from("--pid-file"),
