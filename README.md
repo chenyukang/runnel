@@ -48,8 +48,8 @@ Start the client (add `--daemon` if you want to run in the background):
 sudo runnel --config runnel.yaml client --tui
 ```
 
-With no `--log-file`, these write to `/var/log/runnel/server.log` and
-`/var/log/runnel/client.log`.
+With no `--log-file`, these write to `~/.runnel/logs/server.log` and
+`~/.runnel/logs/client.log`.
 
 Log timestamps default to UTC. Use `--log-timezone Asia/Shanghai`, environment
 variable `RUNNEL_LOG_TIMEZONE=+08:00`, or YAML `log_timezone: +08:00` when you
@@ -145,8 +145,8 @@ runnel tui
 ```
 
 If `--log-file` is omitted, service commands use role-specific files:
-`/var/log/runnel/client.log`, `/var/log/runnel/server.log`, and
-`/var/log/runnel/tun.log`.
+`~/.runnel/logs/client.log`, `~/.runnel/logs/server.log`, and
+`~/.runnel/logs/tun.log`.
 
 If `--config` is omitted, Runnel searches the normal user config locations such
 as: `~/.runnel/config.yaml`, `$XDG_CONFIG_HOME/runnel/config.yaml`, `~/.config/runnel/config.yaml`, `/etc/runnel/config.yaml`.

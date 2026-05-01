@@ -26,8 +26,8 @@ use tracing_subscriber::{EnvFilter, fmt, fmt::time::FormatTime, prelude::*};
 const DAEMON_ENV: &str = "RUNNEL_DAEMONIZED";
 const DAEMON_STARTUP_CHECK: Duration = Duration::from_millis(1200);
 const DAEMON_STARTUP_POLL: Duration = Duration::from_millis(100);
-const DEFAULT_LOG_DIR: &str = "/var/log/runnel";
-const DEFAULT_RUN_LOG_FILE: &str = "/var/log/runnel/run.log";
+const DEFAULT_LOG_DIR: &str = "~/.runnel/logs";
+const DEFAULT_RUN_LOG_FILE: &str = "~/.runnel/logs/run.log";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -43,7 +43,7 @@ struct Cli {
         global = true,
         default_value = DEFAULT_RUN_LOG_FILE,
         hide_default_value = true,
-        help = "Write logs to this file; service commands default to /var/log/runnel/<role>.log"
+        help = "Write logs to this file; service commands default to ~/.runnel/logs/<role>.log"
     )]
     log_file: PathBuf,
     #[arg(
@@ -972,18 +972,18 @@ mod tests {
     fn service_commands_default_to_role_log_files() {
         assert_eq!(
             cli_service::default_log_file_for_role("client"),
-            PathBuf::from("/var/log/runnel/client.log")
+            PathBuf::from("~/.runnel/logs/client.log")
         );
         assert_eq!(
             cli_service::default_log_file_for_role("server"),
-            PathBuf::from("/var/log/runnel/server.log")
+            PathBuf::from("~/.runnel/logs/server.log")
         );
         assert_eq!(
             cli_service::default_log_file_for_command(&Commands::Status(StatusArgs {
                 role: Some(ServiceRole::Client),
                 json: false,
             })),
-            PathBuf::from("/var/log/runnel/client.log")
+            PathBuf::from("~/.runnel/logs/client.log")
         );
     }
 
@@ -1006,6 +1006,11 @@ mod tests {
 
     #[test]
     fn status_defaults_can_use_role_log_files() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        let server_pid_file = home.join(".runnel/logs/server.pid");
+        let server_socket = home.join(".runnel/logs/server.sock");
         let targets =
             cli_daemon::resolve_status_targets(Path::new("ignored.log"), None, None, None, true)
                 .unwrap();
@@ -1018,13 +1023,13 @@ mod tests {
             server
                 .pid_file
                 .as_ref()
-                .is_some_and(|path| path == Path::new("/var/log/runnel/server.pid"))
+                .is_some_and(|path| path == &server_pid_file)
         );
         assert!(
             server
                 .telemetry_socket
                 .as_ref()
-                .is_some_and(|path| path == Path::new("/var/log/runnel/server.sock"))
+                .is_some_and(|path| path == &server_socket)
         );
     }
 

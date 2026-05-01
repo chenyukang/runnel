@@ -312,8 +312,8 @@ runnel tui --attach ./runnel-wg-client.sock
 ```
 
 If `--log-file` is omitted, service commands use role-specific log files under
-`/var/log/runnel`, such as `/var/log/runnel/client.log` and
-`/var/log/runnel/server.log`. Explicit `--log-file` and YAML `log_file` values
+`~/.runnel/logs`, such as `~/.runnel/logs/client.log` and
+`~/.runnel/logs/server.log`. Explicit `--log-file` and YAML `log_file` values
 still take precedence.
 
 Log timestamps default to UTC. Set `--log-timezone local`,

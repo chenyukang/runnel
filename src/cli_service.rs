@@ -235,6 +235,9 @@ pub(super) fn default_log_file_for_role(role: &str) -> PathBuf {
 }
 
 pub(super) fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if let Some(expanded) = expand_home(path) {
+        return Ok(expanded);
+    }
     if path.is_absolute() {
         return Ok(path.to_path_buf());
     }
@@ -242,6 +245,15 @@ pub(super) fn absolute_path(path: &Path) -> Result<PathBuf> {
     Ok(std::env::current_dir()
         .context("failed to read current directory")?
         .join(path))
+}
+
+fn expand_home(path: &Path) -> Option<PathBuf> {
+    let raw = path.to_string_lossy();
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    if raw == "~" {
+        return Some(home);
+    }
+    raw.strip_prefix("~/").map(|rest| home.join(rest))
 }
 
 pub(super) fn command_role(command: &Commands) -> Option<&'static str> {
