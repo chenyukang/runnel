@@ -1,4 +1,4 @@
-use super::wire::{client_establish_ashe, relay_rc4, server_accept_ashe};
+use super::wire::{Rc4State, client_establish_ashe, relay_rc4, server_accept_ashe};
 use crate::{
     proxy::{netlog, route, route::RouteDecision, socks5, traffic},
     runtime::{ClientRuntime, ServerRuntime},
@@ -85,6 +85,11 @@ impl CzarClient {
         let session = self.connect_session().await?;
         *current = Some(session.clone());
         Ok(session)
+    }
+
+    async fn clear_session(&self) {
+        let mut current = self.session.lock().await;
+        *current = None;
     }
 
     async fn connect_session(&self) -> Result<ClientSession> {
@@ -273,9 +278,22 @@ async fn handle_client_connection(
         bail!("destination address too long");
     }
 
-    let mut upstream = client.open_stream().await?;
-    let (upload, download) =
-        client_establish_ashe(&mut upstream, &client.password, &target_string).await?;
+    let (upstream, upload, download) = match open_czar_target_stream(&client, &target_string).await
+    {
+        Ok(opened) => opened,
+        Err(first_err) => {
+            client.clear_session().await;
+            match open_czar_target_stream(&client, &target_string).await {
+                Ok(opened) => opened,
+                Err(second_err) => {
+                    let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
+                    return Err(second_err).context(format!(
+                        "failed to open czar stream after reconnect attempt; first error: {first_err:#}"
+                    ));
+                }
+            }
+        }
+    };
 
     socks5::send_success(&mut inbound).await?;
     let stats = relay_rc4(
@@ -301,6 +319,16 @@ async fn handle_client_connection(
         "relay completed"
     );
     Ok(())
+}
+
+async fn open_czar_target_stream(
+    client: &CzarClient,
+    target_string: &str,
+) -> Result<(DuplexStream, Rc4State, Rc4State)> {
+    let mut upstream = client.open_stream().await?;
+    let (upload, download) =
+        client_establish_ashe(&mut upstream, &client.password, target_string).await?;
+    Ok((upstream, upload, download))
 }
 
 async fn handle_server_connection(

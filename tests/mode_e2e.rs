@@ -34,7 +34,9 @@ struct TestEnv {
     _client_handle: JoinHandle<()>,
     target_port: u16,
     udp_target_port: u16,
+    server_port: u16,
     socks_port: u16,
+    fallback_port: u16,
     cert_path: Option<PathBuf>,
     key_path: Option<PathBuf>,
 }
@@ -225,6 +227,65 @@ async fn daze_czar_mode_survives_repeated_requests_on_one_session() {
     }
 }
 
+#[tokio::test]
+async fn client_modes_keep_running_after_server_disconnect_and_reconnect() {
+    let _guard = test_lock().lock().await;
+
+    for mode in [
+        ProxyMode::NativeHttp,
+        ProxyMode::NativeMux,
+        ProxyMode::DazeAshe,
+        ProxyMode::DazeBaboon,
+        ProxyMode::DazeCzar,
+    ] {
+        let mut env = start_env(mode).await.unwrap();
+
+        env._server_handle.abort();
+        let failed = timeout(
+            Duration::from_secs(5),
+            fetch_via_socks_path(env.socks_port, env.target_port, "/"),
+        )
+        .await
+        .context("timed out waiting for failed SOCKS attempt while server is down")
+        .unwrap();
+        assert!(
+            failed.is_err(),
+            "request unexpectedly succeeded while server was down"
+        );
+        assert!(
+            !env._client_handle.is_finished(),
+            "{mode} client task exited after server/network disconnect"
+        );
+
+        env._server_handle = spawn_server(
+            mode,
+            env.server_port,
+            env.fallback_port,
+            env.cert_path.clone(),
+            env.key_path.clone(),
+        );
+        wait_for_tcp_listener(env.server_port).await.unwrap();
+
+        let body = timeout(
+            Duration::from_secs(5),
+            fetch_via_socks_path(env.socks_port, env.target_port, "/"),
+        )
+        .await
+        .context("timed out waiting for SOCKS round trip after server reconnect")
+        .unwrap()
+        .unwrap();
+        assert!(
+            body.ends_with(b"ok"),
+            "{mode} did not recover after reconnect; body={:?}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            !env._client_handle.is_finished(),
+            "{mode} client task exited after reconnect"
+        );
+    }
+}
+
 async fn assert_mode_round_trip(mode: ProxyMode) -> Result<()> {
     let env = start_env(mode).await?;
     let body = timeout(
@@ -253,33 +314,12 @@ async fn start_env(mode: ProxyMode) -> Result<TestEnv> {
 
     let target_handle = tokio::spawn(run_http_target(target_port));
     let udp_target_handle = tokio::spawn(run_udp_target(udp_target_port));
-    let fallback_url = format!("http://127.0.0.1:{fallback_port}");
 
     let (cert_path, key_path) = if matches!(mode, ProxyMode::NativeHttp | ProxyMode::NativeMux) {
         let (cert, key) = write_temp_cert_pair()?;
         (Some(cert), Some(key))
     } else {
         (None, None)
-    };
-
-    let server_args = ServerArgs {
-        listen: format!("127.0.0.1:{server_port}"),
-        cert: cert_path.clone(),
-        key: key_path.clone(),
-        mode,
-        password: "hello-world".to_owned(),
-        path: "/connect".to_owned(),
-        mux_path: "/mux".to_owned(),
-        auth_window_secs: 120,
-        handshake_timeout_secs: 10,
-        connect_timeout_secs: 10,
-        max_header_size: 16 * 1024,
-        max_tunnel_body_size: 8 * 1024,
-        allow_private_targets: true,
-        fallback_url,
-        fallback_timeout_secs: 5,
-        max_fallback_body_size: 1024 * 1024,
-        wg: Default::default(),
     };
 
     let client_args = ClientArgs {
@@ -309,9 +349,13 @@ async fn start_env(mode: ProxyMode) -> Result<TestEnv> {
         wg: Default::default(),
     };
 
-    let server_handle = tokio::spawn(async move {
-        let _ = server::run(server_args).await;
-    });
+    let server_handle = spawn_server(
+        mode,
+        server_port,
+        fallback_port,
+        cert_path.clone(),
+        key_path.clone(),
+    );
     sleep(Duration::from_millis(150)).await;
 
     let client_handle = tokio::spawn(async move {
@@ -326,9 +370,43 @@ async fn start_env(mode: ProxyMode) -> Result<TestEnv> {
         _client_handle: client_handle,
         target_port,
         udp_target_port,
+        server_port,
         socks_port,
+        fallback_port,
         cert_path,
         key_path,
+    })
+}
+
+fn spawn_server(
+    mode: ProxyMode,
+    server_port: u16,
+    fallback_port: u16,
+    cert_path: Option<PathBuf>,
+    key_path: Option<PathBuf>,
+) -> JoinHandle<()> {
+    let server_args = ServerArgs {
+        listen: format!("127.0.0.1:{server_port}"),
+        cert: cert_path,
+        key: key_path,
+        mode,
+        password: "hello-world".to_owned(),
+        path: "/connect".to_owned(),
+        mux_path: "/mux".to_owned(),
+        auth_window_secs: 120,
+        handshake_timeout_secs: 10,
+        connect_timeout_secs: 10,
+        max_header_size: 16 * 1024,
+        max_tunnel_body_size: 8 * 1024,
+        allow_private_targets: true,
+        fallback_url: format!("http://127.0.0.1:{fallback_port}"),
+        fallback_timeout_secs: 5,
+        max_fallback_body_size: 1024 * 1024,
+        wg: Default::default(),
+    };
+
+    tokio::spawn(async move {
+        let _ = server::run(server_args).await;
     })
 }
 

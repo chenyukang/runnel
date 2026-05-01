@@ -192,6 +192,11 @@ impl MuxClient {
         Ok(session)
     }
 
+    async fn clear_session(&self) {
+        let mut current = self.session.lock().await;
+        *current = None;
+    }
+
     async fn connect_session(&self) -> Result<ClientSession> {
         let upstream = timeout(self.connect_timeout, TcpStream::connect(&self.server))
             .await
@@ -352,50 +357,25 @@ async fn handle_client_connection(
         RouteDecision::Remote => {}
     }
 
-    let session = mux.ensure_session().await?;
-    let stream_id = mux.next_stream_id();
-    let (stream_tx, mut stream_rx) = mpsc::channel(64);
-
-    {
-        let mut streams = session.streams.lock().await;
-        streams.insert(stream_id, stream_tx);
-    }
-
-    if session
-        .frame_tx
-        .send(Frame::open(stream_id, target_string.clone()))
+    let (session, stream_id, mut stream_rx) = match open_mux_stream(&mux, &target_string, &runtime)
         .await
-        .is_err()
     {
-        remove_client_stream(&session, stream_id).await;
-        let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
-        bail!("mux session is not available");
-    }
+        Ok(opened) => opened,
+        Err(first_err) => {
+            mux.clear_session().await;
+            match open_mux_stream(&mux, &target_string, &runtime).await {
+                Ok(opened) => opened,
+                Err(second_err) => {
+                    let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
+                    return Err(second_err).context(format!(
+                        "failed to open mux stream after reconnect attempt; first error: {first_err:#}"
+                    ));
+                }
+            }
+        }
+    };
 
-    let first_event = timeout(runtime.handshake_timeout, stream_rx.recv())
-        .await
-        .context("mux stream open timed out")?;
-
-    match first_event {
-        Some(StreamEvent::Opened) => {
-            socks5::send_success(&mut inbound).await?;
-        }
-        Some(StreamEvent::OpenError(message)) => {
-            remove_client_stream(&session, stream_id).await;
-            let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
-            bail!("mux server refused stream: {message}");
-        }
-        Some(StreamEvent::Closed) | None => {
-            remove_client_stream(&session, stream_id).await;
-            let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
-            bail!("mux session closed while opening stream");
-        }
-        Some(StreamEvent::Data(_)) => {
-            remove_client_stream(&session, stream_id).await;
-            let _ = socks5::send_failure(&mut inbound, socks5::REP_GENERAL_FAILURE).await;
-            bail!("mux session sent data before stream open completed");
-        }
-    }
+    socks5::send_success(&mut inbound).await?;
 
     let (mut reader, mut writer) = inbound.into_split();
     let frame_tx = session.frame_tx.clone();
@@ -444,6 +424,51 @@ async fn handle_client_connection(
     info!(peer = %peer, target = %target_string, stream_id, "mux relay completed");
 
     Ok(())
+}
+
+async fn open_mux_stream(
+    mux: &MuxClient,
+    target_string: &str,
+    runtime: &ClientRuntime,
+) -> Result<(ClientSession, u32, mpsc::Receiver<StreamEvent>)> {
+    let session = mux.ensure_session().await?;
+    let stream_id = mux.next_stream_id();
+    let (stream_tx, mut stream_rx) = mpsc::channel(64);
+
+    {
+        let mut streams = session.streams.lock().await;
+        streams.insert(stream_id, stream_tx);
+    }
+
+    if session
+        .frame_tx
+        .send(Frame::open(stream_id, target_string.to_owned()))
+        .await
+        .is_err()
+    {
+        remove_client_stream(&session, stream_id).await;
+        bail!("mux session is not available");
+    }
+
+    let first_event = timeout(runtime.handshake_timeout, stream_rx.recv())
+        .await
+        .context("mux stream open timed out")?;
+
+    match first_event {
+        Some(StreamEvent::Opened) => Ok((session, stream_id, stream_rx)),
+        Some(StreamEvent::OpenError(message)) => {
+            remove_client_stream(&session, stream_id).await;
+            bail!("mux server refused stream: {message}");
+        }
+        Some(StreamEvent::Closed) | None => {
+            remove_client_stream(&session, stream_id).await;
+            bail!("mux session closed while opening stream");
+        }
+        Some(StreamEvent::Data(_)) => {
+            remove_client_stream(&session, stream_id).await;
+            bail!("mux session sent data before stream open completed");
+        }
+    }
 }
 
 pub(crate) async fn run_server_session<S>(
