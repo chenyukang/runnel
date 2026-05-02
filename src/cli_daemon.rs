@@ -5,6 +5,7 @@ use std::{
     collections::BTreeSet,
     ffi::OsString,
     fs,
+    io::Write,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -595,7 +596,7 @@ pub(super) fn maybe_create_pid_file(cli: &Cli, log_file: &Path) -> Result<Option
         }
     }
 
-    fs::write(&path, format!("{}\n", std::process::id()))
+    write_pid_file_exclusive(&path, std::process::id())
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(Some(PidFileGuard { path }))
 }
@@ -903,6 +904,25 @@ fn read_pid_file(path: &Path) -> Result<u32> {
         .with_context(|| format!("invalid pid in {}", path.display()))
 }
 
+fn write_pid_file_exclusive(path: &Path, pid: u32) -> Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create pid file {}", path.display()))?;
+    file.write_all(format!("{pid}\n").as_bytes())
+        .with_context(|| format!("failed to write pid file {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to flush pid file {}", path.display()))?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn process_exists(pid: u32) -> Result<bool> {
     let pid = pid as i32;
@@ -936,5 +956,62 @@ pub(super) struct PidFileGuard {
 impl Drop for PidFileGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "runnel-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn pid_file_is_created_exclusively() {
+        let dir = temp_dir("pid-exclusive");
+        let path = dir.join("runnel.pid");
+
+        write_pid_file_exclusive(&path, 1234).expect("pid file should be created");
+        assert_eq!(read_pid_file(&path).unwrap(), 1234);
+        assert!(
+            write_pid_file_exclusive(&path, 5678).is_err(),
+            "existing pid file must not be truncated"
+        );
+        assert_eq!(read_pid_file(&path).unwrap(), 1234);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_file_creation_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("pid-symlink");
+        let target = dir.join("target.txt");
+        let path = dir.join("runnel.pid");
+        fs::write(&target, "keep me\n").expect("target file");
+        symlink(&target, &path).expect("pid symlink");
+
+        assert!(
+            write_pid_file_exclusive(&path, 1234).is_err(),
+            "pid file creation must not follow symlinks"
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me\n");
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&target);
+        let _ = fs::remove_dir(&dir);
     }
 }
