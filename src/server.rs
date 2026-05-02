@@ -10,7 +10,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use reqwest::{
-    Client as HttpClient, Method, Url,
+    Client as HttpClient, Method, Response, Url,
     header::{
         CONNECTION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue, TRANSFER_ENCODING,
     },
@@ -535,14 +535,36 @@ impl Fallback {
             }
         }
 
-        let body = response
-            .bytes()
-            .await
-            .context("failed to read fallback response body")?;
+        let body = read_limited_response_body(response, self.max_body_size).await?;
         let encoded = http::build_response(status.as_u16(), &reason, &response_headers, &body);
         stream.write_all(&encoded).await?;
         Ok(())
     }
+}
+
+async fn read_limited_response_body(
+    mut response: Response,
+    max_body_size: usize,
+) -> Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_body_size as u64)
+    {
+        bail!("fallback response body exceeded {max_body_size} bytes");
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed to read fallback response body")?
+    {
+        if body.len().saturating_add(chunk.len()) > max_body_size {
+            bail!("fallback response body exceeded {max_body_size} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 fn fallback_request_url(base: &Url, request_target: &str) -> Result<Url> {
@@ -588,7 +610,11 @@ fn should_skip_response_header(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::wg::server::WgServerArgs;
-    use tokio::io::{AsyncReadExt, duplex};
+    use std::collections::HashMap;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt, duplex},
+        net::TcpListener,
+    };
 
     #[tokio::test]
     async fn tunnel_auth_failure_writes_unauthorized_response() {
@@ -648,5 +674,40 @@ mod tests {
             "{response}"
         );
         assert!(response.contains(AUTH_FAILURE_BODY.trim()), "{response}");
+    }
+
+    #[tokio::test]
+    async fn fallback_rejects_oversized_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fallback listener");
+        let addr = listener.local_addr().expect("fallback addr");
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("fallback accept");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+                .await
+                .expect("fallback response");
+        });
+        let fallback = Fallback::new(&format!("http://{addr}"), Duration::from_secs(1), 4)
+            .expect("fallback config");
+        let request = http::HttpRequest {
+            method: "GET".to_owned(),
+            path: "/".to_owned(),
+            version: "HTTP/1.1".to_owned(),
+            headers: HashMap::new(),
+        };
+        let (mut server_io, _client_io) = duplex(1024);
+
+        let err = fallback
+            .proxy(&mut server_io, request, &[])
+            .await
+            .expect_err("oversized fallback response should fail")
+            .to_string();
+        upstream.await.expect("fallback task");
+        assert!(
+            err.contains("fallback response body exceeded 4 bytes"),
+            "{err}"
+        );
     }
 }
