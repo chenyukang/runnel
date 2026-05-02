@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
-    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, pem::PemObject},
 };
-use std::{fs::File, io::BufReader, net::IpAddr, path::Path, sync::Arc};
+use std::{net::IpAddr, path::Path, sync::Arc};
 
 pub fn load_server_config(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConfig>> {
     let certs = load_certs(cert_path)?;
@@ -79,18 +79,13 @@ pub fn server_name(host: &str) -> Result<ServerName<'static>> {
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
-        .collect::<std::io::Result<Vec<_>>>()
+    CertificateDer::pem_file_iter(path)
+        .with_context(|| format!("failed to open {}", path.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()
         .with_context(|| format!("failed to parse certificates from {}", path.display()))
 }
 
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let key = rustls_pemfile::private_key(&mut reader)
-        .with_context(|| format!("failed to parse private key from {}", path.display()))?
-        .context("no private key found in PEM file")?;
-    Ok(key)
+    PrivateKeyDer::from_pem_file(path)
+        .with_context(|| format!("failed to parse private key from {}", path.display()))
 }

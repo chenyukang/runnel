@@ -30,7 +30,7 @@ where
 {
     let password = salt(password);
     let mut random = [0_u8; 32];
-    fill_random(&mut random);
+    fill_random(&mut random)?;
     stream.write_all(&random).await?;
 
     let session_key = xor_key(&random, &password);
@@ -294,9 +294,8 @@ fn unix_timestamp() -> Result<i64> {
     Ok(now.as_secs() as i64)
 }
 
-pub(super) fn fill_random(buf: &mut [u8]) {
-    use rand::RngCore as _;
-    rand::rngs::OsRng.fill_bytes(buf);
+pub(super) fn fill_random(buf: &mut [u8]) -> Result<()> {
+    getrandom::fill(buf).context("failed to generate daze random bytes")
 }
 
 #[derive(Clone)]

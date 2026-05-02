@@ -2,7 +2,6 @@ use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use clap::Args;
-use rand::rngs::OsRng;
 use serde::Serialize;
 
 use super::parse_key;
@@ -20,18 +19,19 @@ pub(crate) struct WgKeyMaterial {
 }
 
 pub fn run_keygen(args: WgKeygenArgs) -> Result<()> {
-    let material = generate_key_material();
+    let material = generate_key_material()?;
     print_key_material(&material, args.json)?;
     Ok(())
 }
 
-pub(crate) fn generate_key_material() -> WgKeyMaterial {
-    let private_key = StaticSecret::random_from_rng(OsRng).to_bytes();
+pub(crate) fn generate_key_material() -> Result<WgKeyMaterial> {
+    let mut private_key = [0_u8; super::WG_KEY_LEN];
+    getrandom::fill(&mut private_key)?;
     let public_key = *PublicKey::from(&StaticSecret::from(private_key)).as_bytes();
-    WgKeyMaterial {
+    Ok(WgKeyMaterial {
         private_key: STANDARD.encode(private_key),
         public_key: STANDARD.encode(public_key),
-    }
+    })
 }
 
 pub(crate) fn public_key_from_private_key(encoded_private_key: &str) -> Result<String> {
@@ -58,7 +58,7 @@ mod tests {
 
     #[test]
     fn keygen_outputs_parseable_base64_keypair() {
-        let material = generate_key_material();
+        let material = generate_key_material().unwrap();
         let private_key = STANDARD
             .decode(&material.private_key)
             .expect("private key should decode");

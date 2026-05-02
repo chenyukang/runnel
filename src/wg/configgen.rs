@@ -147,8 +147,8 @@ fn generate_config(args: &WgConfigArgs) -> Result<GeneratedWgConfig> {
     let dns = args.dns.or(Some(DEFAULT_ADBLOCK_DNS));
     let dns_capture = args.dns_capture || dns.is_some();
     let server_endpoint = parse_socket_addr("wg config server_endpoint", &args.server_endpoint)?;
-    let client_keys = generate_key_material();
-    let server_keys = generate_key_material();
+    let client_keys = generate_key_material()?;
+    let server_keys = generate_key_material()?;
     validate_ip_rules("wg config client direct", &args.direct_ips)?;
     let peer_allowed_ips = normalize_allowed_ips(
         "wg config server",

@@ -130,7 +130,7 @@ async fn handle_client_connection(
         .context("server connect timed out")??;
     upstream.set_nodelay(true)?;
 
-    let request = build_baboon_request(&runtime.password, &runtime.server);
+    let request = build_baboon_request(&runtime.password, &runtime.server)?;
     upstream.write_all(request.as_bytes()).await?;
 
     let (head, body_prefix) = timeout(
@@ -279,9 +279,9 @@ async fn handle_server_connection(
     Ok(())
 }
 
-fn build_baboon_request(password: &str, server: &str) -> String {
+fn build_baboon_request(password: &str, server: &str) -> Result<String> {
     let mut random = [0_u8; 16];
-    fill_random(&mut random);
+    fill_random(&mut random)?;
     let cipher = salt(password);
     let mut auth = [0_u8; 32];
     auth[..16].copy_from_slice(&random);
@@ -291,7 +291,7 @@ fn build_baboon_request(password: &str, server: &str) -> String {
     md5.consume(&cipher[..16]);
     auth[16..].copy_from_slice(&md5.compute().0);
 
-    format!(
+    Ok(format!(
         concat!(
             "POST {} HTTP/1.1\r\n",
             "Host: {}\r\n",
@@ -303,7 +303,7 @@ fn build_baboon_request(password: &str, server: &str) -> String {
         BABOON_PATH,
         server,
         hex::encode(auth),
-    )
+    ))
 }
 
 fn validate_baboon_request(request: &http::HttpRequest, password: &str) -> bool {
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn baboon_authorization_round_trip() {
-        let request = build_baboon_request("secret", "example.com:443");
+        let request = build_baboon_request("secret", "example.com:443").unwrap();
         let parsed = http::parse_request(request.as_bytes()).expect("request should parse");
         assert!(validate_baboon_request(&parsed, "secret"));
         assert!(!validate_baboon_request(&parsed, "wrong-secret"));

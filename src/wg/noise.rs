@@ -18,7 +18,6 @@ use boringtun::{
     x25519::{PublicKey, StaticSecret},
 };
 use hmac::{Hmac, Mac};
-use rand::RngCore;
 use sha2::Sha256;
 use std::{
     collections::BTreeMap,
@@ -552,7 +551,7 @@ impl NoisePacketCodec {
             return Duration::ZERO;
         }
         let jitter =
-            (rand::rngs::OsRng.next_u32() % (u32::from(self.profile.jitter_ms) + 1)) as u64;
+            (getrandom::u32().unwrap_or(0) % (u32::from(self.profile.jitter_ms) + 1)) as u64;
         Duration::from_millis(jitter)
     }
 
@@ -571,7 +570,6 @@ impl NoisePacketCodec {
 
     fn encode_masked_body(&self, packet: &[u8], pad_len: usize, out: &mut [u8]) -> Result<usize> {
         let key = self.mask_key.expect("mask codec key is present");
-        let mut rng = rand::rngs::OsRng;
         let frame_len = MASK_HEADER_LEN + packet.len() + pad_len + MASK_TAG_LEN;
         if out.len() < frame_len {
             bail!("noise mask packet encode buffer is too small");
@@ -580,7 +578,8 @@ impl NoisePacketCodec {
             bail!("noise mask packet is too large");
         }
 
-        rng.fill_bytes(&mut out[..MASK_NONCE_LEN]);
+        getrandom::fill(&mut out[..MASK_NONCE_LEN])
+            .context("failed to generate noise mask nonce")?;
         let mut nonce = [0u8; MASK_NONCE_LEN];
         nonce.copy_from_slice(&out[..MASK_NONCE_LEN]);
         let header_mask = mask_header(&key, &nonce);
@@ -595,7 +594,8 @@ impl NoisePacketCodec {
         let body_end = body_start + packet.len() + pad_len;
         out[body_start..body_start + packet.len()].copy_from_slice(packet);
         if pad_len > 0 {
-            rng.fill_bytes(&mut out[body_start + packet.len()..body_end]);
+            getrandom::fill(&mut out[body_start + packet.len()..body_end])
+                .context("failed to generate noise mask padding")?;
         }
         xor_mask_body(&key, &nonce, &mut out[body_start..body_end]);
 
@@ -661,7 +661,7 @@ impl NoisePacketCodec {
         if max <= min {
             return min;
         }
-        min + (rand::rngs::OsRng.next_u32() as usize % (max - min + 1))
+        min + (getrandom::u32().unwrap_or(0) as usize % (max - min + 1))
     }
 }
 

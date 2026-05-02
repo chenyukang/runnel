@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
-use rand::{RngCore, rngs::OsRng};
 use sha2::Sha256;
 use std::{
     collections::{HashMap, VecDeque},
@@ -25,7 +24,7 @@ pub struct AuthProof {
 impl AuthProof {
     pub fn sign(password: &str, method: &str, path: &str, target: &str) -> Result<Self> {
         let timestamp = unix_timestamp()?;
-        let nonce = random_nonce();
+        let nonce = random_nonce()?;
         let signature = sign(password, method, path, target, timestamp, &nonce)?;
         Ok(Self {
             timestamp,
@@ -181,10 +180,10 @@ fn unix_timestamp() -> Result<i64> {
     Ok(now.as_secs() as i64)
 }
 
-fn random_nonce() -> String {
+fn random_nonce() -> Result<String> {
     let mut nonce = [0_u8; 16];
-    OsRng.fill_bytes(&mut nonce);
-    URL_SAFE_NO_PAD.encode(nonce)
+    getrandom::fill(&mut nonce).context("failed to generate auth nonce")?;
+    Ok(URL_SAFE_NO_PAD.encode(nonce))
 }
 
 #[cfg(test)]
