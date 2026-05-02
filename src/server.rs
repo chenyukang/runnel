@@ -2,7 +2,7 @@ use crate::{
     mode::ProxyMode,
     proxy::{
         auth::{AUTH_FAILURE_BODY, AUTH_FAILURE_HINT, AuthProof, ReplayProtector},
-        http, mux, netlog, tls, traffic, udp,
+        http, mux, netlog, target, tls, traffic, udp,
     },
     runtime::ServerRuntime,
     wg,
@@ -189,21 +189,11 @@ async fn handle_connection(
         if let Some(tunnel) =
             authorize_tunnel_request(&mut stream, tunnel_head, &body_prefix, &args, &replay).await?
         {
-            if !args.allow_private_targets && is_private_literal_target(&tunnel.target) {
-                let response = http::build_error_response(
-                    403,
-                    "Forbidden",
-                    "literal private IP targets are disabled by default\n",
-                );
-                stream.write_all(&response).await?;
-                return Ok(());
-            }
-
             match tunnel.transport {
                 http::TunnelTransport::Tcp => {
                     let outbound = match timeout(
                         Duration::from_secs(args.connect_timeout_secs),
-                        TcpStream::connect(&tunnel.target),
+                        target::connect_tcp_target(&tunnel.target, args.allow_private_targets),
                     )
                     .await
                     {
@@ -369,9 +359,31 @@ where
     let outbound = bind_udp_socket_for_target(target)
         .await
         .with_context(|| format!("failed to bind UDP socket for {target}"))?;
+    let target_addr = match timeout(
+        Duration::from_secs(args.connect_timeout_secs),
+        target::resolve_allowed_target_addrs(target, args.allow_private_targets),
+    )
+    .await
+    {
+        Ok(Ok(addrs)) => addrs[0],
+        Ok(Err(err)) => {
+            let response = http::build_error_response(403, "Forbidden", &format!("{err}\n"));
+            stream.write_all(&response).await?;
+            return Ok(());
+        }
+        Err(_) => {
+            let response = http::build_error_response(
+                504,
+                "Gateway Timeout",
+                "upstream UDP resolve timed out\n",
+            );
+            stream.write_all(&response).await?;
+            return Ok(());
+        }
+    };
     match timeout(
         Duration::from_secs(args.connect_timeout_secs),
-        outbound.connect(target),
+        outbound.connect(target_addr),
     )
     .await
     {
@@ -570,39 +582,6 @@ fn should_skip_response_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case(CONTENT_LENGTH.as_str())
         || name.eq_ignore_ascii_case(TRANSFER_ENCODING.as_str())
         || name.eq_ignore_ascii_case("keep-alive")
-}
-
-fn is_private_literal_target(target: &str) -> bool {
-    let Some(host) = extract_host(target) else {
-        return false;
-    };
-
-    match host.parse::<IpAddr>() {
-        Ok(IpAddr::V4(addr)) => is_private_v4(addr),
-        Ok(IpAddr::V6(addr)) => is_private_v6(addr),
-        Err(_) => false,
-    }
-}
-
-fn extract_host(target: &str) -> Option<String> {
-    if let Some(rest) = target.strip_prefix('[') {
-        let (host, _) = rest.split_once(']')?;
-        return Some(host.to_owned());
-    }
-
-    let (host, _) = target.rsplit_once(':')?;
-    Some(host.to_owned())
-}
-
-fn is_private_v4(addr: Ipv4Addr) -> bool {
-    addr.is_private() || addr.is_loopback() || addr.is_link_local() || addr.is_unspecified()
-}
-
-fn is_private_v6(addr: Ipv6Addr) -> bool {
-    addr.is_loopback()
-        || addr.is_unique_local()
-        || addr.is_unicast_link_local()
-        || addr.is_unspecified()
 }
 
 #[cfg(test)]

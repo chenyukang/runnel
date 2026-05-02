@@ -7,7 +7,6 @@ use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    net::{IpAddr, Ipv4Addr},
     sync::Arc,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -106,10 +105,6 @@ where
     dec.apply_keystream(&mut address);
     let target = String::from_utf8(address)
         .with_context(|| format!("daze-ashe address decode failed; {AUTH_FAILURE_HINT}"))?;
-
-    if !runtime.allow_private_targets && is_private_literal_target(&target) {
-        bail!("literal private IP targets are disabled by default");
-    }
 
     Ok((dec, enc, target))
 }
@@ -302,26 +297,6 @@ fn unix_timestamp() -> Result<i64> {
 pub(super) fn fill_random(buf: &mut [u8]) {
     use rand::RngCore as _;
     rand::rngs::OsRng.fill_bytes(buf);
-}
-
-fn is_private_literal_target(target: &str) -> bool {
-    match host_from_target(target).and_then(|host| host.parse::<IpAddr>().ok()) {
-        Some(IpAddr::V4(ip)) => {
-            ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip == Ipv4Addr::BROADCAST
-        }
-        Some(IpAddr::V6(ip)) => {
-            ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
-        }
-        None => false,
-    }
-}
-
-fn host_from_target(target: &str) -> Option<&str> {
-    if let Some(rest) = target.strip_prefix('[') {
-        return rest.split_once(']').map(|(host, _)| host);
-    }
-
-    target.rsplit_once(':').map(|(host, _)| host)
 }
 
 #[derive(Clone)]

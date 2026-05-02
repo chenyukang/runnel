@@ -1,6 +1,6 @@
 use super::wire::{Rc4State, client_establish_ashe, relay_rc4, server_accept_ashe};
 use crate::{
-    proxy::{netlog, route, route::RouteDecision, socks5, traffic},
+    proxy::{netlog, route, route::RouteDecision, socks5, target, traffic},
     runtime::{ClientRuntime, ServerRuntime},
 };
 use anyhow::{Context, Result, bail};
@@ -372,9 +372,12 @@ async fn handle_server_connection(
 
 async fn handle_server_stream(mut inbound: DuplexStream, runtime: ServerRuntime) -> Result<()> {
     let (download, upload, target) = server_accept_ashe(&mut inbound, &runtime).await?;
-    let outbound = timeout(runtime.connect_timeout, TcpStream::connect(&target))
-        .await
-        .context("upstream connect timed out")??;
+    let outbound = timeout(
+        runtime.connect_timeout,
+        target::connect_tcp_target(&target, runtime.allow_private_targets),
+    )
+    .await
+    .context("upstream connect timed out")??;
     outbound.set_nodelay(true)?;
 
     let mut code = [0_u8];

@@ -6,6 +6,7 @@ pub mod netlog;
 pub(crate) mod remote;
 pub mod route;
 pub mod socks5;
+pub(crate) mod target;
 pub mod tls;
 pub mod traffic;
 pub mod udp;

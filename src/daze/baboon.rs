@@ -4,7 +4,7 @@ use crate::{
         auth::{AUTH_FAILURE_BODY, AUTH_FAILURE_HINT},
         http, netlog, route,
         route::RouteDecision,
-        socks5, traffic,
+        socks5, target, traffic,
     },
     runtime::{ClientRuntime, ServerRuntime},
 };
@@ -238,9 +238,12 @@ async fn handle_server_connection(
             .await?;
 
         let (download, upload, target) = server_accept_ashe(&mut inbound, &runtime).await?;
-        let outbound = timeout(runtime.connect_timeout, TcpStream::connect(&target))
-            .await
-            .context("upstream connect timed out")??;
+        let outbound = timeout(
+            runtime.connect_timeout,
+            target::connect_tcp_target(&target, runtime.allow_private_targets),
+        )
+        .await
+        .context("upstream connect timed out")??;
         outbound.set_nodelay(true)?;
 
         let mut code = [0_u8];

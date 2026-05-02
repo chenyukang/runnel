@@ -2,7 +2,7 @@ use super::{
     auth::{AUTH_FAILURE_BODY, AUTH_FAILURE_HINT, AuthProof, ReplayProtector},
     http, netlog, route,
     route::RouteDecision,
-    socks5, tls,
+    socks5, target, tls,
 };
 use crate::runtime::{ClientRuntime, ServerRuntime};
 use anyhow::{Context, Result, bail};
@@ -741,17 +741,12 @@ async fn handle_server_open(
     streams: Arc<Mutex<HashMap<u32, mpsc::Sender<ServerStreamCommand>>>>,
     runtime: ServerRuntime,
 ) -> Result<()> {
-    if !runtime.allow_private_targets && is_private_literal_target(&target) {
-        let _ = frame_tx
-            .send(Frame::open_err(
-                stream_id,
-                "literal private IP targets are disabled by default",
-            ))
-            .await;
-        return Ok(());
-    }
-
-    let outbound = match timeout(runtime.connect_timeout, TcpStream::connect(&target)).await {
+    let outbound = match timeout(
+        runtime.connect_timeout,
+        target::connect_tcp_target(&target, runtime.allow_private_targets),
+    )
+    .await
+    {
         Ok(Ok(stream)) => stream,
         Ok(Err(err)) => {
             let _ = frame_tx
@@ -969,26 +964,6 @@ where
     encoded.extend_from_slice(&frame.payload);
     writer.write_all(&encoded).await?;
     writer.flush().await
-}
-
-fn is_private_literal_target(target: &str) -> bool {
-    match host_from_target(target).and_then(|host| host.parse::<std::net::IpAddr>().ok()) {
-        Some(std::net::IpAddr::V4(ip)) => {
-            ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_broadcast()
-        }
-        Some(std::net::IpAddr::V6(ip)) => {
-            ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
-        }
-        None => false,
-    }
-}
-
-fn host_from_target(target: &str) -> Option<&str> {
-    if let Some(rest) = target.strip_prefix('[') {
-        return rest.split_once(']').map(|(host, _)| host);
-    }
-
-    target.rsplit_once(':').map(|(host, _)| host)
 }
 
 #[cfg(test)]
