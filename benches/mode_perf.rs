@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use boringtun::x25519::{PublicKey, StaticSecret};
-use rand::rngs::OsRng;
 use rcgen::generate_simple_self_signed;
 use runnel::{
     client::{self, ClientArgs},
@@ -1155,7 +1154,8 @@ fn host_cidr(ip: IpAddr) -> String {
 }
 
 fn wg_key_pair() -> (String, String) {
-    let private_key = StaticSecret::random_from_rng(OsRng).to_bytes();
+    let mut private_key = [0_u8; 32];
+    getrandom::fill(&mut private_key).expect("failed to generate benchmark WireGuard key");
     let public_key = *PublicKey::from(&StaticSecret::from(private_key)).as_bytes();
     (STANDARD.encode(private_key), STANDARD.encode(public_key))
 }
