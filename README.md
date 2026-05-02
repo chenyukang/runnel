@@ -51,9 +51,9 @@ sudo runnel --config runnel.yaml client --tui
 With no `--log-file`, these write to `~/.runnel/logs/server.log` and
 `~/.runnel/logs/client.log`.
 
-Log timestamps default to UTC. Use `--log-timezone Asia/Shanghai`, environment
-variable `RUNNEL_LOG_TIMEZONE=+08:00`, or YAML `log_timezone: +08:00` when you
-want local Beijing-time logs.
+Log timestamps default to the machine's local timezone. Use
+`--log-timezone utc`, environment variable `RUNNEL_LOG_TIMEZONE=+08:00`, or YAML
+`log_timezone: Asia/Shanghai` when you want a specific timezone.
 
 Check the tunnel:
 

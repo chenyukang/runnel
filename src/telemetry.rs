@@ -33,6 +33,8 @@ pub struct MonitorContext {
     pub path: Option<String>,
     pub log_file: PathBuf,
     pub log_filter: String,
+    #[serde(default)]
+    pub log_timezone_offset_secs: i32,
     pub pid: u32,
 }
 
@@ -233,7 +235,7 @@ impl SnapshotState {
                 .unwrap_or_else(|| "remote".to_owned());
 
             self.recent_targets.push_front(RecentTargetSnapshot {
-                seen_at: clock_stamp(event.at),
+                seen_at: clock_stamp(event.at, self.log_timezone_offset_secs()),
                 link: link_from_target(&target),
                 target,
                 route,
@@ -267,7 +269,7 @@ impl SnapshotState {
             .get("detail")
             .cloned()
             .unwrap_or_else(|| recent_domain_default_detail(&route));
-        let seen_at = clock_stamp(event.at);
+        let seen_at = clock_stamp(event.at, self.log_timezone_offset_secs());
 
         if let Some(index) = self
             .recent_targets
@@ -352,12 +354,19 @@ impl SnapshotState {
 
         self.recent_events.push_front(format!(
             "{} [{}] {}{}",
-            clock_stamp(event.at),
+            clock_stamp(event.at, self.log_timezone_offset_secs()),
             event.level,
             event.message,
             suffix
         ));
         self.recent_events.truncate(RECENT_EVENTS);
+    }
+
+    fn log_timezone_offset_secs(&self) -> i32 {
+        self.context
+            .as_ref()
+            .map(|context| context.log_timezone_offset_secs)
+            .unwrap_or_default()
     }
 }
 
@@ -803,14 +812,15 @@ fn is_loopback_peer(peer: &str) -> bool {
         })
 }
 
-fn clock_stamp(at: SystemTime) -> String {
+fn clock_stamp(at: SystemTime, offset_secs: i32) -> String {
     let elapsed = at
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let seconds = elapsed % 60;
-    let minutes = (elapsed / 60) % 60;
-    let hours = (elapsed / 3600) % 24;
+    let local_elapsed = (elapsed as i64 + i64::from(offset_secs)).rem_euclid(86_400);
+    let seconds = local_elapsed % 60;
+    let minutes = (local_elapsed / 60) % 60;
+    let hours = local_elapsed / 3600;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
@@ -895,7 +905,8 @@ fn current_snapshot(snapshot: &Arc<Mutex<SnapshotState>>) -> Option<DashboardSna
 #[cfg(test)]
 mod tests {
     use super::{
-        MonitorContext, SnapshotState, TraceEvent, event_impacts_health, is_loopback_peer,
+        MonitorContext, SnapshotState, TraceEvent, clock_stamp, event_impacts_health,
+        is_loopback_peer,
     };
     use std::{collections::BTreeMap, path::PathBuf, time::SystemTime};
 
@@ -910,6 +921,15 @@ mod tests {
             ],
         );
         assert!(!event_impacts_health(Some("tun"), &event));
+    }
+
+    #[test]
+    fn clock_stamp_applies_timezone_offset() {
+        assert_eq!(clock_stamp(SystemTime::UNIX_EPOCH, 8 * 60 * 60), "08:00:00");
+        assert_eq!(
+            clock_stamp(SystemTime::UNIX_EPOCH, -(5 * 60 * 60 + 30 * 60)),
+            "18:30:00"
+        );
     }
 
     #[test]
@@ -959,6 +979,7 @@ mod tests {
             path: None,
             log_file: PathBuf::from("proxy.log"),
             log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
             pid: 1,
         });
         let event = trace_event(
@@ -974,6 +995,34 @@ mod tests {
 
         assert_eq!(snapshot.total_warnings, 1);
         assert!(snapshot.last_warning_at.is_none());
+    }
+
+    #[test]
+    fn recent_events_use_monitor_timezone() {
+        let mut snapshot = SnapshotState::default();
+        snapshot.set_context(MonitorContext {
+            command_label: "client".to_owned(),
+            mode_label: "native-http".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("proxy.log"),
+            log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 8 * 60 * 60,
+            pid: 1,
+        });
+
+        snapshot.ingest(&trace_event(
+            "INFO",
+            "client listening",
+            &[("listen", "127.0.0.1:1080")],
+        ));
+
+        assert!(
+            snapshot.recent_events[0].starts_with("08:00:00 [INFO]"),
+            "{}",
+            snapshot.recent_events[0]
+        );
     }
 
     #[test]

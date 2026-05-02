@@ -50,7 +50,7 @@ struct Cli {
         long,
         global = true,
         env = "RUNNEL_LOG_TIMEZONE",
-        default_value = "utc",
+        default_value = "local",
         help = "Timezone for log timestamps: utc, local, +08:00, or Asia/Shanghai"
     )]
     log_timezone: String,
@@ -170,11 +170,7 @@ fn default_config_paths_for(
         push_legacy_home_config_paths(&mut paths, &mut seen, home);
     }
     if let Some(xdg_config_home) = xdg_config_home {
-        push_config_path(
-            &mut paths,
-            &mut seen,
-            xdg_config_home.join("runnel").join("config.yaml"),
-        );
+        push_config_file_variants(&mut paths, &mut seen, &xdg_config_home.join("runnel"));
     }
     if let Some(home) = home {
         push_modern_home_config_paths(&mut paths, &mut seen, home);
@@ -185,11 +181,7 @@ fn default_config_paths_for(
     }
 
     #[cfg(unix)]
-    push_config_path(
-        &mut paths,
-        &mut seen,
-        PathBuf::from("/etc/runnel/config.yaml"),
-    );
+    push_config_file_variants(&mut paths, &mut seen, Path::new("/etc/runnel"));
 
     paths
 }
@@ -199,7 +191,7 @@ fn push_legacy_home_config_paths(
     seen: &mut BTreeSet<PathBuf>,
     home: &Path,
 ) {
-    push_config_path(paths, seen, home.join(".runnel").join("config.yaml"));
+    push_config_file_variants(paths, seen, &home.join(".runnel"));
 }
 
 fn push_modern_home_config_paths(
@@ -207,21 +199,22 @@ fn push_modern_home_config_paths(
     seen: &mut BTreeSet<PathBuf>,
     home: &Path,
 ) {
-    push_config_path(
-        paths,
-        seen,
-        home.join(".config").join("runnel").join("config.yaml"),
-    );
+    push_config_file_variants(paths, seen, &home.join(".config").join("runnel"));
 
     #[cfg(target_os = "macos")]
-    push_config_path(
+    push_config_file_variants(
         paths,
         seen,
-        home.join("Library")
+        &home
+            .join("Library")
             .join("Application Support")
-            .join("runnel")
-            .join("config.yaml"),
+            .join("runnel"),
     );
+}
+
+fn push_config_file_variants(paths: &mut Vec<PathBuf>, seen: &mut BTreeSet<PathBuf>, dir: &Path) {
+    push_config_path(paths, seen, dir.join("config.yaml"));
+    push_config_path(paths, seen, dir.join("config.yml"));
 }
 
 fn push_config_path(paths: &mut Vec<PathBuf>, seen: &mut BTreeSet<PathBuf>, path: PathBuf) {
@@ -417,14 +410,22 @@ async fn main() -> Result<()> {
     )?;
     tun::set_embedded_tui(cli.tui);
     let _pid_file = maybe_create_pid_file(&cli, &observability.log_file)?;
-    if let Some(context) = monitor_context(&cli, observability.log_file.clone()) {
+    if let Some(context) = monitor_context(
+        &cli,
+        observability.log_file.clone(),
+        observability.log_timezone_offset_secs,
+    ) {
         telemetry::set_context(context);
         if cli.daemon || cli.telemetry_sock.is_some() {
             let socket = resolve_socket_for_service(&cli, &observability.log_file)?;
             telemetry::start_socket_server(socket).await?;
         }
     }
-    let dashboard_context = dashboard_context(&cli, observability.log_file.clone());
+    let dashboard_context = dashboard_context(
+        &cli,
+        observability.log_file.clone(),
+        observability.log_timezone_offset_secs,
+    );
 
     let command = async move {
         match cli.command {
@@ -604,6 +605,7 @@ fn read_file_tail(path: &Path, max_lines: usize) -> Result<String> {
 struct ObservabilityGuard {
     _file_guard: tracing_appender::non_blocking::WorkerGuard,
     log_file: PathBuf,
+    log_timezone_offset_secs: i32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -749,6 +751,7 @@ fn init_tracing(
     let file_appender = build_log_file_appender(&log_file)?;
     let (file_writer, file_guard) = tracing_appender::non_blocking(file_appender);
     let timer = log_timer(log_timezone)?;
+    let log_timezone_offset_secs = timer.offset.whole_seconds();
 
     let file_layer = fmt::layer()
         .with_timer(timer)
@@ -776,6 +779,7 @@ fn init_tracing(
     Ok(ObservabilityGuard {
         _file_guard: file_guard,
         log_file,
+        log_timezone_offset_secs,
     })
 }
 
@@ -850,6 +854,7 @@ mod tests {
         first_existing_config_path, parse_log_timezone, read_file_tail, run_utility_command,
         wait_for_daemon_startup,
     };
+    use clap::CommandFactory;
     use runnel::wg;
     use std::{
         ffi::OsString,
@@ -868,8 +873,11 @@ mod tests {
         );
 
         assert_eq!(paths[0], PathBuf::from("/home/alice/.runnel/config.yaml"));
-        assert_eq!(paths[1], PathBuf::from("/xdg/runnel/config.yaml"));
+        assert_eq!(paths[1], PathBuf::from("/home/alice/.runnel/config.yml"));
+        assert_eq!(paths[2], PathBuf::from("/xdg/runnel/config.yaml"));
+        assert_eq!(paths[3], PathBuf::from("/xdg/runnel/config.yml"));
         assert!(paths.contains(&PathBuf::from("/home/alice/.config/runnel/config.yaml")));
+        assert!(paths.contains(&PathBuf::from("/home/alice/.config/runnel/config.yml")));
         assert_eq!(
             paths
                 .iter()
@@ -877,8 +885,18 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(
+            paths
+                .iter()
+                .filter(|path| *path == &PathBuf::from("/home/alice/.runnel/config.yml"))
+                .count(),
+            1
+        );
         #[cfg(unix)]
-        assert!(paths.ends_with(&[PathBuf::from("/etc/runnel/config.yaml")]));
+        assert!(paths.ends_with(&[
+            PathBuf::from("/etc/runnel/config.yaml"),
+            PathBuf::from("/etc/runnel/config.yml")
+        ]));
     }
 
     #[test]
@@ -985,6 +1003,22 @@ mod tests {
             })),
             PathBuf::from("~/.runnel/logs/client.log")
         );
+    }
+
+    #[test]
+    fn log_timezone_defaults_to_local() {
+        let command = Cli::command();
+        let log_timezone = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "log_timezone")
+            .expect("log timezone argument");
+        let defaults = log_timezone
+            .get_default_values()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(defaults, vec!["local"]);
     }
 
     #[test]

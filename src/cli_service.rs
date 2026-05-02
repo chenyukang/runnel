@@ -96,7 +96,11 @@ fn service_descriptor(command: &Commands) -> Option<ServiceDescriptor> {
     }
 }
 
-pub(super) fn dashboard_context(cli: &Cli, log_file: PathBuf) -> Option<tui::DashboardContext> {
+pub(super) fn dashboard_context(
+    cli: &Cli,
+    log_file: PathBuf,
+    log_timezone_offset_secs: i32,
+) -> Option<tui::DashboardContext> {
     if !cli.tui {
         return None;
     }
@@ -110,10 +114,15 @@ pub(super) fn dashboard_context(cli: &Cli, log_file: PathBuf) -> Option<tui::Das
         path: descriptor.path,
         log_file,
         log_filter: cli.log.clone(),
+        log_timezone_offset_secs,
     })
 }
 
-pub(super) fn monitor_context(cli: &Cli, log_file: PathBuf) -> Option<telemetry::MonitorContext> {
+pub(super) fn monitor_context(
+    cli: &Cli,
+    log_file: PathBuf,
+    log_timezone_offset_secs: i32,
+) -> Option<telemetry::MonitorContext> {
     let descriptor = service_descriptor(&cli.command)?;
     Some(telemetry::MonitorContext {
         command_label: descriptor.command_label,
@@ -123,6 +132,7 @@ pub(super) fn monitor_context(cli: &Cli, log_file: PathBuf) -> Option<telemetry:
         path: descriptor.path,
         log_file,
         log_filter: cli.log.clone(),
+        log_timezone_offset_secs,
         pid: std::process::id(),
     })
 }

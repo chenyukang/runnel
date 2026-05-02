@@ -48,6 +48,7 @@ pub struct DashboardContext {
     pub path: Option<String>,
     pub log_file: PathBuf,
     pub log_filter: String,
+    pub log_timezone_offset_secs: i32,
 }
 
 pub async fn run(
@@ -175,6 +176,7 @@ impl From<MonitorContext> for DashboardContext {
             path: value.path,
             log_file: value.log_file,
             log_filter: value.log_filter,
+            log_timezone_offset_secs: value.log_timezone_offset_secs,
         }
     }
 }
@@ -353,7 +355,7 @@ impl DashboardApp {
                 .unwrap_or_else(|| "remote".to_owned());
 
             self.recent_targets.push_front(RecentTarget {
-                seen_at: clock_stamp(event.at),
+                seen_at: clock_stamp(event.at, self.context.log_timezone_offset_secs),
                 link: link_from_target(&target),
                 route,
                 detail: String::new(),
@@ -386,7 +388,7 @@ impl DashboardApp {
             .get("detail")
             .cloned()
             .unwrap_or_else(|| recent_domain_default_detail(&route));
-        let seen_at = clock_stamp(event.at);
+        let seen_at = clock_stamp(event.at, self.context.log_timezone_offset_secs);
 
         if let Some(index) = self
             .recent_targets
@@ -494,7 +496,7 @@ impl DashboardApp {
 
         self.recent_events.push_front(format!(
             "{} [{}] {}{}",
-            clock_stamp(event.at),
+            clock_stamp(event.at, self.context.log_timezone_offset_secs),
             event.level,
             event.message,
             suffix
@@ -945,14 +947,15 @@ fn wave_title(label: &str, history: &[u64]) -> String {
     )
 }
 
-fn clock_stamp(at: SystemTime) -> String {
+fn clock_stamp(at: SystemTime, offset_secs: i32) -> String {
     let elapsed = at
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let seconds = elapsed % 60;
-    let minutes = (elapsed / 60) % 60;
-    let hours = (elapsed / 3600) % 24;
+    let local_elapsed = (elapsed as i64 + i64::from(offset_secs)).rem_euclid(86_400);
+    let seconds = local_elapsed % 60;
+    let minutes = (local_elapsed / 60) % 60;
+    let hours = local_elapsed / 3600;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
@@ -1230,6 +1233,7 @@ mod tests {
             path: None,
             log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
         });
 
         app.ingest(trace_event(
@@ -1256,6 +1260,7 @@ mod tests {
             path: None,
             log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
         });
 
         app.ingest(trace_event(
@@ -1287,6 +1292,7 @@ mod tests {
             path: None,
             log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
         });
 
         app.ingest(trace_event(
@@ -1314,6 +1320,7 @@ mod tests {
             path: None,
             log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
         });
 
         app.ingest(trace_event(
@@ -1347,6 +1354,7 @@ mod tests {
             path: None,
             log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
         });
 
         for _ in 0..3 {
@@ -1382,6 +1390,7 @@ mod tests {
             path: None,
             log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
         });
 
         app.ingest(trace_event(
@@ -1425,6 +1434,7 @@ mod tests {
             path: None,
             log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
         });
 
         app.ingest(trace_event(
@@ -1442,6 +1452,32 @@ mod tests {
     }
 
     #[test]
+    fn recent_event_uses_dashboard_timezone() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "client".to_owned(),
+            mode_label: "native-http".to_owned(),
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("runnel.log"),
+            log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 8 * 60 * 60,
+        });
+
+        app.ingest(trace_event(
+            "INFO",
+            "client listening",
+            &[("listen", "127.0.0.1:1080")],
+        ));
+
+        assert!(
+            app.recent_events[0].starts_with("08:00:00 [INFO]"),
+            "{}",
+            app.recent_events[0]
+        );
+    }
+
+    #[test]
     fn wg_context_renames_recent_domains_panel() {
         let context = DashboardContext {
             command_label: "wg-client".to_owned(),
@@ -1451,6 +1487,7 @@ mod tests {
             path: None,
             log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
         };
 
         assert_eq!(recent_targets_title(&context), "Recent Domains");
@@ -1468,6 +1505,7 @@ mod tests {
             path: None,
             log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
         };
         let item = RecentTarget {
             seen_at: "08:27:01".to_owned(),
@@ -1494,6 +1532,7 @@ mod tests {
             path: None,
             log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
         };
         let item = RecentTarget {
             seen_at: "08:27:01".to_owned(),
@@ -1521,6 +1560,7 @@ mod tests {
             path: None,
             log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
         };
         let blocked = RecentTarget {
             seen_at: "08:27:01".to_owned(),
@@ -1555,6 +1595,7 @@ mod tests {
             path: None,
             log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
         });
 
         app.ingest(trace_event(
@@ -1590,6 +1631,7 @@ mod tests {
             path: None,
             log_file: PathBuf::from("runnel.log"),
             log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
         };
         let item = RecentTarget {
             seen_at: "08:27:01".to_owned(),
