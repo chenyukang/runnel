@@ -15,7 +15,7 @@ client:
       - https://easylist.to/easylist/easylist.txt
       - https://easylist.to/easylist/easyprivacy.txt
       - https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt
-    cache_dir: ~/.cache/runnel/adblock
+    cache_dir: ~/.runnel/cache/adblock
     update_interval_hours: 24
     decision_cache_ttl_secs: 300
     fail_open: true

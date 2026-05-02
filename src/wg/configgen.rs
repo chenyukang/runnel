@@ -215,7 +215,7 @@ fn default_adblock_config() -> GeneratedAdblockConfig {
     GeneratedAdblockConfig {
         enabled: true,
         lists: DEFAULT_ADBLOCK_LISTS.to_vec(),
-        cache_dir: "~/.cache/runnel/adblock",
+        cache_dir: "~/.runnel/cache/adblock",
         update_interval_hours: 24,
         decision_cache_ttl_secs: 300,
         fail_open: true,
@@ -245,7 +245,10 @@ mod tests {
     use crate::config::FileConfig;
     use crate::wg::keys::public_key_from_private_key;
     use crate::wg::{WgEngine, WgObfsMode};
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::{
+        net::{IpAddr, Ipv4Addr},
+        path::Path,
+    };
 
     #[test]
     fn config_generator_outputs_crossed_key_pairs_and_parseable_yaml() {
@@ -281,6 +284,10 @@ mod tests {
         assert_eq!(generated.server.wg.listen, "0.0.0.0:51820");
         assert!(generated.client.adblock.enabled);
         assert_eq!(
+            generated.client.adblock.cache_dir,
+            "~/.runnel/cache/adblock"
+        );
+        assert_eq!(
             generated.client.adblock.lists,
             vec![
                 "https://easylist.to/easylist/easylist.txt",
@@ -311,6 +318,10 @@ mod tests {
         let adblock = client.adblock.as_ref().expect("generated adblock section");
         assert_eq!(adblock.enabled, Some(true));
         assert_eq!(adblock.lists.len(), 3);
+        assert_eq!(
+            adblock.cache_dir.as_deref(),
+            Some(Path::new("~/.runnel/cache/adblock"))
+        );
         let client_wg = parsed
             .client
             .as_ref()

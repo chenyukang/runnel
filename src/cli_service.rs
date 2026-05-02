@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use runnel::{telemetry, tui};
 use std::path::{Path, PathBuf};
 
-use super::{Cli, Commands, DEFAULT_LOG_DIR, DEFAULT_RUN_LOG_FILE};
+use super::{Cli, Commands, DEFAULT_CURRENT_DIR, DEFAULT_LOG_DIR, DEFAULT_RUN_LOG_FILE};
 
 pub(super) const SERVICE_ROLES: &[&str] = &["client", "server", "tun"];
 
@@ -193,22 +193,8 @@ pub(super) fn default_pid_path(log_file: &Path, role: &str) -> Result<PathBuf> {
     default_sidecar_path(log_file, role, "pid")
 }
 
-pub(super) fn default_sidecar_path(log_file: &Path, role: &str, ext: &str) -> Result<PathBuf> {
-    let log_file = absolute_path(log_file)?;
-    let parent = log_file
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let stem = log_file
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("runnel");
-    let file_name = if stem == role {
-        format!("{stem}.{ext}")
-    } else {
-        format!("{stem}.{role}.{ext}")
-    };
-    Ok(parent.join(file_name))
+pub(super) fn default_sidecar_path(_log_file: &Path, role: &str, ext: &str) -> Result<PathBuf> {
+    Ok(absolute_path(Path::new(DEFAULT_CURRENT_DIR))?.join(format!("{role}.{ext}")))
 }
 
 pub(super) fn default_log_file_for_command(command: &Commands) -> PathBuf {

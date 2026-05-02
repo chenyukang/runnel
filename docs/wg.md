@@ -254,7 +254,7 @@ client:
     lists:
       - ~/.config/runnel/easylist.txt
       - https://easylist.to/easylist/easyprivacy.txt
-    cache_dir: ~/.cache/runnel/adblock
+    cache_dir: ~/.runnel/cache/adblock
     update_interval_hours: 24
     decision_cache_ttl_secs: 300
     fail_open: true

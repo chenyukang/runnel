@@ -338,13 +338,10 @@ fn cache_file_name(source: &str) -> String {
 }
 
 fn default_adblock_cache_dir() -> PathBuf {
-    if let Some(cache_home) = std::env::var_os("XDG_CACHE_HOME") {
-        return PathBuf::from(cache_home).join("runnel").join("adblock");
-    }
     if let Some(home) = std::env::var_os("HOME") {
         return PathBuf::from(home)
-            .join(".cache")
-            .join("runnel")
+            .join(".runnel")
+            .join("cache")
             .join("adblock");
     }
     std::env::temp_dir().join("runnel-adblock")
@@ -471,6 +468,18 @@ mod tests {
         };
 
         assert!(!config.is_active());
+    }
+
+    #[test]
+    fn default_cache_dir_uses_runnel_home_cache() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+
+        assert_eq!(
+            default_adblock_cache_dir(),
+            home.join(".runnel").join("cache").join("adblock")
+        );
     }
 
     #[test]

@@ -148,6 +148,9 @@ If `--log-file` is omitted, service commands use role-specific files:
 `~/.runnel/logs/client.log`, `~/.runnel/logs/server.log`, and
 `~/.runnel/logs/tun.log`.
 
+Daemon pid files and telemetry sockets default to `~/.runnel/current`, such as
+`~/.runnel/current/client.pid` and `~/.runnel/current/client.sock`.
+
 If `--config` is omitted, Runnel searches the normal user config locations such
 as: `~/.runnel/config.yaml`, `$XDG_CONFIG_HOME/runnel/config.yaml`, `~/.config/runnel/config.yaml`, `/etc/runnel/config.yaml`.
 

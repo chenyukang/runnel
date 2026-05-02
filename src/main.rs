@@ -26,6 +26,7 @@ use tracing_subscriber::{EnvFilter, fmt, fmt::time::FormatTime, prelude::*};
 const DAEMON_ENV: &str = "RUNNEL_DAEMONIZED";
 const DAEMON_STARTUP_CHECK: Duration = Duration::from_millis(1200);
 const DAEMON_STARTUP_POLL: Duration = Duration::from_millis(100);
+const DEFAULT_CURRENT_DIR: &str = "~/.runnel/current";
 const DEFAULT_LOG_DIR: &str = "~/.runnel/logs";
 const DEFAULT_RUN_LOG_FILE: &str = "~/.runnel/logs/run.log";
 
@@ -1043,8 +1044,8 @@ mod tests {
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
             return;
         };
-        let server_pid_file = home.join(".runnel/logs/server.pid");
-        let server_socket = home.join(".runnel/logs/server.sock");
+        let server_pid_file = home.join(".runnel/current/server.pid");
+        let server_socket = home.join(".runnel/current/server.sock");
         let targets =
             cli_daemon::resolve_status_targets(Path::new("ignored.log"), None, None, None, true)
                 .unwrap();
@@ -1064,6 +1065,24 @@ mod tests {
                 .telemetry_socket
                 .as_ref()
                 .is_some_and(|path| path == &server_socket)
+        );
+    }
+
+    #[test]
+    fn default_pid_and_socket_paths_use_current_dir() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+
+        assert_eq!(
+            cli_service::default_pid_path(Path::new("/var/log/runnel/client.log"), "client")
+                .unwrap(),
+            home.join(".runnel/current/client.pid")
+        );
+        assert_eq!(
+            cli_service::default_socket_path(Path::new("/var/log/runnel/client.log"), "client")
+                .unwrap(),
+            home.join(".runnel/current/client.sock")
         );
     }
 

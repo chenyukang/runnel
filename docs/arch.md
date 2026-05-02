@@ -197,7 +197,7 @@ client:
     lists:
       - ~/.config/runnel/easylist.txt
       - https://easylist.to/easylist/easyprivacy.txt
-    cache_dir: ~/.cache/runnel/adblock
+    cache_dir: ~/.runnel/cache/adblock
     update_interval_hours: 24
     decision_cache_ttl_secs: 300
     fail_open: true
@@ -315,6 +315,10 @@ If `--log-file` is omitted, service commands use role-specific log files under
 `~/.runnel/logs`, such as `~/.runnel/logs/client.log` and
 `~/.runnel/logs/server.log`. Explicit `--log-file` and YAML `log_file` values
 still take precedence.
+
+Daemon pid files and telemetry sockets default to `~/.runnel/current`, such as
+`~/.runnel/current/client.pid` and `~/.runnel/current/client.sock`. Explicit
+`--pid-file`, `--telemetry-sock`, and matching YAML values still take precedence.
 
 Log timestamps default to the machine's local timezone. Set
 `--log-timezone utc`, `RUNNEL_LOG_TIMEZONE=+08:00`, or YAML
