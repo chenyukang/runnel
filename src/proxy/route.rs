@@ -1,5 +1,6 @@
 use super::{adblock::Adblocker, socks5, socks5::TargetAddr, traffic};
 use crate::runtime::ClientRuntime;
+use crate::telemetry::TrafficState;
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
@@ -7,7 +8,10 @@ use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -17,6 +21,8 @@ use tokio::{
 };
 
 const IPV4_WILDCARD_EXPANSION_LIMIT: usize = 4096;
+const TRAFFIC_STATE_PROXYING: u8 = 0;
+const TRAFFIC_STATE_BYPASS: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -65,6 +71,7 @@ pub struct Router {
     mode: FilterMode,
     table: RuleTable,
     adblock: Option<Arc<Adblocker>>,
+    traffic_state: AtomicU8,
     cache: Mutex<HashMap<String, RouteDecision>>,
 }
 
@@ -95,21 +102,45 @@ impl Router {
             mode: runtime.filter,
             table,
             adblock,
+            traffic_state: AtomicU8::new(TRAFFIC_STATE_PROXYING),
             cache: Mutex::new(HashMap::new()),
         }))
     }
 
+    pub fn set_traffic_state(&self, state: TrafficState) {
+        self.traffic_state.store(
+            match state {
+                TrafficState::Proxying => TRAFFIC_STATE_PROXYING,
+                TrafficState::Bypass => TRAFFIC_STATE_BYPASS,
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    fn traffic_state(&self) -> TrafficState {
+        match self.traffic_state.load(Ordering::Relaxed) {
+            TRAFFIC_STATE_BYPASS => TrafficState::Bypass,
+            _ => TrafficState::Proxying,
+        }
+    }
+
     pub async fn decide(&self, target: &TargetAddr) -> Result<RouteDecision> {
-        if let Some(cached) = self.cache.lock().await.get(&cache_key(target)).copied() {
+        let state = self.traffic_state();
+        let key = cache_key(target, state);
+        if let Some(cached) = self.cache.lock().await.get(&key).copied() {
             return Ok(cached);
         }
 
-        let decision = self.decide_uncached(target).await?;
-        self.cache.lock().await.insert(cache_key(target), decision);
+        let decision = self.decide_uncached(target, state).await?;
+        self.cache.lock().await.insert(key, decision);
         Ok(decision)
     }
 
-    async fn decide_uncached(&self, target: &TargetAddr) -> Result<RouteDecision> {
+    async fn decide_uncached(
+        &self,
+        target: &TargetAddr,
+        state: TrafficState,
+    ) -> Result<RouteDecision> {
         if let Some(decision) = self.table.decide_block_only(target).await? {
             return Ok(decision);
         }
@@ -117,6 +148,9 @@ impl Router {
             && adblock.blocks_target(target).await
         {
             return Ok(RouteDecision::Block);
+        }
+        if state == TrafficState::Bypass {
+            return Ok(RouteDecision::Direct);
         }
 
         match self.mode {
@@ -310,8 +344,8 @@ impl RuleTable {
     }
 }
 
-fn cache_key(target: &TargetAddr) -> String {
-    target.to_string()
+fn cache_key(target: &TargetAddr, state: TrafficState) -> String {
+    format!("{}:{}", state.as_str(), target)
 }
 
 pub async fn relay_direct_socks(
@@ -676,6 +710,7 @@ mod tests {
             mode: FilterMode::Proxy,
             table,
             adblock: None,
+            traffic_state: AtomicU8::new(TRAFFIC_STATE_PROXYING),
             cache: Mutex::new(HashMap::new()),
         };
 
@@ -691,6 +726,53 @@ mod tests {
                 .decide(&TargetAddr::Domain("ads.xxx.com".to_owned(), 80))
                 .await
                 .expect("block rule is honored in proxy mode"),
+            RouteDecision::Block
+        );
+    }
+
+    #[tokio::test]
+    async fn bypass_state_forces_direct_after_block_rules() {
+        let table = RuleTable::load(
+            None,
+            None,
+            &RouteRuleConfig {
+                direct: Vec::new(),
+                proxy: vec!["*.example.com".to_owned()],
+                block: vec!["ads.example.com".to_owned()],
+            },
+            &RouteRuleConfig::default(),
+        )
+        .unwrap();
+        let router = Router {
+            mode: FilterMode::Proxy,
+            table,
+            adblock: None,
+            traffic_state: AtomicU8::new(TRAFFIC_STATE_PROXYING),
+            cache: Mutex::new(HashMap::new()),
+        };
+
+        assert_eq!(
+            router
+                .decide(&TargetAddr::Domain("www.example.com".to_owned(), 443))
+                .await
+                .expect("proxy mode decision"),
+            RouteDecision::Remote
+        );
+
+        router.set_traffic_state(TrafficState::Bypass);
+
+        assert_eq!(
+            router
+                .decide(&TargetAddr::Domain("www.example.com".to_owned(), 443))
+                .await
+                .expect("bypass mode decision"),
+            RouteDecision::Direct
+        );
+        assert_eq!(
+            router
+                .decide(&TargetAddr::Domain("ads.example.com".to_owned(), 443))
+                .await
+                .expect("block rule survives bypass"),
             RouteDecision::Block
         );
     }
@@ -735,6 +817,7 @@ mod tests {
             mode: FilterMode::Rule,
             table,
             adblock: Some(Adblocker::from_rules_for_test(&["||ads.qq.com^"])),
+            traffic_state: AtomicU8::new(TRAFFIC_STATE_PROXYING),
             cache: Mutex::new(HashMap::new()),
         };
 

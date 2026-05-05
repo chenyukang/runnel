@@ -88,14 +88,19 @@ pub async fn run_embedded(args: ClientArgs) -> Result<()> {
 }
 
 async fn run_with_signal_handling(args: ClientArgs, handle_signals: bool) -> Result<()> {
-    if matches!(args.effective_mode()?, ProxyMode::Wg) {
+    let mode = args.effective_mode()?;
+    if matches!(mode, ProxyMode::Wg) {
         return wg::client::run(args.wg).await;
     }
 
     args.validate_required()?;
     let system_proxy = system_proxy::maybe_activate(&args)?;
     let runtime = ClientRuntime::from_args(&args);
-    let traffic_switch = Arc::new(Mutex::new(NativeTrafficSwitch::new(system_proxy)));
+    let router = route::Router::from_runtime(&runtime).await?;
+    let traffic_switch = Arc::new(Mutex::new(NativeTrafficSwitch::new(
+        system_proxy,
+        router.clone(),
+    )));
     telemetry::set_traffic_state(telemetry::TrafficState::Proxying);
     let traffic_switch_task = tokio::spawn(run_native_traffic_switch_control(
         telemetry::init_control_channel(),
@@ -103,12 +108,11 @@ async fn run_with_signal_handling(args: ClientArgs, handle_signals: bool) -> Res
     ));
 
     let run_client = async move {
-        let mode = args.effective_mode()?;
         match mode {
-            ProxyMode::NativeHttp => run_native_http(runtime).await,
-            ProxyMode::NativeMux => mux::run_client(runtime).await,
+            ProxyMode::NativeHttp => run_native_http(runtime, router).await,
+            ProxyMode::NativeMux => mux::run_client(runtime, router).await,
             ProxyMode::DazeAshe | ProxyMode::DazeBaboon | ProxyMode::DazeCzar => {
-                crate::daze::run_client(runtime, mode).await
+                crate::daze::run_client(runtime, mode, router).await
             }
             ProxyMode::Wg => unreachable!("wg mode is dispatched before SOCKS client startup"),
         }
@@ -135,13 +139,18 @@ async fn run_with_signal_handling(args: ClientArgs, handle_signals: bool) -> Res
 struct NativeTrafficSwitch {
     state: telemetry::TrafficState,
     system_proxy: Option<system_proxy::SystemProxyGuard>,
+    router: Arc<route::Router>,
 }
 
 impl NativeTrafficSwitch {
-    fn new(system_proxy: Option<system_proxy::SystemProxyGuard>) -> Self {
+    fn new(
+        system_proxy: Option<system_proxy::SystemProxyGuard>,
+        router: Arc<route::Router>,
+    ) -> Self {
         Self {
             state: telemetry::TrafficState::Proxying,
             system_proxy,
+            router,
         }
     }
 
@@ -164,11 +173,15 @@ impl NativeTrafficSwitch {
 
         match next {
             telemetry::TrafficState::Proxying => {
+                self.router
+                    .set_traffic_state(telemetry::TrafficState::Proxying);
                 if let Some(system_proxy) = &self.system_proxy {
                     system_proxy.apply_proxy()?;
                 }
             }
             telemetry::TrafficState::Bypass => {
+                self.router
+                    .set_traffic_state(telemetry::TrafficState::Bypass);
                 if let Some(system_proxy) = &self.system_proxy {
                     system_proxy.restore_original()?;
                 }
@@ -202,8 +215,7 @@ fn emit_traffic_switch(state: telemetry::TrafficState) {
     telemetry::emit("INFO", "traffic switch", fields);
 }
 
-async fn run_native_http(runtime: ClientRuntime) -> Result<()> {
-    let router = route::Router::from_runtime(&runtime).await?;
+async fn run_native_http(runtime: ClientRuntime, router: Arc<route::Router>) -> Result<()> {
     let connector = TlsConnector::from(tls::load_client_config(runtime.ca_cert.as_deref())?);
     let (default_host, _) = tls::split_host_port(&runtime.server)?;
     let server_name = runtime

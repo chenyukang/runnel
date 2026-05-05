@@ -4,7 +4,10 @@ use std::{
     io::{self, Write},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -15,6 +18,7 @@ use tokio::{
     io::{AsyncBufReadExt, BufReader},
     net::{TcpStream, lookup_host},
     process::{Child, Command},
+    sync::Mutex,
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -24,7 +28,7 @@ use crate::{
     client::{self, ClientArgs},
     mode::ProxyMode,
     proxy::{route::FilterMode, tls},
-    system_proxy,
+    system_proxy, telemetry,
 };
 
 #[cfg(test)]
@@ -390,6 +394,18 @@ pub async fn run(mut args: TunArgs) -> Result<()> {
             return Err(err);
         }
     };
+    let traffic_switch = Arc::new(Mutex::new(TunTrafficSwitch::new(
+        args.shell.clone(),
+        up_hooks.clone(),
+        down_hooks.clone(),
+        context.clone(),
+        dns_guard,
+    )));
+    telemetry::set_traffic_state(telemetry::TrafficState::Proxying);
+    let traffic_switch_task = tokio::spawn(run_tun_traffic_switch_control(
+        telemetry::init_control_channel(),
+        Arc::clone(&traffic_switch),
+    ));
 
     let result = tokio::select! {
         result = &mut client_task => join_client(result),
@@ -405,17 +421,125 @@ pub async fn run(mut args: TunArgs) -> Result<()> {
         Err(err) => warn!(error = %err, "tun session ending with error"),
     }
 
-    drop(dns_guard);
-    shutdown(
-        &args.shell,
-        &down_hooks,
-        &context,
-        &mut helper_handle,
-        &mut client_task,
-    )
-    .await;
+    traffic_switch_task.abort();
+    shutdown_switched_tun(&traffic_switch, &mut helper_handle, &mut client_task).await;
     tun_state.clear();
     result
+}
+
+struct TunTrafficSwitch {
+    state: telemetry::TrafficState,
+    shell: String,
+    up_hooks: Vec<String>,
+    down_hooks: Vec<String>,
+    context: CommandContext,
+    dns_guard: Option<system_proxy::SystemDnsGuard>,
+}
+
+impl TunTrafficSwitch {
+    fn new(
+        shell: String,
+        up_hooks: Vec<String>,
+        down_hooks: Vec<String>,
+        context: CommandContext,
+        dns_guard: Option<system_proxy::SystemDnsGuard>,
+    ) -> Self {
+        Self {
+            state: telemetry::TrafficState::Proxying,
+            shell,
+            up_hooks,
+            down_hooks,
+            context,
+            dns_guard,
+        }
+    }
+
+    async fn switch(
+        &mut self,
+        target: telemetry::TrafficSwitchTarget,
+    ) -> telemetry::ControlResponse {
+        let previous_state = self.state;
+        match self.try_switch(target).await {
+            Ok(state) => telemetry::ControlResponse::ok(previous_state, state),
+            Err(err) => telemetry::ControlResponse::error(format!("{err:#}")),
+        }
+    }
+
+    async fn try_switch(
+        &mut self,
+        target: telemetry::TrafficSwitchTarget,
+    ) -> Result<telemetry::TrafficState> {
+        let next = target.resolve(self.state);
+        if next == self.state {
+            return Ok(self.state);
+        }
+
+        match next {
+            telemetry::TrafficState::Proxying => {
+                run_hooks("up hook", &self.shell, &self.up_hooks, &self.context).await?;
+                if let Some(dns_guard) = &self.dns_guard {
+                    dns_guard.apply_override()?;
+                }
+            }
+            telemetry::TrafficState::Bypass => {
+                if let Some(dns_guard) = &self.dns_guard {
+                    dns_guard.restore_original()?;
+                }
+                run_hooks("down hook", &self.shell, &self.down_hooks, &self.context).await?;
+            }
+        }
+
+        self.state = next;
+        telemetry::set_traffic_state(next);
+        emit_traffic_switch(next);
+        Ok(next)
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        if self.state == telemetry::TrafficState::Proxying {
+            if let Some(dns_guard) = &self.dns_guard {
+                dns_guard.restore_original()?;
+            }
+            run_hooks("down hook", &self.shell, &self.down_hooks, &self.context).await?;
+            self.state = telemetry::TrafficState::Bypass;
+            telemetry::set_traffic_state(telemetry::TrafficState::Bypass);
+        }
+        Ok(())
+    }
+}
+
+async fn run_tun_traffic_switch_control(
+    mut receiver: tokio::sync::mpsc::Receiver<telemetry::ControlEnvelope>,
+    traffic_switch: Arc<Mutex<TunTrafficSwitch>>,
+) {
+    while let Some(envelope) = receiver.recv().await {
+        let response = match envelope.request.command {
+            telemetry::ControlCommand::Switch { target } => {
+                traffic_switch.lock().await.switch(target).await
+            }
+        };
+        envelope.respond(response);
+    }
+}
+
+async fn shutdown_switched_tun(
+    traffic_switch: &Arc<Mutex<TunTrafficSwitch>>,
+    helper: &mut RunningTunHelper,
+    client_task: &mut JoinHandle<Result<()>>,
+) {
+    if let Err(err) = traffic_switch.lock().await.shutdown().await {
+        warn!(error = %err, "tun down hook failed");
+    }
+
+    shutdown_tun_helper(helper).await;
+    client_task.abort();
+    let _ = client_task.await;
+}
+
+fn emit_traffic_switch(state: telemetry::TrafficState) {
+    let mut fields = BTreeMap::new();
+    fields.insert("state".to_owned(), state.as_str().to_owned());
+    telemetry::emit("INFO", "traffic switch", fields);
 }
 
 fn apply_client_tun_dns_override(args: &mut ClientArgs, context: &CommandContext) {

@@ -14,8 +14,7 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-pub(super) async fn run_client(runtime: ClientRuntime) -> Result<()> {
-    let router = route::Router::from_runtime(&runtime).await?;
+pub(super) async fn run_client(runtime: ClientRuntime, router: Arc<route::Router>) -> Result<()> {
     let listener = TcpListener::bind(&runtime.listen)
         .await
         .with_context(|| format!("failed to bind {}", runtime.listen))?;

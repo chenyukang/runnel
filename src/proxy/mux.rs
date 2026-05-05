@@ -290,9 +290,8 @@ impl MuxClient {
     }
 }
 
-pub(crate) async fn run_client(runtime: ClientRuntime) -> Result<()> {
+pub(crate) async fn run_client(runtime: ClientRuntime, router: Arc<route::Router>) -> Result<()> {
     let session = Arc::new(MuxClient::new(&runtime)?);
-    let router = route::Router::from_runtime(&runtime).await?;
     let listener = TcpListener::bind(&runtime.listen)
         .await
         .with_context(|| format!("failed to bind {}", runtime.listen))?;

@@ -120,6 +120,7 @@ impl ServiceRole {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
 enum SwitchRole {
     Client,
+    Tun,
     WgClient,
 }
 
@@ -127,6 +128,7 @@ impl SwitchRole {
     fn service_role(self) -> ServiceRole {
         match self {
             Self::Client => ServiceRole::Client,
+            Self::Tun => ServiceRole::Tun,
             Self::WgClient => ServiceRole::WgClient,
         }
     }
