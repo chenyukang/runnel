@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    fmt,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
@@ -8,13 +9,14 @@ use std::{
 
 use anyhow::{Context as AnyhowContext, Result};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
 const HISTORY_LEN: usize = 48;
 const RECENT_EVENTS: usize = 40;
 const RECENT_TARGETS: usize = RECENT_EVENTS;
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TraceEvent {
@@ -28,6 +30,8 @@ pub struct TraceEvent {
 pub struct MonitorContext {
     pub command_label: String,
     pub mode_label: String,
+    #[serde(default)]
+    pub traffic_state: TrafficState,
     pub listen: Option<String>,
     pub upstream: Option<String>,
     pub path: Option<String>,
@@ -96,14 +100,116 @@ pub struct RecentTargetSnapshot {
     pub downloaded: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TrafficState {
+    #[default]
+    Proxying,
+    Bypass,
+}
+
+impl TrafficState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Proxying => "proxying",
+            Self::Bypass => "bypass",
+        }
+    }
+}
+
+impl fmt::Display for TrafficState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TrafficSwitchTarget {
+    Toggle,
+    Proxying,
+    Bypass,
+}
+
+impl TrafficSwitchTarget {
+    pub fn resolve(self, current: TrafficState) -> TrafficState {
+        match self {
+            Self::Toggle => match current {
+                TrafficState::Proxying => TrafficState::Bypass,
+                TrafficState::Bypass => TrafficState::Proxying,
+            },
+            Self::Proxying => TrafficState::Proxying,
+            Self::Bypass => TrafficState::Bypass,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ControlRequest {
+    pub command: ControlCommand,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum ControlCommand {
+    Switch { target: TrafficSwitchTarget },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ControlResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub previous_state: Option<TrafficState>,
+    pub state: Option<TrafficState>,
+    pub message: String,
+}
+
+impl ControlResponse {
+    pub fn ok(previous_state: TrafficState, state: TrafficState) -> Self {
+        Self {
+            ok: true,
+            previous_state: Some(previous_state),
+            state: Some(state),
+            message: format!(
+                "traffic state switched {} -> {}",
+                previous_state.as_str(),
+                state.as_str()
+            ),
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            previous_state: None,
+            state: None,
+            message: message.into(),
+        }
+    }
+}
+
+pub struct ControlEnvelope {
+    pub request: ControlRequest,
+    response: oneshot::Sender<ControlResponse>,
+}
+
+impl ControlEnvelope {
+    pub fn respond(self, response: ControlResponse) {
+        let _ = self.response.send(response);
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
 enum WireMessage {
     Snapshot(DashboardSnapshot),
     Event(TraceEvent),
+    Control(ControlRequest),
+    ControlResponse(ControlResponse),
 }
 
 static TELEMETRY: OnceLock<TelemetryHub> = OnceLock::new();
+static CONTROL: OnceLock<Mutex<Option<mpsc::Sender<ControlEnvelope>>>> = OnceLock::new();
 
 struct TelemetryHub {
     sender: broadcast::Sender<TraceEvent>,
@@ -155,6 +261,12 @@ impl Default for SnapshotState {
 impl SnapshotState {
     fn set_context(&mut self, context: MonitorContext) {
         self.context = Some(context);
+    }
+
+    fn set_traffic_state(&mut self, state: TrafficState) {
+        if let Some(context) = &mut self.context {
+            context.traffic_state = state;
+        }
     }
 
     fn ingest(&mut self, event: &TraceEvent) {
@@ -480,6 +592,24 @@ pub fn set_context(context: MonitorContext) {
     }
 }
 
+pub fn set_traffic_state(state: TrafficState) {
+    let Some(hub) = TELEMETRY.get() else {
+        return;
+    };
+    if let Ok(mut snapshot) = hub.snapshot.lock() {
+        snapshot.set_traffic_state(state);
+    }
+}
+
+pub fn init_control_channel() -> mpsc::Receiver<ControlEnvelope> {
+    let (sender, receiver) = mpsc::channel(8);
+    let slot = CONTROL.get_or_init(|| Mutex::new(None));
+    if let Ok(mut slot) = slot.lock() {
+        *slot = Some(sender);
+    }
+    receiver
+}
+
 pub fn subscribe() -> Option<broadcast::Receiver<TraceEvent>> {
     TELEMETRY.get().map(|hub| hub.sender.subscribe())
 }
@@ -666,6 +796,9 @@ pub async fn attach_socket(
     {
         WireMessage::Snapshot(snapshot) => snapshot,
         WireMessage::Event(_) => anyhow::bail!("telemetry stream did not start with a snapshot"),
+        WireMessage::Control(_) | WireMessage::ControlResponse(_) => {
+            anyhow::bail!("telemetry stream did not start with a snapshot")
+        }
     };
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -686,6 +819,85 @@ pub async fn attach_socket(
     });
 
     Ok((snapshot, rx))
+}
+
+#[cfg(unix)]
+pub async fn switch_socket(path: &Path, target: TrafficSwitchTarget) -> Result<ControlResponse> {
+    use tokio::{
+        io::{AsyncBufReadExt, BufReader},
+        net::UnixStream,
+    };
+
+    let stream = UnixStream::connect(path)
+        .await
+        .with_context(|| format!("failed to connect telemetry socket {}", path.display()))?;
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    let first = lines
+        .next_line()
+        .await
+        .context("failed to read telemetry snapshot")?
+        .context("telemetry socket closed before snapshot")?;
+    let previous_state = match serde_json::from_str::<WireMessage>(&first)
+        .context("failed to parse telemetry snapshot")?
+    {
+        WireMessage::Snapshot(snapshot) => snapshot.context.traffic_state,
+        WireMessage::Event(_) | WireMessage::Control(_) | WireMessage::ControlResponse(_) => {
+            anyhow::bail!("telemetry stream did not start with a snapshot")
+        }
+    };
+
+    write_wire_message(
+        &mut writer,
+        &WireMessage::Control(ControlRequest {
+            command: ControlCommand::Switch { target },
+        }),
+    )
+    .await?;
+
+    let started_at = Instant::now();
+    loop {
+        let remaining = CONTROL_TIMEOUT
+            .checked_sub(started_at.elapsed())
+            .context("timed out waiting for switch response")?;
+        let line = tokio::time::timeout(remaining, lines.next_line())
+            .await
+            .context("timed out waiting for switch response")?
+            .context("failed to read switch response")?
+            .context("telemetry socket closed before switch response")?;
+        match serde_json::from_str::<WireMessage>(&line)
+            .context("failed to parse switch response")?
+        {
+            WireMessage::ControlResponse(response) => {
+                return Ok(control_response_with_state_fallback(
+                    response,
+                    previous_state,
+                    target,
+                ));
+            }
+            WireMessage::Event(_) | WireMessage::Snapshot(_) => continue,
+            WireMessage::Control(_) => continue,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub async fn switch_socket(_path: &Path, _target: TrafficSwitchTarget) -> Result<ControlResponse> {
+    anyhow::bail!("telemetry control is only supported on Unix platforms")
+}
+
+fn control_response_with_state_fallback(
+    mut response: ControlResponse,
+    previous_state: TrafficState,
+    target: TrafficSwitchTarget,
+) -> ControlResponse {
+    if response.previous_state.is_none() {
+        response.previous_state = Some(previous_state);
+    }
+    if response.ok && response.state.is_none() {
+        response.state = Some(target.resolve(previous_state));
+    }
+    response
 }
 
 #[cfg(not(unix))]
@@ -853,29 +1065,48 @@ fn split_target(target: &str) -> (String, Option<u16>) {
 
 #[cfg(unix)]
 async fn handle_subscriber(
-    mut stream: tokio::net::UnixStream,
+    stream: tokio::net::UnixStream,
     sender: broadcast::Sender<TraceEvent>,
     snapshot: Arc<Mutex<SnapshotState>>,
 ) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let (reader, mut writer) = stream.into_split();
     if let Some(snapshot) = current_snapshot(&snapshot) {
-        write_wire_message(&mut stream, &WireMessage::Snapshot(snapshot)).await?;
+        write_wire_message(&mut writer, &WireMessage::Snapshot(snapshot)).await?;
     } else {
         anyhow::bail!("telemetry context is not ready yet");
     }
 
+    let mut lines = BufReader::new(reader).lines();
     let mut receiver = sender.subscribe();
     loop {
-        match receiver.recv().await {
-            Ok(event) => {
-                if write_wire_message(&mut stream, &WireMessage::Event(event))
-                    .await
-                    .is_err()
-                {
+        tokio::select! {
+            line = lines.next_line() => {
+                let Some(line) = line.context("failed to read telemetry control message")? else {
                     break;
+                };
+                let Ok(message) = serde_json::from_str::<WireMessage>(&line) else {
+                    continue;
+                };
+                if let WireMessage::Control(request) = message {
+                    let response = dispatch_control(request).await;
+                    if write_wire_message(&mut writer, &WireMessage::ControlResponse(response)).await.is_err() {
+                        break;
+                    }
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => break,
+            event = receiver.recv() => {
+                match event {
+                    Ok(event) => {
+                        if write_wire_message(&mut writer, &WireMessage::Event(event)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
         }
     }
 
@@ -883,12 +1114,11 @@ async fn handle_subscriber(
 }
 
 #[cfg(unix)]
-async fn write_wire_message(
-    stream: &mut tokio::net::UnixStream,
-    message: &WireMessage,
-) -> Result<()> {
+async fn write_wire_message<W>(stream: &mut W, message: &WireMessage) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::AsyncWriteExt;
-
     let mut encoded = serde_json::to_vec(message).context("failed to encode telemetry message")?;
     encoded.push(b'\n');
     stream
@@ -898,6 +1128,28 @@ async fn write_wire_message(
     Ok(())
 }
 
+async fn dispatch_control(request: ControlRequest) -> ControlResponse {
+    let sender = CONTROL
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|slot| slot.clone()));
+    let Some(sender) = sender else {
+        return ControlResponse::error("runtime switch is not supported by this daemon");
+    };
+    let (response, receiver) = oneshot::channel();
+    if sender
+        .send(ControlEnvelope { request, response })
+        .await
+        .is_err()
+    {
+        return ControlResponse::error("runtime switch handler is not available");
+    }
+    match tokio::time::timeout(CONTROL_TIMEOUT, receiver).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => ControlResponse::error("runtime switch handler closed"),
+        Err(_) => ControlResponse::error("runtime switch handler timed out"),
+    }
+}
+
 fn current_snapshot(snapshot: &Arc<Mutex<SnapshotState>>) -> Option<DashboardSnapshot> {
     snapshot.lock().ok()?.snapshot()
 }
@@ -905,8 +1157,9 @@ fn current_snapshot(snapshot: &Arc<Mutex<SnapshotState>>) -> Option<DashboardSna
 #[cfg(test)]
 mod tests {
     use super::{
-        MonitorContext, SnapshotState, TraceEvent, clock_stamp, event_impacts_health,
-        is_loopback_peer,
+        ControlResponse, MonitorContext, SnapshotState, TraceEvent, TrafficState,
+        TrafficSwitchTarget, clock_stamp, control_response_with_state_fallback,
+        event_impacts_health, is_loopback_peer,
     };
     use std::{collections::BTreeMap, path::PathBuf, time::SystemTime};
 
@@ -930,6 +1183,23 @@ mod tests {
             clock_stamp(SystemTime::UNIX_EPOCH, -(5 * 60 * 60 + 30 * 60)),
             "18:30:00"
         );
+    }
+
+    #[test]
+    fn switch_response_uses_snapshot_state_as_old_daemon_fallback() {
+        let response = control_response_with_state_fallback(
+            ControlResponse {
+                ok: true,
+                previous_state: None,
+                state: Some(TrafficState::Bypass),
+                message: "ok".to_owned(),
+            },
+            TrafficState::Proxying,
+            TrafficSwitchTarget::Toggle,
+        );
+
+        assert_eq!(response.previous_state, Some(TrafficState::Proxying));
+        assert_eq!(response.state, Some(TrafficState::Bypass));
     }
 
     #[test]
@@ -974,6 +1244,7 @@ mod tests {
         snapshot.set_context(MonitorContext {
             command_label: "tun".to_owned(),
             mode_label: "native-http".to_owned(),
+            traffic_state: TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
@@ -1003,6 +1274,7 @@ mod tests {
         snapshot.set_context(MonitorContext {
             command_label: "client".to_owned(),
             mode_label: "native-http".to_owned(),
+            traffic_state: TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,

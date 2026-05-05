@@ -276,6 +276,25 @@ IP connections will not trigger domain routing. CDN/shared IP answers can also
 affect other domains that resolve to the same host IP while the client is
 running.
 
+## Runtime Bypass
+
+When a WG client daemon is running and you temporarily want normal local-network
+access, use `switch` instead of stopping the daemon:
+
+```bash
+sudo runnel switch client
+sudo runnel switch client --bypass
+sudo runnel switch client --proxy
+```
+
+The first command toggles between `proxying` and `bypass`. Bypass removes the WG
+client's active route hooks and restores the DNS settings that were present
+before startup, while the daemon, telemetry socket, and WireGuard device process
+stay alive. Switching back reapplies the same route hook plan and DNS override,
+so configured `ip_rules` and `domain_rules` return to the same behavior. Dynamic
+`domain_rules.direct` host routes that were already installed are preserved
+across the bypass window and are still cleaned up when the daemon exits.
+
 ## DNS Domain Capture
 
 By default WG mode can see aggregate tunnel bytes, not domains. To populate TUI

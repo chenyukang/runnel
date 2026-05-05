@@ -1,6 +1,8 @@
 #[cfg(any(target_os = "macos", test))]
 use anyhow::Context;
 use anyhow::{Result, bail};
+#[cfg(any(target_os = "macos", test))]
+use std::net::IpAddr;
 #[cfg(target_os = "macos")]
 use tracing::{info, warn};
 
@@ -29,6 +31,8 @@ struct ServiceDnsSnapshot {
 #[derive(Debug)]
 pub struct SystemProxyGuard {
     snapshots: Vec<ServiceProxySnapshot>,
+    host: String,
+    port: u16,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -39,6 +43,7 @@ pub struct SystemProxyGuard;
 #[derive(Debug)]
 pub struct SystemDnsGuard {
     snapshots: Vec<ServiceDnsSnapshot>,
+    servers: Vec<String>,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -123,7 +128,29 @@ impl SystemProxyGuard {
             applied.push(snapshot.clone());
         }
 
-        Ok(Self { snapshots })
+        Ok(Self {
+            snapshots,
+            host,
+            port,
+        })
+    }
+
+    pub fn apply_proxy(&self) -> Result<()> {
+        for snapshot in &self.snapshots {
+            set_service_proxy(&snapshot.name, &self.host, self.port)?;
+            info!(
+                service = %snapshot.name,
+                host = %self.host,
+                port = self.port,
+                "enabled macOS SOCKS system proxy"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn restore_original(&self) -> Result<()> {
+        restore_many(self.snapshots.iter().rev());
+        Ok(())
     }
 }
 
@@ -154,7 +181,69 @@ impl SystemDnsGuard {
             applied.push(snapshot.clone());
         }
 
-        Ok(Self { snapshots })
+        Ok(Self {
+            snapshots,
+            servers: servers.to_vec(),
+        })
+    }
+
+    pub fn apply_override(&self) -> Result<()> {
+        for snapshot in &self.snapshots {
+            set_service_dns_servers(&snapshot.name, &self.servers)?;
+            info!(
+                service = %snapshot.name,
+                servers = ?self.servers,
+                "overrode macOS DNS servers for tunnel session"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn restore_original(&self) -> Result<()> {
+        restore_dns_many(self.snapshots.iter().rev());
+        Ok(())
+    }
+
+    pub fn direct_dns_upstream(&self) -> Option<IpAddr> {
+        self.snapshots
+            .iter()
+            .flat_map(|snapshot| snapshot.servers.iter())
+            .filter_map(|server| parse_direct_dns_ip(server))
+            .next()
+            .or_else(|| {
+                self.snapshots.iter().find_map(|snapshot| {
+                    read_service_router(&snapshot.name)
+                        .ok()
+                        .flatten()
+                        .filter(|ip| is_direct_dns_ip(*ip))
+                })
+            })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl SystemProxyGuard {
+    pub fn apply_proxy(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn restore_original(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl SystemDnsGuard {
+    pub fn apply_override(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn restore_original(&self) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn direct_dns_upstream(&self) -> Option<std::net::IpAddr> {
+        None
     }
 }
 
@@ -195,7 +284,11 @@ fn restore_dns_many<'a>(snapshots: impl IntoIterator<Item = &'a ServiceDnsSnapsh
     for snapshot in snapshots {
         match restore_service_dns(snapshot) {
             Ok(()) => {
-                info!(service = %snapshot.name, "restored macOS DNS servers");
+                info!(
+                    service = %snapshot.name,
+                    servers = ?snapshot.servers,
+                    "restored macOS DNS servers"
+                );
             }
             Err(err) => {
                 warn!(
@@ -260,6 +353,12 @@ fn read_service_dns_snapshot(service: &str) -> Result<ServiceDnsSnapshot> {
         name: service.to_owned(),
         servers: parse_dns_servers(&output),
     })
+}
+
+#[cfg(target_os = "macos")]
+fn read_service_router(service: &str) -> Result<Option<IpAddr>> {
+    let output = run_networksetup(["-getinfo", service])?;
+    Ok(parse_service_router(&output))
 }
 
 #[cfg(target_os = "macos")]
@@ -375,6 +474,36 @@ fn parse_dns_servers(output: &str) -> Vec<String> {
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn parse_service_router(output: &str) -> Option<IpAddr> {
+    output.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("Router:")?.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        value
+            .parse::<IpAddr>()
+            .ok()
+            .filter(|ip| is_direct_dns_ip(*ip))
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_direct_dns_ip(value: &str) -> Option<IpAddr> {
+    value
+        .parse::<IpAddr>()
+        .ok()
+        .filter(|ip| is_direct_dns_ip(*ip))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_direct_dns_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => !ip.is_loopback() && !ip.is_unspecified(),
+        IpAddr::V6(ip) => !ip.is_loopback() && !ip.is_unspecified(),
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn parse_service_has_ip_address(output: &str) -> bool {
     output.lines().any(|line| {
         let Some(value) = line.trim().strip_prefix("IP address:") else {
@@ -448,8 +577,9 @@ fn normalize_proxy_host(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServiceProxySnapshot, normalize_proxy_host, parse_dns_servers, parse_network_services,
-        parse_service_has_ip_address, parse_socks_proxy,
+        ServiceProxySnapshot, normalize_proxy_host, parse_direct_dns_ip, parse_dns_servers,
+        parse_network_services, parse_service_has_ip_address, parse_service_router,
+        parse_socks_proxy,
     };
 
     #[test]
@@ -481,6 +611,27 @@ DHCP Configuration\n\
 IP address: none\n";
         assert!(parse_service_has_ip_address(active));
         assert!(!parse_service_has_ip_address(inactive));
+    }
+
+    #[test]
+    fn parses_router_from_service_info() {
+        let raw = "\
+DHCP Configuration\n\
+IP address: 192.168.3.46\n\
+Router: 192.168.3.1\n";
+        assert_eq!(
+            parse_service_router(raw),
+            Some("192.168.3.1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn ignores_loopback_as_direct_dns_upstream() {
+        assert_eq!(parse_direct_dns_ip("127.0.0.1"), None);
+        assert_eq!(
+            parse_direct_dns_ip("223.5.5.5"),
+            Some("223.5.5.5".parse().unwrap())
+        );
     }
 
     #[test]

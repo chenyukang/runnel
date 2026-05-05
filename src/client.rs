@@ -7,17 +7,19 @@ use crate::{
         socks5, tls, traffic, udp_assoc,
     },
     runtime::ClientRuntime,
-    system_proxy, wg,
+    system_proxy, telemetry, wg,
 };
 use anyhow::{Context, Result, bail};
 use clap::Args;
 use std::{
+    collections::BTreeMap,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
     sync::Arc,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
+    sync::Mutex,
     time::timeout,
 };
 use tokio_rustls::TlsConnector;
@@ -91,8 +93,14 @@ async fn run_with_signal_handling(args: ClientArgs, handle_signals: bool) -> Res
     }
 
     args.validate_required()?;
-    let _system_proxy = system_proxy::maybe_activate(&args)?;
+    let system_proxy = system_proxy::maybe_activate(&args)?;
     let runtime = ClientRuntime::from_args(&args);
+    let traffic_switch = Arc::new(Mutex::new(NativeTrafficSwitch::new(system_proxy)));
+    telemetry::set_traffic_state(telemetry::TrafficState::Proxying);
+    let traffic_switch_task = tokio::spawn(run_native_traffic_switch_control(
+        telemetry::init_control_channel(),
+        Arc::clone(&traffic_switch),
+    ));
 
     let run_client = async move {
         let mode = args.effective_mode()?;
@@ -107,17 +115,91 @@ async fn run_with_signal_handling(args: ClientArgs, handle_signals: bool) -> Res
     };
 
     if handle_signals {
-        tokio::select! {
+        let result = tokio::select! {
             result = run_client => result,
             signal = wait_for_shutdown_signal() => {
                 signal?;
                 info!("client shutting down");
                 Ok(())
             }
-        }
+        };
+        traffic_switch_task.abort();
+        result
     } else {
-        run_client.await
+        let result = run_client.await;
+        traffic_switch_task.abort();
+        result
     }
+}
+
+struct NativeTrafficSwitch {
+    state: telemetry::TrafficState,
+    system_proxy: Option<system_proxy::SystemProxyGuard>,
+}
+
+impl NativeTrafficSwitch {
+    fn new(system_proxy: Option<system_proxy::SystemProxyGuard>) -> Self {
+        Self {
+            state: telemetry::TrafficState::Proxying,
+            system_proxy,
+        }
+    }
+
+    fn switch(&mut self, target: telemetry::TrafficSwitchTarget) -> telemetry::ControlResponse {
+        let previous_state = self.state;
+        match self.try_switch(target) {
+            Ok(state) => telemetry::ControlResponse::ok(previous_state, state),
+            Err(err) => telemetry::ControlResponse::error(format!("{err:#}")),
+        }
+    }
+
+    fn try_switch(
+        &mut self,
+        target: telemetry::TrafficSwitchTarget,
+    ) -> Result<telemetry::TrafficState> {
+        let next = target.resolve(self.state);
+        if next == self.state {
+            return Ok(self.state);
+        }
+
+        match next {
+            telemetry::TrafficState::Proxying => {
+                if let Some(system_proxy) = &self.system_proxy {
+                    system_proxy.apply_proxy()?;
+                }
+            }
+            telemetry::TrafficState::Bypass => {
+                if let Some(system_proxy) = &self.system_proxy {
+                    system_proxy.restore_original()?;
+                }
+            }
+        }
+
+        self.state = next;
+        telemetry::set_traffic_state(next);
+        emit_traffic_switch(next);
+        Ok(next)
+    }
+}
+
+async fn run_native_traffic_switch_control(
+    mut receiver: tokio::sync::mpsc::Receiver<telemetry::ControlEnvelope>,
+    traffic_switch: Arc<Mutex<NativeTrafficSwitch>>,
+) {
+    while let Some(envelope) = receiver.recv().await {
+        let response = match envelope.request.command {
+            telemetry::ControlCommand::Switch { target } => {
+                traffic_switch.lock().await.switch(target)
+            }
+        };
+        envelope.respond(response);
+    }
+}
+
+fn emit_traffic_switch(state: telemetry::TrafficState) {
+    let mut fields = BTreeMap::new();
+    fields.insert("state".to_owned(), state.as_str().to_owned());
+    telemetry::emit("INFO", "traffic switch", fields);
 }
 
 async fn run_native_http(runtime: ClientRuntime) -> Result<()> {

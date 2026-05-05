@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use cli_daemon::{
     maybe_create_pid_file, reload_daemon_process, resolve_pid_file_for_role,
-    status_daemon_processes, stop_daemon_process,
+    status_daemon_processes, stop_daemon_process, switch_daemon_process,
 };
 use cli_service::{
     absolute_path, command_role, dashboard_context, default_log_file_for_command, monitor_context,
@@ -86,6 +86,7 @@ enum Commands {
     Tui(TuiArgs),
     Stop(StopArgs),
     Reload(ReloadArgs),
+    Switch(SwitchArgs),
     Status(StatusArgs),
 }
 
@@ -116,6 +117,25 @@ impl ServiceRole {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum SwitchRole {
+    Client,
+    WgClient,
+}
+
+impl SwitchRole {
+    fn service_role(self) -> ServiceRole {
+        match self {
+            Self::Client => ServiceRole::Client,
+            Self::WgClient => ServiceRole::WgClient,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        self.service_role().as_str()
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 struct StopArgs {
     #[arg(value_enum)]
@@ -130,6 +150,28 @@ struct ReloadArgs {
     role: Option<ServiceRole>,
     #[arg(long, default_value_t = 10)]
     wait_secs: u64,
+}
+
+#[derive(Debug, Clone, Args)]
+struct SwitchArgs {
+    #[arg(value_enum)]
+    role: Option<SwitchRole>,
+    #[arg(long, conflicts_with = "proxy", help = "Force bypass mode")]
+    bypass: bool,
+    #[arg(long, help = "Force normal proxying mode")]
+    proxy: bool,
+}
+
+impl SwitchArgs {
+    fn target(&self) -> telemetry::TrafficSwitchTarget {
+        if self.bypass {
+            telemetry::TrafficSwitchTarget::Bypass
+        } else if self.proxy {
+            telemetry::TrafficSwitchTarget::Proxying
+        } else {
+            telemetry::TrafficSwitchTarget::Toggle
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -384,6 +426,10 @@ async fn main() -> Result<()> {
         reload_daemon_process(&cli, config_path, args.clone(), log_file_is_default).await?;
         return Ok(());
     }
+    if let Commands::Switch(args) = &cli.command {
+        switch_daemon_process(&cli, args.clone(), log_file_is_default).await?;
+        return Ok(());
+    }
     if let Commands::Status(args) = &cli.command {
         status_daemon_processes(
             &cli.log_file,
@@ -441,6 +487,7 @@ async fn main() -> Result<()> {
             Commands::Tui(_) => Ok(()),
             Commands::Stop(_) => Ok(()),
             Commands::Reload(_) => Ok(()),
+            Commands::Switch(_) => Ok(()),
             Commands::Status(_) => Ok(()),
         }
     };
@@ -470,7 +517,11 @@ async fn main() -> Result<()> {
 fn normalize_cli_modes(cli: &mut Cli) {
     if matches!(
         cli.command,
-        Commands::Tui(_) | Commands::Stop(_) | Commands::Reload(_) | Commands::Status(_)
+        Commands::Tui(_)
+            | Commands::Stop(_)
+            | Commands::Reload(_)
+            | Commands::Switch(_)
+            | Commands::Status(_)
     ) {
         cli.tui = false;
         cli.daemon = false;
@@ -500,6 +551,7 @@ fn validate_daemon_mode(cli: &Cli) -> Result<()> {
         | Commands::Tui(_)
         | Commands::Stop(_)
         | Commands::Reload(_)
+        | Commands::Switch(_)
         | Commands::Status(_) => {
             anyhow::bail!(
                 "--daemon is only supported for client, server, tun, wg-client, and wg-server"
@@ -850,10 +902,10 @@ fn command_requires_strict_config(command: &Commands) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, ReloadArgs, ServiceRole, StatusArgs, StopArgs, build_log_file_appender,
-        cli_daemon, cli_service, command_requires_strict_config, default_config_paths_for,
-        first_existing_config_path, parse_log_timezone, read_file_tail, run_utility_command,
-        wait_for_daemon_startup,
+        Cli, Commands, ReloadArgs, ServiceRole, StatusArgs, StopArgs, SwitchArgs, SwitchRole,
+        build_log_file_appender, cli_daemon, cli_service, command_requires_strict_config,
+        default_config_paths_for, first_existing_config_path, parse_log_timezone, read_file_tail,
+        run_utility_command, wait_for_daemon_startup,
     };
     use clap::CommandFactory;
     use runnel::wg;
@@ -1113,6 +1165,13 @@ mod tests {
                 wait_secs: 10,
             }
         )));
+        assert!(!command_requires_strict_config(&Commands::Switch(
+            SwitchArgs {
+                role: Some(SwitchRole::Client),
+                bypass: false,
+                proxy: false,
+            }
+        )));
     }
 
     #[test]
@@ -1249,10 +1308,28 @@ mod tests {
     }
 
     #[test]
+    fn switch_command_is_not_a_service_role() {
+        let args = SwitchArgs {
+            role: Some(SwitchRole::Client),
+            bypass: true,
+            proxy: false,
+        };
+        assert_eq!(
+            args.target(),
+            runnel::telemetry::TrafficSwitchTarget::Bypass
+        );
+
+        let command = Commands::Switch(args);
+        assert!(cli_service::command_role(&command).is_none());
+        assert!(run_utility_command(&command).is_none());
+    }
+
+    #[test]
     fn status_state_is_running_when_pid_and_runtime_match() {
         let runtime = cli_daemon::RuntimeStatus {
             command: "client".to_owned(),
             mode: "native-http".to_owned(),
+            traffic_state: runnel::telemetry::TrafficState::Proxying,
             pid: 42,
             listen: None,
             upstream: None,
@@ -1280,6 +1357,7 @@ mod tests {
         let runtime = cli_daemon::RuntimeStatus {
             command: "tun".to_owned(),
             mode: "native-http".to_owned(),
+            traffic_state: runnel::telemetry::TrafficState::Proxying,
             pid: 77,
             listen: None,
             upstream: None,

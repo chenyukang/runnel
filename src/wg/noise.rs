@@ -1,10 +1,10 @@
 use super::{
     WG_OBFS_MAX_PADDING, WgObfsMode, WgObfsProfile, WgRuntimeConfig,
     client::WgClientArgs,
-    dns::{DomainRuleEngine, start_dns_capture},
+    dns::{DnsCaptureController, DomainRuleEngine, start_dns_capture},
     hooks::{
-        DynamicRouteManager, HookGuard, effective_hook_plan, plan_client_hooks, plan_server_hooks,
-        run_hooks,
+        DynamicRouteManager, HookGuard, SwitchableHookGuard, effective_hook_plan,
+        plan_client_hooks, plan_server_hooks, run_hooks,
     },
     select_device_name,
     server::WgServerArgs,
@@ -22,13 +22,14 @@ use sha2::Sha256;
 use std::{
     collections::BTreeMap,
     io,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::Arc,
     time::Duration,
 };
 use tokio::{
     io::unix::AsyncFd,
     net::UdpSocket,
+    sync::Mutex,
     time::{MissedTickBehavior, interval, sleep},
 };
 use tracing::{debug, info, warn};
@@ -93,18 +94,34 @@ pub(crate) async fn run_client(args: WgClientArgs, runtime: WgRuntimeConfig) -> 
         });
 
     run_hooks(&plan.up)?;
-    let _cleanup = HookGuard::new("wg-client", plan.down);
-    let _dns_capture = match (args.dns_capture, args.dns) {
+    let route_switch = SwitchableHookGuard::new("wg-client", plan);
+    let dns_capture = match (args.dns_capture, args.dns) {
         (true, Some(dns)) => Some(start_dns_capture(dns, domain_rules).await?),
         (true, None) => bail!("wg client --dns-capture requires --dns as the upstream resolver"),
         (false, _) => None,
     };
-    let _domain_route_manager = domain_route_manager;
-    let _dns_guard = match (args.dns, args.dns_capture) {
+    let dns_capture_control = dns_capture.as_ref().map(|capture| capture.controller());
+    let dns_guard = match (args.dns, args.dns_capture) {
         (Some(_), true) => system_proxy::maybe_activate_tun_dns(&["127.0.0.1".to_owned()])?,
         (Some(dns), false) => system_proxy::maybe_activate_tun_dns(&[dns.to_string()])?,
         (None, _) => None,
     };
+    let bypass_dns = dns_guard
+        .as_ref()
+        .and_then(system_proxy::SystemDnsGuard::direct_dns_upstream);
+    let traffic_switch = Arc::new(Mutex::new(WgNoiseTrafficSwitch::new(
+        route_switch,
+        domain_route_manager,
+        dns_guard,
+        dns_capture_control,
+        args.dns.filter(|_| args.dns_capture),
+        bypass_dns,
+    )));
+    telemetry::set_traffic_state(telemetry::TrafficState::Proxying);
+    let traffic_switch_task = tokio::spawn(run_wg_noise_traffic_switch_control(
+        telemetry::init_control_channel(),
+        Arc::clone(&traffic_switch),
+    ));
 
     info!(
         device = %actual_device,
@@ -118,7 +135,7 @@ pub(crate) async fn run_client(args: WgClientArgs, runtime: WgRuntimeConfig) -> 
         "wg client started"
     );
 
-    run_noise_loop(
+    let result = run_noise_loop(
         "wg-client",
         tun,
         socket,
@@ -128,7 +145,9 @@ pub(crate) async fn run_client(args: WgClientArgs, runtime: WgRuntimeConfig) -> 
         args.obfs,
         args.obfs_profile(),
     )
-    .await
+    .await;
+    traffic_switch_task.abort();
+    result
 }
 
 pub(crate) async fn run_server(args: WgServerArgs, runtime: WgRuntimeConfig) -> Result<()> {
@@ -175,6 +194,110 @@ pub(crate) async fn run_server(args: WgServerArgs, runtime: WgRuntimeConfig) -> 
         args.obfs_profile(),
     )
     .await
+}
+
+struct WgNoiseTrafficSwitch {
+    state: telemetry::TrafficState,
+    routes: SwitchableHookGuard,
+    _domain_routes: Option<Arc<DynamicRouteManager>>,
+    dns_guard: Option<system_proxy::SystemDnsGuard>,
+    dns_capture: Option<DnsCaptureController>,
+    proxy_dns: Option<IpAddr>,
+    bypass_dns: Option<IpAddr>,
+}
+
+impl WgNoiseTrafficSwitch {
+    fn new(
+        routes: SwitchableHookGuard,
+        domain_routes: Option<Arc<DynamicRouteManager>>,
+        dns_guard: Option<system_proxy::SystemDnsGuard>,
+        dns_capture: Option<DnsCaptureController>,
+        proxy_dns: Option<IpAddr>,
+        bypass_dns: Option<IpAddr>,
+    ) -> Self {
+        Self {
+            state: telemetry::TrafficState::Proxying,
+            routes,
+            _domain_routes: domain_routes,
+            dns_guard,
+            dns_capture,
+            proxy_dns,
+            bypass_dns,
+        }
+    }
+
+    fn switch(&mut self, target: telemetry::TrafficSwitchTarget) -> telemetry::ControlResponse {
+        let previous_state = self.state;
+        match self.try_switch(target) {
+            Ok(state) => telemetry::ControlResponse::ok(previous_state, state),
+            Err(err) => telemetry::ControlResponse::error(format!("{err:#}")),
+        }
+    }
+
+    fn try_switch(
+        &mut self,
+        target: telemetry::TrafficSwitchTarget,
+    ) -> Result<telemetry::TrafficState> {
+        let next = target.resolve(self.state);
+        if next == self.state {
+            return Ok(self.state);
+        }
+
+        match next {
+            telemetry::TrafficState::Proxying => {
+                self.routes.proxying()?;
+                if let (Some(dns_capture), Some(proxy_dns)) = (&self.dns_capture, self.proxy_dns) {
+                    dns_capture.set_upstream(proxy_dns);
+                }
+                if let Some(dns_guard) = &self.dns_guard {
+                    dns_guard.apply_override()?;
+                }
+            }
+            telemetry::TrafficState::Bypass => {
+                self.routes.bypass()?;
+                match (&self.dns_capture, self.bypass_dns) {
+                    (Some(dns_capture), Some(bypass_dns)) => {
+                        dns_capture.set_upstream(bypass_dns);
+                        if let Some(dns_guard) = &self.dns_guard {
+                            dns_guard.apply_override()?;
+                        }
+                    }
+                    _ => {
+                        if let Some(dns_guard) = &self.dns_guard {
+                            dns_guard.restore_original()?;
+                        }
+                    }
+                }
+            }
+        }
+
+        self.state = next;
+        telemetry::set_traffic_state(next);
+        emit_traffic_switch(next);
+        Ok(next)
+    }
+}
+
+async fn run_wg_noise_traffic_switch_control(
+    mut receiver: tokio::sync::mpsc::Receiver<telemetry::ControlEnvelope>,
+    traffic_switch: Arc<Mutex<WgNoiseTrafficSwitch>>,
+) {
+    while let Some(envelope) = receiver.recv().await {
+        let response = match envelope.request.command {
+            telemetry::ControlCommand::Switch { target } => {
+                traffic_switch.lock().await.switch(target)
+            }
+        };
+        envelope.respond(response);
+    }
+}
+
+fn emit_traffic_switch(state: telemetry::TrafficState) {
+    let mut fields = BTreeMap::new();
+    fields.insert("state".to_owned(), state.as_str().to_owned());
+    fields.insert("mode".to_owned(), "wg".to_owned());
+    fields.insert("engine".to_owned(), "noise".to_owned());
+    telemetry::emit("INFO", "traffic switch", fields);
 }
 
 fn open_tun_device(requested_device: &str) -> Result<(AsyncFd<TunSocket>, String)> {

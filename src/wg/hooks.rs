@@ -27,6 +27,12 @@ pub(crate) struct HookGuard {
     hooks: Vec<String>,
 }
 
+pub(crate) struct SwitchableHookGuard {
+    label: &'static str,
+    plan: HookPlan,
+    active: bool,
+}
+
 pub(crate) struct DynamicRouteManager {
     route: RouteInfo,
     tunnel: TunnelPair,
@@ -132,6 +138,45 @@ impl Drop for HookGuard {
             return;
         }
         if let Err(err) = run_hooks(&self.hooks) {
+            warn!(label = self.label, error = %err, "wg cleanup hooks failed");
+        }
+    }
+}
+
+impl SwitchableHookGuard {
+    pub(crate) fn new(label: &'static str, plan: HookPlan) -> Self {
+        Self {
+            label,
+            plan,
+            active: true,
+        }
+    }
+
+    pub(crate) fn bypass(&mut self) -> Result<bool> {
+        if !self.active {
+            return Ok(false);
+        }
+        run_hooks(&self.plan.down)?;
+        self.active = false;
+        Ok(true)
+    }
+
+    pub(crate) fn proxying(&mut self) -> Result<bool> {
+        if self.active {
+            return Ok(false);
+        }
+        run_hooks(&self.plan.up)?;
+        self.active = true;
+        Ok(true)
+    }
+}
+
+impl Drop for SwitchableHookGuard {
+    fn drop(&mut self) {
+        if !self.active || self.plan.down.is_empty() {
+            return;
+        }
+        if let Err(err) = run_hooks(&self.plan.down) {
             warn!(label = self.label, error = %err, "wg cleanup hooks failed");
         }
     }

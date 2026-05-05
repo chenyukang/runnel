@@ -133,12 +133,14 @@ server:
 
 ## Daily Commands
 
-Config lookup order, daemon mode, status, stop, and TUI are shared by all modes:
+Config lookup order, daemon mode, status, stop, and TUI are shared by all modes.
+Client daemons also support runtime traffic switching:
 
 ```bash
 sudo runnel --config runnel.yaml client
 sudo runnel --config runnel.yaml server --daemon
 sudo runnel reload
+sudo runnel switch client
 sudo runnel stop
 runnel status
 runnel tui

@@ -305,6 +305,21 @@ Stop a daemon:
 runnel stop client
 ```
 
+Temporarily bypass a running client without stopping the daemon:
+
+```bash
+sudo runnel switch client
+sudo runnel switch client --bypass
+sudo runnel switch client --proxy
+```
+
+`switch` preserves the original runtime plan. Switching to `bypass` restores the
+macOS system proxy or removes WG client routes/DNS overrides so system traffic
+goes directly. Switching back to `proxying` reapplies the same hooks, DNS
+override, and route configuration that the daemon started with. Dynamic WG
+domain direct host routes are kept across the bypass window and are cleaned up
+when the daemon exits.
+
 Attach a dashboard:
 
 ```bash
@@ -345,5 +360,6 @@ Limit the affected network services by repeating `--system-proxy-service`.
 ## Runtime Support
 
 The same operational layer is shared across modes: config loading, daemon pid
-files, telemetry sockets, `status`, `stop`, logging, and TUI. WG mode adds
-platform hooks for TUN setup, routes, DNS, forwarding/NAT, and UAPI stats.
+files, telemetry sockets, `status`, `stop`, logging, and TUI. Client daemons add
+`switch` for runtime traffic bypass. WG mode adds platform hooks for TUN setup,
+routes, DNS, forwarding/NAT, and UAPI stats.

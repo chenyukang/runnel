@@ -2,11 +2,11 @@ use anyhow::{Context, Result};
 use std::{
     collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::Duration,
 };
 use tokio::{net::UdpSocket, task::JoinHandle, time::timeout};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     proxy::{
@@ -24,6 +24,12 @@ const MAX_DNS_PACKET: usize = 4096;
 
 pub(crate) struct DnsCaptureGuard {
     handle: JoinHandle<()>,
+    controller: DnsCaptureController,
+}
+
+#[derive(Clone)]
+pub(crate) struct DnsCaptureController {
+    upstream: Arc<RwLock<SocketAddr>>,
 }
 
 #[derive(Clone)]
@@ -36,6 +42,34 @@ pub(crate) struct DomainRuleEngine {
 impl Drop for DnsCaptureGuard {
     fn drop(&mut self) {
         self.handle.abort();
+    }
+}
+
+impl DnsCaptureGuard {
+    pub(crate) fn controller(&self) -> DnsCaptureController {
+        self.controller.clone()
+    }
+}
+
+impl DnsCaptureController {
+    fn new(upstream: SocketAddr) -> Self {
+        Self {
+            upstream: Arc::new(RwLock::new(upstream)),
+        }
+    }
+
+    pub(crate) fn set_upstream(&self, upstream: IpAddr) {
+        let upstream = SocketAddr::new(upstream, 53);
+        let mut current = self.upstream.write().expect("dns capture upstream lock");
+        if *current == upstream {
+            return;
+        }
+        *current = upstream;
+        info!(upstream = %upstream, "wg DNS capture upstream changed");
+    }
+
+    fn upstream(&self) -> SocketAddr {
+        *self.upstream.read().expect("dns capture upstream lock")
     }
 }
 
@@ -100,17 +134,14 @@ pub(crate) async fn start_dns_capture(
             .await
             .with_context(|| format!("failed to bind WG DNS capture listener on {DNS_LISTEN}"))?,
     );
-    let handle = tokio::spawn(run_dns_capture(
-        socket,
-        SocketAddr::new(upstream, 53),
-        domain_rules,
-    ));
-    Ok(DnsCaptureGuard { handle })
+    let controller = DnsCaptureController::new(SocketAddr::new(upstream, 53));
+    let handle = tokio::spawn(run_dns_capture(socket, controller.clone(), domain_rules));
+    Ok(DnsCaptureGuard { handle, controller })
 }
 
 async fn run_dns_capture(
     socket: Arc<UdpSocket>,
-    upstream: SocketAddr,
+    upstream: DnsCaptureController,
     domain_rules: Option<DomainRuleEngine>,
 ) {
     let mut buffer = vec![0u8; MAX_DNS_PACKET];
@@ -146,6 +177,7 @@ async fn run_dns_capture(
 
         let socket = Arc::clone(&socket);
         let domain_rules = domain_rules.clone();
+        let upstream = upstream.upstream();
         tokio::spawn(async move {
             if let Err(err) = forward_dns_packet(
                 socket,
@@ -498,5 +530,14 @@ mod tests {
                 .unwrap(),
             RouteDecision::Direct
         );
+    }
+
+    #[test]
+    fn dns_capture_controller_updates_upstream() {
+        let controller = super::DnsCaptureController::new("1.1.1.1:53".parse().unwrap());
+
+        controller.set_upstream("192.168.3.1".parse().unwrap());
+
+        assert_eq!(controller.upstream(), "192.168.3.1:53".parse().unwrap());
     }
 }

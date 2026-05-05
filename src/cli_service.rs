@@ -92,6 +92,7 @@ fn service_descriptor(command: &Commands) -> Option<ServiceDescriptor> {
         | Commands::Tui(_)
         | Commands::Stop(_)
         | Commands::Reload(_)
+        | Commands::Switch(_)
         | Commands::Status(_) => None,
     }
 }
@@ -115,6 +116,7 @@ pub(super) fn dashboard_context(
         log_file,
         log_filter: cli.log.clone(),
         log_timezone_offset_secs,
+        traffic_state: telemetry::TrafficState::Proxying,
     })
 }
 
@@ -133,6 +135,7 @@ pub(super) fn monitor_context(
         log_file,
         log_filter: cli.log.clone(),
         log_timezone_offset_secs,
+        traffic_state: telemetry::TrafficState::Proxying,
         pid: std::process::id(),
     })
 }
@@ -211,6 +214,10 @@ pub(super) fn default_log_file_for_command(command: &Commands) -> PathBuf {
             .role
             .map(|role| default_log_file_for_role(role.as_str()))
             .unwrap_or_else(|| PathBuf::from(DEFAULT_RUN_LOG_FILE)),
+        Commands::Switch(args) => args
+            .role
+            .map(|role| default_log_file_for_role(role.as_str()))
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_RUN_LOG_FILE)),
         Commands::Status(args) => args
             .role
             .map(|role| default_log_file_for_role(role.as_str()))
@@ -265,6 +272,7 @@ pub(super) fn command_role(command: &Commands) -> Option<&'static str> {
         | Commands::Tui(_)
         | Commands::Stop(_)
         | Commands::Reload(_)
+        | Commands::Switch(_)
         | Commands::Status(_) => None,
     }
 }

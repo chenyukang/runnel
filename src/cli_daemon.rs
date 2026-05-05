@@ -13,7 +13,7 @@ use std::{
 use tokio::time::sleep;
 
 use super::{
-    Cli, ReloadArgs, ServiceRole, StatusArgs, StopArgs,
+    Cli, ReloadArgs, ServiceRole, StatusArgs, StopArgs, SwitchArgs,
     cli_service::{
         SERVICE_ROLES, absolute_path, command_role, default_log_file_for_role, default_pid_path,
         default_socket_path,
@@ -47,6 +47,7 @@ struct ServiceStatus {
 pub(super) struct RuntimeStatus {
     pub(super) command: String,
     pub(super) mode: String,
+    pub(super) traffic_state: telemetry::TrafficState,
     pub(super) pid: u32,
     pub(super) listen: Option<String>,
     pub(super) upstream: Option<String>,
@@ -69,6 +70,7 @@ impl From<telemetry::DashboardSnapshot> for RuntimeStatus {
         Self {
             command: snapshot.context.command_label,
             mode: snapshot.context.mode_label,
+            traffic_state: snapshot.context.traffic_state,
             pid: snapshot.context.pid,
             listen: snapshot.context.listen,
             upstream: snapshot.context.upstream,
@@ -491,6 +493,7 @@ fn print_status_report(report: &StatusReport) {
         }
         if let Some(runtime) = &service.runtime {
             println!("  mode: {}", runtime.mode);
+            println!("  traffic_state: {}", runtime.traffic_state);
             if let Some(listen) = &runtime.listen {
                 println!("  listen: {listen}");
             }
@@ -702,7 +705,74 @@ pub(super) async fn reload_daemon_process(
     }
 }
 
+pub(super) async fn switch_daemon_process(
+    cli: &Cli,
+    args: SwitchArgs,
+    use_role_default_log_files: bool,
+) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = (cli, args, use_role_default_log_files);
+        anyhow::bail!("runnel switch is only supported on unix platforms");
+    }
+
+    #[cfg(unix)]
+    {
+        let role = resolve_control_role(
+            "switch",
+            &cli.log_file,
+            cli.pid_file.clone(),
+            args.role.map(|role| role.service_role()),
+            use_role_default_log_files,
+        )?;
+        let log_file = if use_role_default_log_files && cli.pid_file.is_none() {
+            default_log_file_for_role(role.as_str())
+        } else {
+            cli.log_file.clone()
+        };
+        let socket = match &cli.telemetry_sock {
+            Some(socket) => absolute_path(socket)?,
+            None => default_socket_path(&log_file, role.as_str())?,
+        };
+        let response = telemetry::switch_socket(&socket, args.target()).await?;
+        if !response.ok {
+            anyhow::bail!("{}", response.message);
+        }
+        let previous_state = response
+            .previous_state
+            .map(|state| state.as_str())
+            .unwrap_or("unknown");
+        let state = response
+            .state
+            .map(|state| state.as_str())
+            .unwrap_or("unknown");
+        println!(
+            "runnel traffic switched role={} {} -> {}",
+            role.as_str(),
+            previous_state,
+            state
+        );
+        Ok(())
+    }
+}
+
 pub(super) fn resolve_reload_role(
+    log_file: &Path,
+    configured_pid_file: Option<PathBuf>,
+    role: Option<ServiceRole>,
+    use_role_default_log_files: bool,
+) -> Result<ServiceRole> {
+    resolve_control_role(
+        "reload",
+        log_file,
+        configured_pid_file,
+        role,
+        use_role_default_log_files,
+    )
+}
+
+fn resolve_control_role(
+    command: &str,
     log_file: &Path,
     configured_pid_file: Option<PathBuf>,
     role: Option<ServiceRole>,
@@ -713,13 +783,14 @@ pub(super) fn resolve_reload_role(
     }
 
     if configured_pid_file.is_some() {
-        anyhow::bail!("reload requires a role when --pid-file is set");
+        anyhow::bail!("{command} requires a role when --pid-file is set");
     }
 
-    let pid_file = resolve_stop_pid_file(log_file, None, None, use_role_default_log_files)?;
+    let pid_file =
+        resolve_pid_file_for_control(command, log_file, None, None, use_role_default_log_files)?;
     role_from_pid_file(&pid_file).with_context(|| {
         format!(
-            "failed to infer daemon role from pid file {}; pass `reload client`, `reload server`, `reload tun`, `reload wg-client`, or `reload wg-server`",
+            "failed to infer daemon role from pid file {}; pass `{command} client`, `{command} server`, `{command} tun`, `{command} wg-client`, or `{command} wg-server`",
             pid_file.display()
         )
     })
@@ -835,6 +906,22 @@ fn resolve_stop_pid_file(
     role: Option<ServiceRole>,
     use_role_default_log_files: bool,
 ) -> Result<PathBuf> {
+    resolve_pid_file_for_control(
+        "stop",
+        log_file,
+        configured_pid_file,
+        role,
+        use_role_default_log_files,
+    )
+}
+
+fn resolve_pid_file_for_control(
+    command: &str,
+    log_file: &Path,
+    configured_pid_file: Option<PathBuf>,
+    role: Option<ServiceRole>,
+    use_role_default_log_files: bool,
+) -> Result<PathBuf> {
     if let Some(path) = configured_pid_file {
         return absolute_path(&path);
     }
@@ -875,11 +962,11 @@ fn resolve_stop_pid_file(
 
     match found.len() {
         0 => anyhow::bail!(
-            "no pid file found; pass `stop client`, `stop server`, `stop tun`, `stop wg-client`, `stop wg-server`, or `--pid-file`"
+            "no pid file found; pass `{command} client`, `{command} server`, `{command} tun`, `{command} wg-client`, `{command} wg-server`, or `--pid-file`"
         ),
         1 => Ok(found.remove(0)),
         _ => anyhow::bail!(
-            "multiple pid files exist; pass `stop client`, `stop server`, `stop tun`, `stop wg-client`, `stop wg-server`, or `--pid-file`"
+            "multiple pid files exist; pass `{command} client`, `{command} server`, `{command} tun`, `{command} wg-client`, `{command} wg-server`, or `--pid-file`"
         ),
     }
 }

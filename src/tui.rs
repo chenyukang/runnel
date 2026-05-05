@@ -29,8 +29,8 @@ use tokio::{
 };
 
 use crate::telemetry::{
-    DashboardSnapshot, MonitorContext, RecentTargetSnapshot, RouteStats, TraceEvent, attach_socket,
-    event_impacts_health, route_bucket_for_event,
+    DashboardSnapshot, MonitorContext, RecentTargetSnapshot, RouteStats, TraceEvent, TrafficState,
+    attach_socket, event_impacts_health, route_bucket_for_event,
 };
 
 const HISTORY_LEN: usize = 48;
@@ -44,6 +44,7 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 pub struct DashboardContext {
     pub command_label: String,
     pub mode_label: String,
+    pub traffic_state: TrafficState,
     pub listen: Option<String>,
     pub upstream: Option<String>,
     pub path: Option<String>,
@@ -172,6 +173,7 @@ impl From<MonitorContext> for DashboardContext {
         Self {
             command_label: value.command_label,
             mode_label: value.mode_label,
+            traffic_state: value.traffic_state,
             listen: value.listen,
             upstream: value.upstream,
             path: value.path,
@@ -296,6 +298,7 @@ impl DashboardApp {
             self.last_warning_at = Some(Instant::now());
         }
 
+        self.capture_traffic_state(&event);
         self.capture_listener_context(&event);
         self.capture_recent_event(&event);
         self.capture_recent_domain_ip(&event);
@@ -485,6 +488,17 @@ impl DashboardApp {
         }
     }
 
+    fn capture_traffic_state(&mut self, event: &TraceEvent) {
+        if event.message != "traffic switch" {
+            return;
+        }
+        self.context.traffic_state = match event.fields.get("state").map(String::as_str) {
+            Some("bypass") => TrafficState::Bypass,
+            Some("proxying") => TrafficState::Proxying,
+            _ => self.context.traffic_state,
+        };
+    }
+
     fn capture_recent_event(&mut self, event: &TraceEvent) {
         if event.message == "traffic sample" || event.message == "dns query" {
             return;
@@ -592,6 +606,9 @@ fn draw_dashboard(frame: &mut ratatui::Frame<'_>, app: &DashboardApp) {
         Line::from(vec![
             Span::styled("mode ", overview_label_style()),
             Span::styled(&app.context.mode_label, overview_value_style()),
+            Span::raw("    "),
+            Span::styled("traffic ", overview_label_style()),
+            Span::styled(app.context.traffic_state.as_str(), overview_value_style()),
             Span::raw("    "),
             Span::styled("uptime ", overview_label_style()),
             Span::styled(
@@ -1238,6 +1255,7 @@ mod tests {
         let mut app = DashboardApp::new(DashboardContext {
             command_label: "wg-client".to_owned(),
             mode_label: "wg".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
@@ -1265,6 +1283,7 @@ mod tests {
         let mut app = DashboardApp::new(DashboardContext {
             command_label: "wg-client".to_owned(),
             mode_label: "wg".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
@@ -1297,6 +1316,7 @@ mod tests {
         let mut app = DashboardApp::new(DashboardContext {
             command_label: "wg-client".to_owned(),
             mode_label: "wg".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
@@ -1325,6 +1345,7 @@ mod tests {
         let mut app = DashboardApp::new(DashboardContext {
             command_label: "wg-client".to_owned(),
             mode_label: "wg".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
@@ -1359,6 +1380,7 @@ mod tests {
         let mut app = DashboardApp::new(DashboardContext {
             command_label: "wg-client".to_owned(),
             mode_label: "wg".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
@@ -1395,6 +1417,7 @@ mod tests {
         let mut app = DashboardApp::new(DashboardContext {
             command_label: "client".to_owned(),
             mode_label: "native-http".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
@@ -1439,6 +1462,7 @@ mod tests {
         let mut app = DashboardApp::new(DashboardContext {
             command_label: "wg-client".to_owned(),
             mode_label: "wg".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
@@ -1466,6 +1490,7 @@ mod tests {
         let mut app = DashboardApp::new(DashboardContext {
             command_label: "client".to_owned(),
             mode_label: "native-http".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
@@ -1488,10 +1513,37 @@ mod tests {
     }
 
     #[test]
+    fn traffic_switch_event_updates_context_state() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "client".to_owned(),
+            mode_label: "wg".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("runnel.log"),
+            log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
+        });
+
+        app.ingest(trace_event(
+            "INFO",
+            "traffic switch",
+            &[("state", "bypass")],
+        ));
+
+        assert_eq!(
+            app.context.traffic_state,
+            crate::telemetry::TrafficState::Bypass
+        );
+    }
+
+    #[test]
     fn wg_context_renames_recent_domains_panel() {
         let context = DashboardContext {
             command_label: "wg-client".to_owned(),
             mode_label: "wg".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
@@ -1510,6 +1562,7 @@ mod tests {
         let context = DashboardContext {
             command_label: "client".to_owned(),
             mode_label: "wg".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
@@ -1537,6 +1590,7 @@ mod tests {
         let context = DashboardContext {
             command_label: "client".to_owned(),
             mode_label: "wg".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
@@ -1565,6 +1619,7 @@ mod tests {
         let context = DashboardContext {
             command_label: "client".to_owned(),
             mode_label: "wg".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
@@ -1600,6 +1655,7 @@ mod tests {
         let mut app = DashboardApp::new(DashboardContext {
             command_label: "wg-client".to_owned(),
             mode_label: "wg".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
@@ -1636,6 +1692,7 @@ mod tests {
         let context = DashboardContext {
             command_label: "client".to_owned(),
             mode_label: "native-http".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
             listen: None,
             upstream: None,
             path: None,
