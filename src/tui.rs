@@ -37,6 +37,7 @@ const HISTORY_LEN: usize = 48;
 const RECENT_EVENTS: usize = 40;
 const RECENT_TARGETS: usize = RECENT_EVENTS;
 const RECENT_DOMAIN_STATUS_WIDTH: usize = 9;
+const ROUTE_STAT_LABEL_WIDTH: usize = 9;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 #[derive(Clone, Debug)]
@@ -786,19 +787,21 @@ fn stat_block(title: &'static str, value: String, color: Color) -> Paragraph<'st
 fn route_stats_panel(stats: RouteStats) -> Paragraph<'static> {
     Paragraph::new(vec![
         Line::from(Span::styled("Routes", overview_label_style())),
-        Line::from(vec![
-            Span::styled("proxy: ", overview_label_style()),
-            Span::styled(stats.proxy.to_string(), Style::default().fg(Color::Blue)),
-        ]),
-        Line::from(vec![
-            Span::styled("direct: ", overview_label_style()),
-            Span::styled(stats.direct.to_string(), Style::default().fg(Color::Green)),
-        ]),
-        Line::from(vec![
-            Span::styled("blocked: ", overview_label_style()),
-            Span::styled(stats.blocked.to_string(), Style::default().fg(Color::Red)),
-        ]),
+        route_stat_line("proxy:", stats.proxy, Color::Blue),
+        route_stat_line("direct:", stats.direct, Color::Green),
+        route_stat_line("blocked:", stats.blocked, Color::Red),
     ])
+}
+
+fn route_stat_line(label: &str, value: u64, color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(route_stat_label(label), overview_label_style()),
+        Span::styled(value.to_string(), Style::default().fg(color)),
+    ])
+}
+
+fn route_stat_label(label: &str) -> String {
+    format!("{label:<width$}", width = ROUTE_STAT_LABEL_WIDTH)
 }
 
 fn overview_label_style() -> Style {
@@ -1190,7 +1193,7 @@ mod tests {
         DashboardApp, DashboardContext, RecentTarget, TraceEvent, fit_wave_data_to_width,
         link_from_target, recent_target_activity, recent_target_link, recent_target_route,
         recent_targets_activity_header, recent_targets_link_header, recent_targets_title,
-        recent_targets_widths, split_target,
+        recent_targets_widths, route_stat_label, split_target,
     };
     use ratatui::layout::Constraint;
     use std::{collections::BTreeMap, path::PathBuf, time::SystemTime};
@@ -1211,6 +1214,13 @@ mod tests {
     #[test]
     fn wave_data_handles_empty_history() {
         assert_eq!(fit_wave_data_to_width(&[], 4), vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn route_stat_labels_align_values() {
+        assert_eq!(route_stat_label("proxy:"), "proxy:   ");
+        assert_eq!(route_stat_label("direct:"), "direct:  ");
+        assert_eq!(route_stat_label("blocked:"), "blocked: ");
     }
 
     #[test]
