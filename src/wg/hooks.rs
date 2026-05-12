@@ -2,6 +2,8 @@ use anyhow::{Context, Result, bail};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    error::Error as StdError,
+    fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     process::Command,
     sync::Mutex,
@@ -38,6 +40,54 @@ pub(crate) struct DynamicRouteManager {
     tunnel: TunnelPair,
     direct_hosts: Mutex<BTreeMap<IpAddr, String>>,
 }
+
+#[derive(Debug)]
+pub(crate) struct EgressRouteNotReady {
+    target: String,
+    detail: String,
+    route_output: Option<String>,
+}
+
+impl EgressRouteNotReady {
+    fn new(target: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+            detail: detail.into(),
+            route_output: None,
+        }
+    }
+
+    fn with_route_output(mut self, output: impl Into<String>) -> Self {
+        self.route_output = Some(output.into());
+        self
+    }
+
+    pub(crate) fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub(crate) fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    pub(crate) fn route_output_for_log(&self) -> Option<String> {
+        self.route_output
+            .as_deref()
+            .map(|output| output.lines().map(str::trim).collect::<Vec<_>>().join("; "))
+    }
+}
+
+impl fmt::Display for EgressRouteNotReady {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "egress route to {} is not ready: {}",
+            self.target, self.detail
+        )
+    }
+}
+
+impl StdError for EgressRouteNotReady {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TunnelPair {
@@ -812,12 +862,16 @@ fn detect_egress_route(target: IpAddr) -> Result<RouteInfo> {
             .output()
             .with_context(|| format!("failed to inspect route to {target}"))?;
         if !output.status.success() {
-            bail!(
-                "failed to inspect route to {target}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            return Err(EgressRouteNotReady::new(
+                target,
+                format!(
+                    "route command failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            )
+            .into());
         }
-        return parse_macos_route_get(&String::from_utf8_lossy(&output.stdout));
+        return parse_macos_route_get(&target, &String::from_utf8_lossy(&output.stdout));
     }
 
     #[cfg(target_os = "linux")]
@@ -833,12 +887,16 @@ fn detect_egress_route(target: IpAddr) -> Result<RouteInfo> {
             .output()
             .with_context(|| format!("failed to inspect route to {target}"))?;
         if !output.status.success() {
-            bail!(
-                "failed to inspect route to {target}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            return Err(EgressRouteNotReady::new(
+                target,
+                format!(
+                    "ip route command failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            )
+            .into());
         }
-        return parse_linux_route_get(&String::from_utf8_lossy(&output.stdout));
+        return parse_linux_route_get(&target, &String::from_utf8_lossy(&output.stdout));
     }
 
     #[allow(unreachable_code)]
@@ -849,7 +907,7 @@ fn detect_egress_route(target: IpAddr) -> Result<RouteInfo> {
 }
 
 #[cfg(target_os = "macos")]
-fn parse_macos_route_get(output: &str) -> Result<RouteInfo> {
+fn parse_macos_route_get(target: &str, output: &str) -> Result<RouteInfo> {
     let mut interface = None;
     let mut gateway = None;
     for line in output.lines() {
@@ -865,7 +923,11 @@ fn parse_macos_route_get(output: &str) -> Result<RouteInfo> {
     }
 
     if interface.is_none() {
-        bail!("route output did not include an interface");
+        return Err(
+            EgressRouteNotReady::new(target, "route output did not include an interface")
+                .with_route_output(output)
+                .into(),
+        );
     }
 
     Ok(RouteInfo { interface, gateway })
@@ -877,7 +939,7 @@ fn is_macos_tunnel_interface(interface: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn parse_linux_route_get(output: &str) -> Result<RouteInfo> {
+fn parse_linux_route_get(target: &str, output: &str) -> Result<RouteInfo> {
     let tokens = output.split_whitespace().collect::<Vec<_>>();
     let mut interface = None;
     let mut gateway = None;
@@ -890,7 +952,12 @@ fn parse_linux_route_get(output: &str) -> Result<RouteInfo> {
     }
 
     if interface.is_none() {
-        bail!("linux route output did not include an interface");
+        return Err(EgressRouteNotReady::new(
+            target,
+            "linux route output did not include an interface",
+        )
+        .with_route_output(output)
+        .into());
     }
 
     Ok(RouteInfo { interface, gateway })
@@ -898,7 +965,7 @@ fn parse_linux_route_get(output: &str) -> Result<RouteInfo> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RouteInfo, build_client_hook_plan, exclude_routes};
+    use super::{EgressRouteNotReady, RouteInfo, build_client_hook_plan, exclude_routes};
     use crate::wg::{WgRuntimeConfig, default_client_allowed_ips};
     use ipnet::IpNet;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -994,6 +1061,7 @@ mod tests {
     #[test]
     fn macos_route_get_ignores_non_ip_gateway_values() {
         let route = super::parse_macos_route_get(
+            "172.235.244.118",
             r#"
    route to: 172.235.244.118
 destination: 172.235.244.118
@@ -1005,6 +1073,35 @@ destination: 172.235.244.118
 
         assert_eq!(route.interface.as_deref(), Some("utun5"));
         assert_eq!(route.gateway, None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_route_get_missing_interface_is_recoverable() {
+        let err = super::parse_macos_route_get(
+            "172.235.244.118",
+            r#"
+   route to: 172.235.244.118
+destination: 172.235.244.118
+       mask: 255.255.255.255
+"#,
+        )
+        .expect_err("missing route interface should be treated as route-not-ready");
+
+        let route_not_ready = err
+            .downcast_ref::<EgressRouteNotReady>()
+            .expect("missing interface should produce EgressRouteNotReady");
+        assert_eq!(route_not_ready.target(), "172.235.244.118");
+        assert_eq!(
+            route_not_ready.detail(),
+            "route output did not include an interface"
+        );
+        assert!(
+            route_not_ready
+                .route_output_for_log()
+                .expect("route output should be preserved")
+                .contains("destination: 172.235.244.118")
+        );
     }
 
     #[cfg(target_os = "macos")]

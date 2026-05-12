@@ -3,8 +3,8 @@ use super::{
     default_client_allowed_ips_for,
     dns::{DnsCaptureController, DomainRuleEngine, start_dns_capture},
     hooks::{
-        DynamicRouteManager, SwitchableHookGuard, effective_hook_plan, log_plan_lines,
-        plan_client_hooks, print_plan, run_hooks,
+        DynamicRouteManager, EgressRouteNotReady, SwitchableHookGuard, effective_hook_plan,
+        log_plan_lines, plan_client_hooks, print_plan, run_hooks,
     },
     noise, normalize_allowed_ips, parse_key, parse_socket_addr,
     preflight::{WgPreflightRole, check as check_preflight},
@@ -19,6 +19,8 @@ use boringtun::noise::TunnResult;
 use clap::Args;
 use std::{
     collections::BTreeMap,
+    error::Error as StdError,
+    fmt, io,
     net::{IpAddr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -32,6 +34,46 @@ use crate::{
 };
 
 const HANDSHAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+const WG_CLIENT_RECOVERY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const WG_CLIENT_RECOVERY_MAX_DELAY: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+struct WgClientNetworkNotReady {
+    operation: &'static str,
+    endpoint: SocketAddr,
+    os_error: Option<i32>,
+    os_error_name: &'static str,
+    last_error: String,
+}
+
+impl WgClientNetworkNotReady {
+    fn from_udp_error(operation: &'static str, endpoint: SocketAddr, error: &io::Error) -> Self {
+        let os_error = error.raw_os_error();
+        Self {
+            operation,
+            endpoint,
+            os_error,
+            os_error_name: os_error.and_then(udp_os_error_name).unwrap_or("unknown"),
+            last_error: error.to_string(),
+        }
+    }
+}
+
+impl fmt::Display for WgClientNetworkNotReady {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "wg client network is not ready while {} to {}",
+            self.operation, self.endpoint
+        )?;
+        if let Some(os_error) = self.os_error {
+            write!(f, " ({} / os error {os_error})", self.os_error_name)?;
+        }
+        write!(f, ": {}", self.last_error)
+    }
+}
+
+impl StdError for WgClientNetworkNotReady {}
 
 #[derive(Clone, Debug, Args)]
 pub struct WgClientArgs {
@@ -153,11 +195,11 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
             false,
         )?;
     }
-    let planned_device = select_device_name(&args.device)?;
-    let default_plan = plan_client_hooks(&planned_device, &runtime)?;
-    let plan = effective_hook_plan(default_plan, &args.up, &args.down);
 
     if args.print_hooks || args.dry_run {
+        let planned_device = select_device_name(&args.device)?;
+        let default_plan = plan_client_hooks(&planned_device, &runtime)?;
+        let plan = effective_hook_plan(default_plan, &args.up, &args.down);
         let lines = plan_lines(&args, &planned_device, &runtime, &plan);
         if args.print_hooks {
             print_plan(&lines);
@@ -169,14 +211,110 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
         }
     }
 
+    run_with_recovery(args, runtime, obfs_profile).await
+}
+
+async fn run_with_recovery(
+    args: WgClientArgs,
+    runtime: WgRuntimeConfig,
+    obfs_profile: WgObfsProfile,
+) -> Result<()> {
+    let endpoint = runtime.endpoint.context("wg client endpoint missing")?;
+    let mut restart_count = 0u64;
+    let mut restart_delay = WG_CLIENT_RECOVERY_INITIAL_DELAY;
+
+    loop {
+        let result =
+            run_client_session(args.clone(), runtime.clone(), obfs_profile, restart_count).await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if let Some(local_path_lost) = error.downcast_ref::<noise::WgNoiseLocalPathLost>() {
+                    restart_count += 1;
+                    warn!(
+                        engine = ?args.engine,
+                        endpoint = %endpoint,
+                        restart_count,
+                        backoff_ms = restart_delay.as_millis(),
+                        consecutive_failures = local_path_lost.consecutive_failures,
+                        os_error = ?local_path_lost.os_error,
+                        os_error_name = local_path_lost.os_error_name,
+                        last_error = %local_path_lost.last_error,
+                        "wg client local UDP path lost; rebuilding session after backoff"
+                    );
+                } else if let Some(route_not_ready) = error.downcast_ref::<EgressRouteNotReady>() {
+                    restart_count += 1;
+                    warn!(
+                        engine = ?args.engine,
+                        endpoint = %endpoint,
+                        route_target = route_not_ready.target(),
+                        route_detail = route_not_ready.detail(),
+                        route_output = ?route_not_ready.route_output_for_log(),
+                        restart_count,
+                        backoff_ms = restart_delay.as_millis(),
+                        "wg client egress route not ready; retrying session after backoff"
+                    );
+                } else if let Some(network_not_ready) =
+                    error.downcast_ref::<WgClientNetworkNotReady>()
+                {
+                    restart_count += 1;
+                    warn!(
+                        engine = ?args.engine,
+                        endpoint = %endpoint,
+                        operation = network_not_ready.operation,
+                        probe_endpoint = %network_not_ready.endpoint,
+                        os_error = ?network_not_ready.os_error,
+                        os_error_name = network_not_ready.os_error_name,
+                        last_error = %network_not_ready.last_error,
+                        restart_count,
+                        backoff_ms = restart_delay.as_millis(),
+                        "wg client network not ready; retrying session after backoff"
+                    );
+                } else {
+                    return Err(error);
+                }
+
+                tokio::select! {
+                    _ = tokio::time::sleep(restart_delay) => {}
+                    signal = wait_for_shutdown_signal() => return signal,
+                }
+
+                info!(
+                    engine = ?args.engine,
+                    endpoint = %endpoint,
+                    restart_count,
+                    "wg client rebuilding session after recoverable network change"
+                );
+                restart_delay = next_recovery_delay(restart_delay);
+            }
+        }
+    }
+}
+
+async fn run_client_session(
+    args: WgClientArgs,
+    runtime: WgRuntimeConfig,
+    obfs_profile: WgObfsProfile,
+    restart_count: u64,
+) -> Result<()> {
     if !args.skip_handshake_probe {
         probe_server_handshake(&runtime, args.obfs, obfs_profile, HANDSHAKE_PROBE_TIMEOUT).await?;
     }
 
     if args.engine == WgEngine::Noise {
-        return noise::run_client(args, runtime).await;
+        let endpoint = runtime.endpoint.context("wg client endpoint missing")?;
+        return noise::run_client_session(args, runtime, endpoint, restart_count).await;
     }
 
+    run_device_client_session(args, runtime, restart_count).await
+}
+
+async fn run_device_client_session(
+    args: WgClientArgs,
+    runtime: WgRuntimeConfig,
+    restart_count: u64,
+) -> Result<()> {
+    let endpoint = runtime.endpoint.context("wg client endpoint missing")?;
     let (_device_handle, actual_device) = create_device_handle(&args.device)?;
     let socket_path = control_socket_path(&actual_device);
     apply_device_config(&socket_path, &runtime)?;
@@ -185,9 +323,7 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
         tcpdump::start(
             "wg-client",
             args.tcpdump_interface.as_deref(),
-            TcpdumpFilter::Client {
-                endpoint: runtime.endpoint.expect("validated wg client endpoint"),
-            },
+            TcpdumpFilter::Client { endpoint },
         )
     });
     let adblock = Adblocker::from_config(&args.adblock).await?;
@@ -250,18 +386,20 @@ pub async fn run(args: WgClientArgs) -> Result<()> {
 
     info!(
         device = %actual_device,
-        endpoint = %runtime.endpoint.context("wg client endpoint missing")?,
+        endpoint = %endpoint,
         tunnel_ip = %runtime.tunnel_ip,
         peer_tunnel_ip = %runtime.peer_tunnel_ip,
         dns = ?args.dns,
         dns_capture = args.dns_capture,
         mtu = runtime.mtu,
+        restart_count,
         uapi_socket = %socket_path.display(),
         "wg client started"
     );
 
     let result = wait_for_shutdown_signal().await;
     traffic_switch_task.abort();
+    let _ = traffic_switch_task.await;
     result
 }
 
@@ -368,6 +506,10 @@ fn emit_traffic_switch(state: telemetry::TrafficState) {
     telemetry::emit("INFO", "traffic switch", fields);
 }
 
+fn next_recovery_delay(delay: Duration) -> Duration {
+    delay.saturating_mul(2).min(WG_CLIENT_RECOVERY_MAX_DELAY)
+}
+
 async fn probe_server_handshake(
     runtime: &WgRuntimeConfig,
     obfs: WgObfsMode,
@@ -401,10 +543,13 @@ async fn probe_server_handshake(
     let mut encoded_buf = vec![0u8; noise::MAX_NOISE_UDP_PACKET_SIZE];
     let encoded_len = codec.encode(&packet, &mut encoded_buf)?;
 
-    socket
-        .send_to(&encoded_buf[..encoded_len], endpoint)
-        .await
-        .with_context(|| format!("failed to send WG handshake probe to {endpoint}"))?;
+    send_probe_udp_packet(
+        &socket,
+        &encoded_buf[..encoded_len],
+        endpoint,
+        "sending WG handshake probe",
+    )
+    .await?;
 
     let mut recv_buf = vec![0u8; noise::MAX_NOISE_UDP_PACKET_SIZE];
     let mut decoded_buf = [0u8; super::HANDSHAKE_BUFFER_SIZE];
@@ -425,12 +570,13 @@ async fn probe_server_handshake(
             ) {
                 TunnResult::WriteToNetwork(packet) => {
                     let encoded_len = codec.encode(packet, &mut encoded_buf)?;
-                    socket
-                        .send_to(&encoded_buf[..encoded_len], endpoint)
-                        .await
-                        .with_context(|| {
-                            format!("failed to send WG handshake probe keepalive to {endpoint}")
-                        })?;
+                    send_probe_udp_packet(
+                        &socket,
+                        &encoded_buf[..encoded_len],
+                        endpoint,
+                        "sending WG handshake probe keepalive",
+                    )
+                    .await?;
                     return Ok(());
                 }
                 TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
@@ -447,6 +593,37 @@ async fn probe_server_handshake(
             "wg client handshake probe timed out after {}s; endpoint may be unreachable or WG keys may not match. Pass --skip-handshake-probe or set client.wg.skip_handshake_probe: true to start without probing.",
             timeout_duration.as_secs()
         ),
+    }
+}
+
+async fn send_probe_udp_packet(
+    socket: &UdpSocket,
+    packet: &[u8],
+    endpoint: SocketAddr,
+    operation: &'static str,
+) -> Result<usize> {
+    match socket.send_to(packet, endpoint).await {
+        Ok(sent) => Ok(sent),
+        Err(error) if is_recoverable_udp_path_error(&error) => {
+            Err(WgClientNetworkNotReady::from_udp_error(operation, endpoint, &error).into())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to send WG handshake probe to {endpoint}"))
+        }
+    }
+}
+
+fn is_recoverable_udp_path_error(error: &io::Error) -> bool {
+    error.raw_os_error().and_then(udp_os_error_name).is_some()
+}
+
+fn udp_os_error_name(code: i32) -> Option<&'static str> {
+    match code {
+        libc::EADDRNOTAVAIL => Some("EADDRNOTAVAIL"),
+        libc::ENETDOWN => Some("ENETDOWN"),
+        libc::ENETUNREACH => Some("ENETUNREACH"),
+        libc::EHOSTUNREACH => Some("EHOSTUNREACH"),
+        _ => None,
     }
 }
 
@@ -672,7 +849,11 @@ fn domain_rules_need_dns_capture(domain_rules: &RouteRuleConfig) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{WgClientArgs, plan_lines, probe_server_handshake};
+    use super::{
+        WG_CLIENT_RECOVERY_INITIAL_DELAY, WgClientArgs, WgClientNetworkNotReady,
+        is_recoverable_udp_path_error, next_recovery_delay, plan_lines, probe_server_handshake,
+        udp_os_error_name,
+    };
     use crate::proxy::route::RouteRuleConfig;
     use crate::wg::{
         HANDSHAKE_BUFFER_SIZE, WgEngine, WgObfsMode, WgObfsProfile, WgRuntimeConfig,
@@ -684,6 +865,7 @@ mod tests {
         x25519::{PublicKey, StaticSecret},
     };
     use std::{
+        io,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         time::Duration,
     };
@@ -732,6 +914,54 @@ mod tests {
         );
         assert_eq!(runtime.tunnel_ip, IpAddr::V4(Ipv4Addr::new(10, 8, 0, 2)));
         assert_eq!(runtime.peer_allowed_ips, vec!["0.0.0.0/0"]);
+    }
+
+    #[test]
+    fn recovery_backoff_caps_at_ten_seconds() {
+        let mut delay = WG_CLIENT_RECOVERY_INITIAL_DELAY;
+        let mut observed = Vec::new();
+        for _ in 0..6 {
+            observed.push(delay);
+            delay = next_recovery_delay(delay);
+        }
+
+        assert_eq!(
+            observed,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(10),
+                Duration::from_secs(10),
+            ]
+        );
+    }
+
+    #[test]
+    fn handshake_probe_send_errors_mark_local_network_not_ready() {
+        for code in [
+            libc::EADDRNOTAVAIL,
+            libc::ENETDOWN,
+            libc::ENETUNREACH,
+            libc::EHOSTUNREACH,
+        ] {
+            assert!(is_recoverable_udp_path_error(
+                &io::Error::from_raw_os_error(code)
+            ));
+        }
+        assert!(!is_recoverable_udp_path_error(
+            &io::Error::from_raw_os_error(libc::ECONNREFUSED)
+        ));
+
+        let endpoint = SocketAddr::from(([198, 51, 100, 10], 51820));
+        let error = io::Error::from_raw_os_error(libc::ENETUNREACH);
+        let network_not_ready =
+            WgClientNetworkNotReady::from_udp_error("sending WG handshake probe", endpoint, &error);
+        assert_eq!(network_not_ready.endpoint, endpoint);
+        assert_eq!(network_not_ready.os_error, Some(libc::ENETUNREACH));
+        assert_eq!(network_not_ready.os_error_name, "ENETUNREACH");
+        assert_eq!(udp_os_error_name(libc::ENETUNREACH), Some("ENETUNREACH"));
     }
 
     #[test]

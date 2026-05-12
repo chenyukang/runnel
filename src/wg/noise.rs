@@ -21,7 +21,8 @@ use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::{
     collections::BTreeMap,
-    io,
+    error::Error as StdError,
+    fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::Arc,
     time::Duration,
@@ -32,7 +33,7 @@ use tokio::{
     sync::Mutex,
     time::{MissedTickBehavior, interval, sleep},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     proxy::{adblock::Adblocker, route::RouteRuleConfig},
@@ -51,10 +52,15 @@ const MASK_PAD_LEN: usize = 2;
 const MASK_TAG_LEN: usize = 8;
 const MASK_HEADER_LEN: usize = MASK_NONCE_LEN + MASK_LEN_LEN + MASK_PAD_LEN;
 const MASK_FRAME_OVERHEAD: usize = MASK_HEADER_LEN + MASK_TAG_LEN + WG_OBFS_MAX_PADDING as usize;
+const LOCAL_PATH_LOST_SEND_THRESHOLD: u32 = 3;
 type HmacSha256 = Hmac<Sha256>;
 
-pub(crate) async fn run_client(args: WgClientArgs, runtime: WgRuntimeConfig) -> Result<()> {
-    let endpoint = runtime.endpoint.context("wg client endpoint missing")?;
+pub(super) async fn run_client_session(
+    args: WgClientArgs,
+    runtime: WgRuntimeConfig,
+    endpoint: SocketAddr,
+    restart_count: u64,
+) -> Result<()> {
     let (tun, actual_device) = open_tun_device(&args.device)?;
     let socket = UdpSocket::bind(bind_addr_for_endpoint(runtime.bind, endpoint))
         .await
@@ -131,6 +137,7 @@ pub(crate) async fn run_client(args: WgClientArgs, runtime: WgRuntimeConfig) -> 
         dns = ?args.dns,
         dns_capture = args.dns_capture,
         mtu = runtime.mtu,
+        restart_count,
         engine = "noise",
         "wg client started"
     );
@@ -147,6 +154,7 @@ pub(crate) async fn run_client(args: WgClientArgs, runtime: WgRuntimeConfig) -> 
     )
     .await;
     traffic_switch_task.abort();
+    let _ = traffic_switch_task.await;
     result
 }
 
@@ -339,6 +347,7 @@ async fn run_noise_loop(
     let mut traffic_timer = interval(TRAFFIC_SAMPLE_TICK);
     traffic_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut traffic = TrafficCounters::default();
+    let mut path_health = UdpPathHealth::default();
     let shutdown = wait_for_shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -353,6 +362,7 @@ async fn run_noise_loop(
             Some(endpoint),
             action,
             &mut traffic,
+            &mut path_health,
         )
         .await?;
     }
@@ -366,7 +376,7 @@ async fn run_noise_loop(
                     continue;
                 }
                 let action = noise_action(tunnel.encapsulate(&tun_packet[..len], &mut out_packet));
-                apply_noise_action(role, &tun, &socket, &codec, &mut encoded_packet, peer.endpoint(), action, &mut traffic).await?;
+                apply_noise_action(role, &tun, &socket, &codec, &mut encoded_packet, peer.endpoint(), action, &mut traffic, &mut path_health).await?;
             }
             received = socket.recv_from(&mut udp_packet) => {
                 let (len, source) = received.context("failed to receive wg noise UDP packet")?;
@@ -376,12 +386,12 @@ async fn run_noise_loop(
                 };
                 let action = noise_action(tunnel.decapsulate(Some(source.ip()), &decoded_packet[..decoded_len], &mut out_packet));
                 let response_target = peer.observe_source(role, source, &action);
-                apply_noise_action(role, &tun, &socket, &codec, &mut encoded_packet, response_target, action, &mut traffic).await?;
-                flush_queued_packets(role, &mut tunnel, &tun, &socket, &codec, peer.endpoint(), &mut out_packet, &mut encoded_packet, &mut traffic).await?;
+                apply_noise_action(role, &tun, &socket, &codec, &mut encoded_packet, response_target, action, &mut traffic, &mut path_health).await?;
+                flush_queued_packets(role, &mut tunnel, &tun, &socket, &codec, peer.endpoint(), &mut out_packet, &mut encoded_packet, &mut traffic, &mut path_health).await?;
             }
             _ = timers.tick() => {
                 let action = noise_action(tunnel.update_timers(&mut out_packet));
-                apply_noise_action(role, &tun, &socket, &codec, &mut encoded_packet, peer.endpoint(), action, &mut traffic).await?;
+                apply_noise_action(role, &tun, &socket, &codec, &mut encoded_packet, peer.endpoint(), action, &mut traffic, &mut path_health).await?;
             }
             _ = traffic_timer.tick() => {
                 traffic.emit(role);
@@ -401,6 +411,7 @@ async fn flush_queued_packets(
     out_packet: &mut [u8],
     encoded_packet: &mut [u8],
     traffic: &mut TrafficCounters,
+    path_health: &mut UdpPathHealth,
 ) -> Result<()> {
     for _ in 0..MAX_QUEUE_FLUSH {
         let action = noise_action(tunnel.decapsulate(None, &[], out_packet));
@@ -417,6 +428,7 @@ async fn flush_queued_packets(
             peer_endpoint,
             action,
             traffic,
+            path_health,
         )
         .await?;
         if !should_continue {
@@ -454,6 +466,7 @@ async fn apply_noise_action(
     peer_endpoint: Option<SocketAddr>,
     action: NoiseAction,
     traffic: &mut TrafficCounters,
+    path_health: &mut UdpPathHealth,
 ) -> Result<()> {
     match action {
         NoiseAction::Done => Ok(()),
@@ -477,6 +490,7 @@ async fn apply_noise_action(
                 endpoint,
                 &packet,
                 traffic,
+                path_health,
             )
             .await?;
             Ok(())
@@ -500,6 +514,7 @@ async fn send_network_packet(
     endpoint: SocketAddr,
     packet: &[u8],
     traffic: &mut TrafficCounters,
+    path_health: &mut UdpPathHealth,
 ) -> Result<()> {
     if codec.has_junk_packets() {
         for _ in 0..codec.profile.junk_packets {
@@ -512,8 +527,9 @@ async fn send_network_packet(
                     endpoint,
                     &encoded_packet[..encoded_len],
                     traffic,
+                    path_health,
                 )
-                .await
+                .await?
                 {
                     return Ok(());
                 }
@@ -529,8 +545,9 @@ async fn send_network_packet(
         endpoint,
         &encoded_packet[..encoded_len],
         traffic,
+        path_health,
     )
-    .await
+    .await?
     {
         return Ok(());
     }
@@ -549,23 +566,174 @@ async fn send_udp_packet(
     endpoint: SocketAddr,
     packet: &[u8],
     traffic: &mut TrafficCounters,
-) -> bool {
+    path_health: &mut UdpPathHealth,
+) -> Result<bool> {
     match socket.send_to(packet, endpoint).await {
         Ok(sent) => {
             traffic.uploaded += sent as u64;
-            true
+            path_health.record_success(role, endpoint);
+            Ok(true)
         }
         Err(error) => {
-            warn!(
-                role,
-                endpoint = %endpoint,
-                error = %error,
-                "wg noise UDP send failed"
-            );
-            false
+            path_health.record_failure(role, endpoint, packet.len(), &error)?;
+            Ok(false)
         }
     }
 }
+
+#[derive(Debug, Default)]
+struct UdpPathHealth {
+    consecutive_local_path_failures: u32,
+}
+
+impl UdpPathHealth {
+    fn record_success(&mut self, role: &'static str, endpoint: SocketAddr) {
+        if self.consecutive_local_path_failures == 0 {
+            return;
+        }
+        info!(
+            role,
+            endpoint = %endpoint,
+            recovered_after_failures = self.consecutive_local_path_failures,
+            "wg noise UDP local path recovered"
+        );
+        self.consecutive_local_path_failures = 0;
+    }
+
+    fn record_failure(
+        &mut self,
+        role: &'static str,
+        endpoint: SocketAddr,
+        bytes: usize,
+        error: &io::Error,
+    ) -> Result<()> {
+        let os_error = error.raw_os_error();
+        let os_error_name = os_error.and_then(udp_os_error_name).unwrap_or("unknown");
+        match classify_udp_send_error(error) {
+            UdpSendFailureKind::LocalPathLost => {
+                self.consecutive_local_path_failures += 1;
+                warn!(
+                    role,
+                    endpoint = %endpoint,
+                    bytes,
+                    failure_kind = "local_path_lost",
+                    consecutive_failures = self.consecutive_local_path_failures,
+                    threshold = LOCAL_PATH_LOST_SEND_THRESHOLD,
+                    os_error = ?os_error,
+                    os_error_name,
+                    error = %error,
+                    "wg noise UDP local path send failed"
+                );
+                if should_rebuild_session_on_local_path_loss(role)
+                    && self.consecutive_local_path_failures >= LOCAL_PATH_LOST_SEND_THRESHOLD
+                {
+                    error!(
+                        role,
+                        endpoint = %endpoint,
+                        consecutive_failures = self.consecutive_local_path_failures,
+                        threshold = LOCAL_PATH_LOST_SEND_THRESHOLD,
+                        os_error = ?os_error,
+                        os_error_name,
+                        error = %error,
+                        "wg noise UDP local path marked lost; tearing down session"
+                    );
+                    return Err(WgNoiseLocalPathLost {
+                        role,
+                        endpoint,
+                        consecutive_failures: self.consecutive_local_path_failures,
+                        os_error,
+                        os_error_name,
+                        last_error: error.to_string(),
+                    }
+                    .into());
+                }
+            }
+            UdpSendFailureKind::Other => {
+                if self.consecutive_local_path_failures > 0 {
+                    info!(
+                        role,
+                        endpoint = %endpoint,
+                        previous_local_path_failures = self.consecutive_local_path_failures,
+                        "wg noise UDP local path failure streak reset by non-local send error"
+                    );
+                    self.consecutive_local_path_failures = 0;
+                }
+                warn!(
+                    role,
+                    endpoint = %endpoint,
+                    bytes,
+                    failure_kind = "udp_send_failed",
+                    os_error = ?os_error,
+                    os_error_name,
+                    error = %error,
+                    "wg noise UDP send failed"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UdpSendFailureKind {
+    LocalPathLost,
+    Other,
+}
+
+fn classify_udp_send_error(error: &io::Error) -> UdpSendFailureKind {
+    match error.raw_os_error() {
+        Some(code)
+            if code == libc::EADDRNOTAVAIL
+                || code == libc::ENETDOWN
+                || code == libc::ENETUNREACH
+                || code == libc::EHOSTUNREACH =>
+        {
+            UdpSendFailureKind::LocalPathLost
+        }
+        _ => UdpSendFailureKind::Other,
+    }
+}
+
+fn udp_os_error_name(code: i32) -> Option<&'static str> {
+    match code {
+        libc::EADDRNOTAVAIL => Some("EADDRNOTAVAIL"),
+        libc::ENETDOWN => Some("ENETDOWN"),
+        libc::ENETUNREACH => Some("ENETUNREACH"),
+        libc::EHOSTUNREACH => Some("EHOSTUNREACH"),
+        libc::ECONNREFUSED => Some("ECONNREFUSED"),
+        _ => None,
+    }
+}
+
+fn should_rebuild_session_on_local_path_loss(role: &'static str) -> bool {
+    role == "wg-client"
+}
+
+#[derive(Debug)]
+pub(super) struct WgNoiseLocalPathLost {
+    pub(super) role: &'static str,
+    pub(super) endpoint: SocketAddr,
+    pub(super) consecutive_failures: u32,
+    pub(super) os_error: Option<i32>,
+    pub(super) os_error_name: &'static str,
+    pub(super) last_error: String,
+}
+
+impl fmt::Display for WgNoiseLocalPathLost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} local UDP path to {} failed {} consecutive times",
+            self.role, self.endpoint, self.consecutive_failures
+        )?;
+        if let Some(os_error) = self.os_error {
+            write!(f, " ({} / os error {os_error})", self.os_error_name)?;
+        }
+        write!(f, ": {}", self.last_error)
+    }
+}
+
+impl StdError for WgNoiseLocalPathLost {}
 
 async fn maybe_obfs_jitter(codec: &NoisePacketCodec) {
     let jitter = codec.jitter();
@@ -954,15 +1122,20 @@ impl TrafficCounters {
 #[cfg(test)]
 mod tests {
     use super::{
-        MASK_HEADER_LEN, MASK_TAG_LEN, MAX_NOISE_UDP_PACKET_SIZE, MAX_WG_PACKET_SIZE, NoiseAction,
-        NoisePacketCodec, NoisePeerState, bind_addr_for_endpoint, noise_action,
+        LOCAL_PATH_LOST_SEND_THRESHOLD, MASK_HEADER_LEN, MASK_TAG_LEN, MAX_NOISE_UDP_PACKET_SIZE,
+        MAX_WG_PACKET_SIZE, NoiseAction, NoisePacketCodec, NoisePeerState, UdpPathHealth,
+        UdpSendFailureKind, WgNoiseLocalPathLost, bind_addr_for_endpoint, classify_udp_send_error,
+        noise_action, udp_os_error_name,
     };
     use crate::wg::{
         WgObfsMode, WgObfsProfile, WgRuntimeConfig, default_client_allowed_ips,
         default_server_allowed_ips,
     };
     use boringtun::x25519::{PublicKey, StaticSecret};
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::{
+        io,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    };
 
     #[test]
     fn bind_addr_for_endpoint_preserves_endpoint_family() {
@@ -980,6 +1153,124 @@ mod tests {
             ),
             SocketAddr::from((Ipv6Addr::UNSPECIFIED, 1234))
         );
+    }
+
+    #[test]
+    fn udp_send_error_classifies_local_path_failures() {
+        for code in [
+            libc::EADDRNOTAVAIL,
+            libc::ENETDOWN,
+            libc::ENETUNREACH,
+            libc::EHOSTUNREACH,
+        ] {
+            assert_eq!(
+                classify_udp_send_error(&io::Error::from_raw_os_error(code)),
+                UdpSendFailureKind::LocalPathLost
+            );
+        }
+
+        assert_eq!(
+            classify_udp_send_error(&io::Error::from_raw_os_error(libc::ECONNREFUSED)),
+            UdpSendFailureKind::Other
+        );
+        assert_eq!(
+            classify_udp_send_error(&io::Error::new(io::ErrorKind::TimedOut, "timed out")),
+            UdpSendFailureKind::Other
+        );
+        assert_eq!(
+            udp_os_error_name(libc::EADDRNOTAVAIL),
+            Some("EADDRNOTAVAIL")
+        );
+    }
+
+    #[test]
+    fn udp_path_health_escalates_after_consecutive_local_path_failures() {
+        let endpoint = SocketAddr::from(([198, 51, 100, 10], 51820));
+        let mut health = UdpPathHealth::default();
+
+        for expected_failures in 1..LOCAL_PATH_LOST_SEND_THRESHOLD {
+            health
+                .record_failure(
+                    "wg-client",
+                    endpoint,
+                    64,
+                    &io::Error::from_raw_os_error(libc::EADDRNOTAVAIL),
+                )
+                .unwrap();
+            assert_eq!(health.consecutive_local_path_failures, expected_failures);
+        }
+
+        let error = health
+            .record_failure(
+                "wg-client",
+                endpoint,
+                64,
+                &io::Error::from_raw_os_error(libc::EADDRNOTAVAIL),
+            )
+            .unwrap_err();
+        let local_path_lost = error
+            .downcast_ref::<WgNoiseLocalPathLost>()
+            .expect("local path failures should escalate to WgNoiseLocalPathLost");
+        assert_eq!(local_path_lost.endpoint, endpoint);
+        assert_eq!(
+            local_path_lost.consecutive_failures,
+            LOCAL_PATH_LOST_SEND_THRESHOLD
+        );
+        assert_eq!(local_path_lost.os_error, Some(libc::EADDRNOTAVAIL));
+        assert_eq!(local_path_lost.os_error_name, "EADDRNOTAVAIL");
+    }
+
+    #[test]
+    fn udp_path_health_does_not_restart_server_session() {
+        let endpoint = SocketAddr::from(([198, 51, 100, 10], 51820));
+        let mut health = UdpPathHealth::default();
+
+        for expected_failures in 1..=LOCAL_PATH_LOST_SEND_THRESHOLD {
+            health
+                .record_failure(
+                    "wg-server",
+                    endpoint,
+                    64,
+                    &io::Error::from_raw_os_error(libc::EADDRNOTAVAIL),
+                )
+                .unwrap();
+            assert_eq!(health.consecutive_local_path_failures, expected_failures);
+        }
+    }
+
+    #[test]
+    fn udp_path_health_resets_after_success_or_non_local_send_error() {
+        let endpoint = SocketAddr::from(([198, 51, 100, 10], 51820));
+        let mut health = UdpPathHealth::default();
+
+        health
+            .record_failure(
+                "wg-client",
+                endpoint,
+                64,
+                &io::Error::from_raw_os_error(libc::EADDRNOTAVAIL),
+            )
+            .unwrap();
+        health.record_success("wg-client", endpoint);
+        assert_eq!(health.consecutive_local_path_failures, 0);
+
+        health
+            .record_failure(
+                "wg-client",
+                endpoint,
+                64,
+                &io::Error::from_raw_os_error(libc::EADDRNOTAVAIL),
+            )
+            .unwrap();
+        health
+            .record_failure(
+                "wg-client",
+                endpoint,
+                64,
+                &io::Error::from_raw_os_error(libc::ECONNREFUSED),
+            )
+            .unwrap();
+        assert_eq!(health.consecutive_local_path_failures, 0);
     }
 
     #[test]
