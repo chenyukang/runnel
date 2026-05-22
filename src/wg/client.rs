@@ -75,6 +75,24 @@ impl fmt::Display for WgClientNetworkNotReady {
 
 impl StdError for WgClientNetworkNotReady {}
 
+#[derive(Debug)]
+struct WgClientHandshakeProbeTimedOut {
+    endpoint: SocketAddr,
+    timeout_duration: Duration,
+}
+
+impl fmt::Display for WgClientHandshakeProbeTimedOut {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "wg client handshake probe timed out after {}s; endpoint may be unreachable or WG keys may not match. Pass --skip-handshake-probe or set client.wg.skip_handshake_probe: true to start without probing.",
+            self.timeout_duration.as_secs()
+        )
+    }
+}
+
+impl StdError for WgClientHandshakeProbeTimedOut {}
+
 #[derive(Clone, Debug, Args)]
 pub struct WgClientArgs {
     #[arg(long, value_enum, default_value_t = WgEngine::Device)]
@@ -222,10 +240,17 @@ async fn run_with_recovery(
     let endpoint = runtime.endpoint.context("wg client endpoint missing")?;
     let mut restart_count = 0u64;
     let mut restart_delay = WG_CLIENT_RECOVERY_INITIAL_DELAY;
+    let mut session_started = false;
 
     loop {
-        let result =
-            run_client_session(args.clone(), runtime.clone(), obfs_profile, restart_count).await;
+        let result = run_client_session(
+            args.clone(),
+            runtime.clone(),
+            obfs_profile,
+            restart_count,
+            &mut session_started,
+        )
+        .await;
         match result {
             Ok(()) => return Ok(()),
             Err(error) => {
@@ -270,6 +295,19 @@ async fn run_with_recovery(
                         backoff_ms = restart_delay.as_millis(),
                         "wg client network not ready; retrying session after backoff"
                     );
+                } else if let Some(probe_timeout) =
+                    recoverable_handshake_probe_timeout(&error, session_started)
+                {
+                    restart_count += 1;
+                    warn!(
+                        engine = ?args.engine,
+                        endpoint = %endpoint,
+                        probe_endpoint = %probe_timeout.endpoint,
+                        timeout_secs = probe_timeout.timeout_duration.as_secs(),
+                        restart_count,
+                        backoff_ms = restart_delay.as_millis(),
+                        "wg client handshake probe timed out after prior session; retrying session after backoff"
+                    );
                 } else {
                     return Err(error);
                 }
@@ -296,10 +334,12 @@ async fn run_client_session(
     runtime: WgRuntimeConfig,
     obfs_profile: WgObfsProfile,
     restart_count: u64,
+    session_started: &mut bool,
 ) -> Result<()> {
     if !args.skip_handshake_probe {
         probe_server_handshake(&runtime, args.obfs, obfs_profile, HANDSHAKE_PROBE_TIMEOUT).await?;
     }
+    *session_started = true;
 
     if args.engine == WgEngine::Noise {
         let endpoint = runtime.endpoint.context("wg client endpoint missing")?;
@@ -510,6 +550,13 @@ fn next_recovery_delay(delay: Duration) -> Duration {
     delay.saturating_mul(2).min(WG_CLIENT_RECOVERY_MAX_DELAY)
 }
 
+fn recoverable_handshake_probe_timeout(
+    error: &anyhow::Error,
+    session_started: bool,
+) -> Option<&WgClientHandshakeProbeTimedOut> {
+    session_started.then(|| error.downcast_ref()).flatten()
+}
+
 async fn probe_server_handshake(
     runtime: &WgRuntimeConfig,
     obfs: WgObfsMode,
@@ -589,10 +636,11 @@ async fn probe_server_handshake(
 
     match timeout(timeout_duration, probe).await {
         Ok(result) => result,
-        Err(_) => bail!(
-            "wg client handshake probe timed out after {}s; endpoint may be unreachable or WG keys may not match. Pass --skip-handshake-probe or set client.wg.skip_handshake_probe: true to start without probing.",
-            timeout_duration.as_secs()
-        ),
+        Err(_) => Err(WgClientHandshakeProbeTimedOut {
+            endpoint,
+            timeout_duration,
+        }
+        .into()),
     }
 }
 
@@ -850,9 +898,9 @@ fn domain_rules_need_dns_capture(domain_rules: &RouteRuleConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        WG_CLIENT_RECOVERY_INITIAL_DELAY, WgClientArgs, WgClientNetworkNotReady,
-        is_recoverable_udp_path_error, next_recovery_delay, plan_lines, probe_server_handshake,
-        udp_os_error_name,
+        WG_CLIENT_RECOVERY_INITIAL_DELAY, WgClientArgs, WgClientHandshakeProbeTimedOut,
+        WgClientNetworkNotReady, is_recoverable_udp_path_error, next_recovery_delay, plan_lines,
+        probe_server_handshake, recoverable_handshake_probe_timeout, udp_os_error_name,
     };
     use crate::proxy::route::RouteRuleConfig;
     use crate::wg::{
@@ -962,6 +1010,22 @@ mod tests {
         assert_eq!(network_not_ready.os_error, Some(libc::ENETUNREACH));
         assert_eq!(network_not_ready.os_error_name, "ENETUNREACH");
         assert_eq!(udp_os_error_name(libc::ENETUNREACH), Some("ENETUNREACH"));
+    }
+
+    #[test]
+    fn handshake_probe_timeout_recovers_only_after_session_started() {
+        let endpoint = SocketAddr::from(([198, 51, 100, 10], 51820));
+        let error: anyhow::Error = WgClientHandshakeProbeTimedOut {
+            endpoint,
+            timeout_duration: Duration::from_secs(3),
+        }
+        .into();
+
+        assert!(recoverable_handshake_probe_timeout(&error, false).is_none());
+        let timeout = recoverable_handshake_probe_timeout(&error, true)
+            .expect("prior sessions should make restart probe timeouts recoverable");
+        assert_eq!(timeout.endpoint, endpoint);
+        assert_eq!(timeout.timeout_duration, Duration::from_secs(3));
     }
 
     #[test]
