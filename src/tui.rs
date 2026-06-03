@@ -1131,21 +1131,54 @@ fn recent_targets_widths() -> [Constraint; 4] {
 }
 
 fn sample_process_stats(pid: u32) -> ProcessStats {
-    let mut system = System::new();
-    let sys_pid = sysinfo::Pid::from_u32(pid);
-    system.refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), true);
-
-    let memory_bytes = system
-        .process(sys_pid)
-        .map(|process| process.memory())
-        .unwrap_or(0);
-
+    let memory_bytes = sample_process_memory_bytes(pid);
     let threads = sample_thread_count(pid);
 
     ProcessStats {
         memory_bytes,
         threads,
     }
+}
+
+fn sample_process_memory_bytes(pid: u32) -> u64 {
+    let mut system = System::new();
+    let sys_pid = sysinfo::Pid::from_u32(pid);
+    system.refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), true);
+
+    if let Some(memory_bytes) = system
+        .process(sys_pid)
+        .map(|process| process.memory())
+        .filter(|memory_bytes| *memory_bytes > 0)
+    {
+        return memory_bytes;
+    }
+
+    sample_process_rss_bytes(pid).unwrap_or(0)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sample_process_rss_bytes(pid: u32) -> Option<u64> {
+    let output = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_ps_rss_kib(&String::from_utf8_lossy(&output.stdout)).map(|kib| kib.saturating_mul(1024))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn sample_process_rss_bytes(_pid: u32) -> Option<u64> {
+    None
+}
+
+#[cfg(any(test, target_os = "macos", target_os = "linux"))]
+fn parse_ps_rss_kib(output: &str) -> Option<u64> {
+    output
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .find_map(|rss| rss.parse::<u64>().ok())
 }
 
 fn sample_thread_count(pid: u32) -> Option<usize> {
@@ -1208,9 +1241,10 @@ fn split_target(target: &str) -> (String, Option<u16>) {
 mod tests {
     use super::{
         DashboardApp, DashboardContext, RecentTarget, TraceEvent, fit_wave_data_to_width,
-        link_from_target, recent_target_activity, recent_target_link, recent_target_route,
-        recent_targets_activity_header, recent_targets_link_header, recent_targets_title,
-        recent_targets_widths, route_stat_label, split_target,
+        link_from_target, parse_ps_rss_kib, recent_target_activity, recent_target_link,
+        recent_target_route, recent_targets_activity_header, recent_targets_link_header,
+        recent_targets_title, recent_targets_widths, route_stat_label, sample_process_memory_bytes,
+        split_target,
     };
     use ratatui::layout::Constraint;
     use std::{collections::BTreeMap, path::PathBuf, time::SystemTime};
@@ -1248,6 +1282,23 @@ mod tests {
     #[test]
     fn split_ipv6_target() {
         assert_eq!(split_target("[::1]:1080"), ("::1".to_owned(), Some(1080)));
+    }
+
+    #[test]
+    fn parse_ps_rss_reads_kib_value() {
+        assert_eq!(parse_ps_rss_kib(" 13568\n"), Some(13568));
+    }
+
+    #[test]
+    fn parse_ps_rss_skips_blank_and_invalid_lines() {
+        assert_eq!(parse_ps_rss_kib("\nRSS\n  2048\n"), Some(2048));
+        assert_eq!(parse_ps_rss_kib("\nRSS\n"), None);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn sample_process_memory_reports_current_process() {
+        assert!(sample_process_memory_bytes(std::process::id()) > 0);
     }
 
     #[test]
