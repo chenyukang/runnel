@@ -225,6 +225,9 @@ tunnel route. `domain_rules.direct` installs dynamic direct host routes for
 resolved A/AAAA records, `domain_rules.block` returns NXDOMAIN from DNS capture,
 and `domain_rules.proxy` keeps the default tunnel behavior. WG `ip_rules.block`
 still needs firewall or blackhole-route hooks and is not enforced yet.
+Dynamic direct host routes are tracked in
+`~/.runnel/current/wg-client-dynamic-routes.json` so a later client start can
+remove Runnel-owned routes left behind by an interrupted session.
 
 ## Config Files
 

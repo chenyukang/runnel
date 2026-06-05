@@ -1141,19 +1141,31 @@ fn sample_process_stats(pid: u32) -> ProcessStats {
 }
 
 fn sample_process_memory_bytes(pid: u32) -> u64 {
+    select_process_memory_bytes(
+        sample_process_sysinfo_memory_bytes(pid),
+        sample_process_rss_bytes(pid),
+    )
+}
+
+fn sample_process_sysinfo_memory_bytes(pid: u32) -> Option<u64> {
     let mut system = System::new();
     let sys_pid = sysinfo::Pid::from_u32(pid);
     system.refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), true);
 
-    if let Some(memory_bytes) = system
+    system
         .process(sys_pid)
         .map(|process| process.memory())
         .filter(|memory_bytes| *memory_bytes > 0)
-    {
-        return memory_bytes;
-    }
+}
 
-    sample_process_rss_bytes(pid).unwrap_or(0)
+#[cfg(target_os = "macos")]
+fn select_process_memory_bytes(sysinfo_bytes: Option<u64>, rss_bytes: Option<u64>) -> u64 {
+    rss_bytes.or(sysinfo_bytes).unwrap_or(0)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn select_process_memory_bytes(sysinfo_bytes: Option<u64>, rss_bytes: Option<u64>) -> u64 {
+    sysinfo_bytes.or(rss_bytes).unwrap_or(0)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1244,7 +1256,7 @@ mod tests {
         link_from_target, parse_ps_rss_kib, recent_target_activity, recent_target_link,
         recent_target_route, recent_targets_activity_header, recent_targets_link_header,
         recent_targets_title, recent_targets_widths, route_stat_label, sample_process_memory_bytes,
-        split_target,
+        select_process_memory_bytes, split_target,
     };
     use ratatui::layout::Constraint;
     use std::{collections::BTreeMap, path::PathBuf, time::SystemTime};
@@ -1293,6 +1305,24 @@ mod tests {
     fn parse_ps_rss_skips_blank_and_invalid_lines() {
         assert_eq!(parse_ps_rss_kib("\nRSS\n  2048\n"), Some(2048));
         assert_eq!(parse_ps_rss_kib("\nRSS\n"), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_process_memory_prefers_rss_to_match_activity_monitor() {
+        assert_eq!(
+            select_process_memory_bytes(Some(78 * 1024 * 1024), Some(25 * 1024 * 1024)),
+            25 * 1024 * 1024
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_process_memory_prefers_sysinfo() {
+        assert_eq!(
+            select_process_memory_bytes(Some(78 * 1024 * 1024), Some(25 * 1024 * 1024)),
+            78 * 1024 * 1024
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

@@ -1,10 +1,13 @@
 use anyhow::{Context, Result, bail};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error as StdError,
-    fmt,
+    fmt, fs,
+    io::ErrorKind,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
 };
@@ -36,9 +39,27 @@ pub(crate) struct SwitchableHookGuard {
 }
 
 pub(crate) struct DynamicRouteManager {
-    route: RouteInfo,
+    endpoint_ip: IpAddr,
+    route: Mutex<RouteInfo>,
     tunnel: TunnelPair,
     direct_hosts: Mutex<BTreeMap<IpAddr, String>>,
+    ledger: DynamicRouteLedger,
+}
+
+#[derive(Clone, Debug)]
+struct DynamicRouteLedger {
+    path: PathBuf,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+struct DynamicRouteLedgerFile {
+    routes: Vec<DynamicRouteLedgerEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct DynamicRouteLedgerEntry {
+    ip: IpAddr,
+    domain: String,
 }
 
 #[derive(Debug)]
@@ -137,6 +158,8 @@ impl DynamicRouteManager {
         let endpoint_ip = runtime
             .endpoint_ip()
             .context("wg client endpoint is required to build dynamic domain routes")?;
+        let ledger = DynamicRouteLedger::for_client();
+        ledger.cleanup_previous()?;
         let route = detect_egress_route(endpoint_ip)?;
         let tunnel = ensure_tunnel_pair(
             runtime.tunnel_ip,
@@ -145,9 +168,11 @@ impl DynamicRouteManager {
             "wg client peer_tunnel_ip",
         )?;
         Ok(Self {
-            route,
+            endpoint_ip,
+            route: Mutex::new(route),
             tunnel,
             direct_hosts: Mutex::new(BTreeMap::new()),
+            ledger,
         })
     }
 
@@ -155,13 +180,97 @@ impl DynamicRouteManager {
         if !self.tunnel.supports_ip(ip) {
             return Ok(false);
         }
+        let current_route = detect_egress_route(self.endpoint_ip)?;
+        let mut route = self.route.lock().expect("dynamic route mutex");
         let mut direct_hosts = self.direct_hosts.lock().expect("dynamic route mutex");
+        if *route != current_route {
+            refresh_direct_host_routes(&direct_hosts, &current_route)?;
+            *route = current_route;
+        }
         if direct_hosts.contains_key(&ip) {
             return Ok(false);
         }
-        run_domain_route_hook(domain, ip, &direct_host_add_command(ip, &self.route))?;
         direct_hosts.insert(ip, domain.to_owned());
+        if let Err(err) = self.ledger.save_hosts(&direct_hosts) {
+            direct_hosts.remove(&ip);
+            return Err(err);
+        }
+        if let Err(err) = run_domain_route_hook(domain, ip, &direct_host_add_command(ip, &route)) {
+            direct_hosts.remove(&ip);
+            if let Err(ledger_err) = self.ledger.save_hosts(&direct_hosts) {
+                warn!(
+                    domain = %domain,
+                    ip = %ip,
+                    error = %ledger_err,
+                    "wg dynamic direct route ledger rollback failed"
+                );
+            }
+            return Err(err);
+        }
         Ok(true)
+    }
+}
+
+fn refresh_direct_host_routes(hosts: &BTreeMap<IpAddr, String>, route: &RouteInfo) -> Result<()> {
+    for (ip, domain) in hosts {
+        run_domain_route_hook(domain, *ip, &direct_host_delete_command(*ip))?;
+        run_domain_route_hook(domain, *ip, &direct_host_add_command(*ip, route))?;
+    }
+    Ok(())
+}
+
+impl DynamicRouteLedger {
+    fn for_client() -> Self {
+        Self {
+            path: dynamic_route_ledger_path(),
+        }
+    }
+
+    #[cfg(test)]
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn cleanup_previous(&self) -> Result<()> {
+        let entries = read_dynamic_route_ledger_entries(&self.path)?;
+        let mut cleanup_ok = true;
+        for entry in entries.iter().rev() {
+            if let Err(err) = run_domain_route_hook(
+                &entry.domain,
+                entry.ip,
+                &direct_host_delete_command(entry.ip),
+            ) {
+                cleanup_ok = false;
+                warn!(
+                    domain = %entry.domain,
+                    ip = %entry.ip,
+                    error = %err,
+                    "wg stale dynamic direct route cleanup failed"
+                );
+            }
+        }
+        if cleanup_ok { self.remove() } else { Ok(()) }
+    }
+
+    fn save_hosts(&self, hosts: &BTreeMap<IpAddr, String>) -> Result<()> {
+        let entries = hosts
+            .iter()
+            .map(|(ip, domain)| DynamicRouteLedgerEntry {
+                ip: *ip,
+                domain: domain.clone(),
+            })
+            .collect::<Vec<_>>();
+        write_dynamic_route_ledger_entries(&self.path, entries)
+    }
+
+    fn remove(&self) -> Result<()> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) => {
+                Err(err).with_context(|| format!("failed to remove {}", self.path.display()))
+            }
+        }
     }
 }
 
@@ -174,10 +283,15 @@ impl Drop for DynamicRouteManager {
             .iter()
             .map(|(ip, domain)| (*ip, domain.clone()))
             .collect::<Vec<_>>();
+        let mut cleanup_ok = true;
         for (ip, domain) in hosts.into_iter().rev() {
             if let Err(err) = run_domain_route_hook(&domain, ip, &direct_host_delete_command(ip)) {
+                cleanup_ok = false;
                 warn!(host = %ip, error = %err, "wg dynamic direct route cleanup failed");
             }
+        }
+        if cleanup_ok && let Err(err) = self.ledger.remove() {
+            warn!(error = %err, "wg dynamic direct route ledger cleanup failed");
         }
     }
 }
@@ -241,6 +355,54 @@ pub(crate) fn run_hooks(hooks: &[String]) -> Result<()> {
 
 fn run_domain_route_hook(domain: &str, ip: IpAddr, hook: &str) -> Result<()> {
     run_hook(hook, Some(domain), Some(ip))
+}
+
+fn dynamic_route_ledger_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".runnel")
+        .join("current")
+        .join("wg-client-dynamic-routes.json")
+}
+
+fn read_dynamic_route_ledger_entries(path: &Path) -> Result<Vec<DynamicRouteLedgerEntry>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path.display())),
+    };
+    let file = serde_json::from_slice::<DynamicRouteLedgerFile>(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(file.routes)
+}
+
+fn write_dynamic_route_ledger_entries(
+    path: &Path,
+    routes: Vec<DynamicRouteLedgerEntry>,
+) -> Result<()> {
+    if routes.is_empty() {
+        return remove_file_if_exists(path);
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let data = serde_json::to_vec_pretty(&DynamicRouteLedgerFile { routes })
+        .context("failed to encode dynamic route ledger")?;
+    let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
+    fs::write(&tmp, data).with_context(|| format!("failed to write {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("failed to replace {}", path.display()))?;
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
+    }
 }
 
 fn run_hook(hook: &str, domain: Option<&str>, ip: Option<IpAddr>) -> Result<()> {
@@ -968,7 +1130,13 @@ mod tests {
     use super::{EgressRouteNotReady, RouteInfo, build_client_hook_plan, exclude_routes};
     use crate::wg::{WgRuntimeConfig, default_client_allowed_ips};
     use ipnet::IpNet;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::{
+        collections::BTreeMap,
+        fs,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     fn client_runtime() -> WgRuntimeConfig {
         WgRuntimeConfig {
@@ -983,6 +1151,63 @@ mod tests {
             peer_allowed_ips: default_client_allowed_ips(),
             excluded_ips: Vec::new(),
         }
+    }
+
+    fn unique_test_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("runnel-{name}-{}-{nonce}.json", std::process::id()))
+    }
+
+    #[test]
+    fn dynamic_route_ledger_round_trips_hosts() {
+        let path = unique_test_path("dynamic-routes");
+        let ledger = super::DynamicRouteLedger::new(path.clone());
+        let mut hosts = BTreeMap::new();
+        hosts.insert(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 108)),
+            "example.com".to_owned(),
+        );
+        hosts.insert(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 109)),
+            "example.com".to_owned(),
+        );
+
+        ledger.save_hosts(&hosts).expect("ledger should be saved");
+        let entries =
+            super::read_dynamic_route_ledger_entries(&path).expect("ledger should be readable");
+
+        assert_eq!(
+            entries,
+            vec![
+                super::DynamicRouteLedgerEntry {
+                    ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 108)),
+                    domain: "example.com".to_owned(),
+                },
+                super::DynamicRouteLedgerEntry {
+                    ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 109)),
+                    domain: "example.com".to_owned(),
+                },
+            ]
+        );
+
+        ledger.remove().expect("ledger should be removed");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn dynamic_route_ledger_removes_empty_host_set() {
+        let path = unique_test_path("dynamic-routes-empty");
+        fs::write(&path, b"{\"routes\":[]}").expect("seed ledger should be writable");
+        let ledger = super::DynamicRouteLedger::new(path.clone());
+
+        ledger
+            .save_hosts(&BTreeMap::new())
+            .expect("empty host set should remove ledger");
+
+        assert!(!path.exists());
     }
 
     #[cfg(target_os = "macos")]
