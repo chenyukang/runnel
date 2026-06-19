@@ -11,7 +11,7 @@ use std::{
     process::Command,
     sync::Mutex,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::WgRuntimeConfig;
 
@@ -180,6 +180,14 @@ impl DynamicRouteManager {
         if !self.tunnel.supports_ip(ip) {
             return Ok(false);
         }
+        if !is_dynamic_direct_route_ip(ip) {
+            debug!(
+                domain = %domain,
+                ip = %ip,
+                "skipped wg dynamic direct route for special-purpose IP"
+            );
+            return Ok(false);
+        }
         let current_route = detect_egress_route(self.endpoint_ip)?;
         let mut route = self.route.lock().expect("dynamic route mutex");
         let mut direct_hosts = self.direct_hosts.lock().expect("dynamic route mutex");
@@ -217,6 +225,24 @@ fn refresh_direct_host_routes(hosts: &BTreeMap<IpAddr, String>, route: &RouteInf
         run_domain_route_hook(domain, *ip, &direct_host_add_command(*ip, route))?;
     }
     Ok(())
+}
+
+fn is_dynamic_direct_route_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_link_local()
+                && !ip.is_multicast()
+                && !ip.is_broadcast()
+        }
+        IpAddr::V6(ip) => {
+            !ip.is_loopback()
+                && !ip.is_unspecified()
+                && !ip.is_unicast_link_local()
+                && !ip.is_multicast()
+        }
+    }
 }
 
 impl DynamicRouteLedger {
@@ -1159,6 +1185,36 @@ mod tests {
             .expect("system time should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("runnel-{name}-{}-{nonce}.json", std::process::id()))
+    }
+
+    #[test]
+    fn dynamic_direct_route_rejects_special_purpose_ips() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6("fe80::1".parse().unwrap()),
+            IpAddr::V6("ff02::1".parse().unwrap()),
+        ] {
+            assert!(
+                !super::is_dynamic_direct_route_ip(ip),
+                "{ip} should not become a dynamic direct route"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_direct_route_accepts_unicast_ips() {
+        assert!(super::is_dynamic_direct_route_ip(IpAddr::V4(
+            Ipv4Addr::new(8, 8, 8, 8)
+        )));
+        assert!(super::is_dynamic_direct_route_ip(IpAddr::V6(
+            "2606:4700:4700::1111".parse().unwrap()
+        )));
     }
 
     #[test]

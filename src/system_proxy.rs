@@ -20,7 +20,7 @@ struct ServiceProxySnapshot {
     authenticated: bool,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ServiceDnsSnapshot {
     name: String,
@@ -164,7 +164,18 @@ impl SystemDnsGuard {
 
         let snapshots = services
             .iter()
-            .map(|service| read_service_dns_snapshot(service))
+            .map(|service| {
+                let snapshot = read_service_dns_snapshot(service)?;
+                let (snapshot, sanitized) = sanitize_dns_snapshot_for_override(snapshot, servers);
+                if sanitized {
+                    warn!(
+                        service = %snapshot.name,
+                        servers = ?servers,
+                        "ignored stale macOS DNS snapshot matching loopback tunnel override"
+                    );
+                }
+                Ok(snapshot)
+            })
             .collect::<Result<Vec<_>>>()?;
 
         let mut applied = Vec::with_capacity(snapshots.len());
@@ -496,6 +507,40 @@ fn parse_direct_dns_ip(value: &str) -> Option<IpAddr> {
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn sanitize_dns_snapshot_for_override(
+    mut snapshot: ServiceDnsSnapshot,
+    override_servers: &[String],
+) -> (ServiceDnsSnapshot, bool) {
+    if is_loopback_dns_override(override_servers)
+        && dns_server_lists_match(&snapshot.servers, override_servers)
+    {
+        snapshot.servers.clear();
+        return (snapshot, true);
+    }
+    (snapshot, false)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_loopback_dns_override(servers: &[String]) -> bool {
+    !servers.is_empty()
+        && servers.iter().all(|server| {
+            server.parse::<IpAddr>().is_ok_and(|ip| match ip {
+                IpAddr::V4(ip) => ip.is_loopback(),
+                IpAddr::V6(ip) => ip.is_loopback(),
+            })
+        })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn dns_server_lists_match(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.trim().eq_ignore_ascii_case(right.trim()))
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn is_direct_dns_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => !ip.is_loopback() && !ip.is_unspecified(),
@@ -577,9 +622,9 @@ fn normalize_proxy_host(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ServiceProxySnapshot, normalize_proxy_host, parse_direct_dns_ip, parse_dns_servers,
-        parse_network_services, parse_service_has_ip_address, parse_service_router,
-        parse_socks_proxy,
+        ServiceDnsSnapshot, ServiceProxySnapshot, normalize_proxy_host, parse_direct_dns_ip,
+        parse_dns_servers, parse_network_services, parse_service_has_ip_address,
+        parse_service_router, parse_socks_proxy, sanitize_dns_snapshot_for_override,
     };
 
     #[test]
@@ -675,5 +720,33 @@ Authenticated Proxy Enabled: 0\n";
     fn parses_empty_dns_server_list() {
         let raw = "There aren't any DNS Servers set on Wi-Fi.\n";
         assert!(parse_dns_servers(raw).is_empty());
+    }
+
+    #[test]
+    fn sanitizes_loopback_dns_snapshot_matching_tunnel_override() {
+        let snapshot = ServiceDnsSnapshot {
+            name: "Wi-Fi".to_owned(),
+            servers: vec!["127.0.0.1".to_owned()],
+        };
+        let override_servers = vec!["127.0.0.1".to_owned()];
+
+        let (snapshot, sanitized) = sanitize_dns_snapshot_for_override(snapshot, &override_servers);
+
+        assert!(sanitized);
+        assert!(snapshot.servers.is_empty());
+    }
+
+    #[test]
+    fn preserves_non_loopback_dns_snapshot() {
+        let snapshot = ServiceDnsSnapshot {
+            name: "Wi-Fi".to_owned(),
+            servers: vec!["223.5.5.5".to_owned()],
+        };
+        let override_servers = vec!["127.0.0.1".to_owned()];
+
+        let (snapshot, sanitized) = sanitize_dns_snapshot_for_override(snapshot, &override_servers);
+
+        assert!(!sanitized);
+        assert_eq!(snapshot.servers, vec!["223.5.5.5".to_owned()]);
     }
 }
