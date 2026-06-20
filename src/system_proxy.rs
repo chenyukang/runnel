@@ -50,6 +50,23 @@ pub struct SystemDnsGuard {
 #[derive(Debug)]
 pub struct SystemDnsGuard;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemDnsMonitorCheck {
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+pub struct SystemDnsMonitor {
+    services: Vec<String>,
+    servers: Vec<String>,
+}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Clone, Debug)]
+pub struct SystemDnsMonitor;
+
 pub fn maybe_activate(args: &ClientArgs) -> Result<Option<SystemProxyGuard>> {
     if !args.system_proxy {
         return Ok(None);
@@ -230,6 +247,17 @@ impl SystemDnsGuard {
                 })
             })
     }
+
+    pub fn monitor(&self) -> SystemDnsMonitor {
+        SystemDnsMonitor {
+            services: self
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.name.clone())
+                .collect(),
+            servers: self.servers.clone(),
+        }
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -255,6 +283,43 @@ impl SystemDnsGuard {
 
     pub fn direct_dns_upstream(&self) -> Option<std::net::IpAddr> {
         None
+    }
+
+    pub fn monitor(&self) -> SystemDnsMonitor {
+        SystemDnsMonitor
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl SystemDnsMonitor {
+    pub fn check(&self) -> Result<SystemDnsMonitorCheck> {
+        for service in &self.services {
+            let current = read_service_dns_snapshot(service)?;
+            if !dns_server_lists_match(&current.servers, &self.servers) {
+                return Ok(SystemDnsMonitorCheck {
+                    ok: false,
+                    detail: format!(
+                        "{service} DNS is {:?}, expected {:?}",
+                        current.servers, self.servers
+                    ),
+                });
+            }
+        }
+
+        Ok(SystemDnsMonitorCheck {
+            ok: true,
+            detail: format!("system DNS matches {:?}", self.servers),
+        })
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl SystemDnsMonitor {
+    pub fn check(&self) -> Result<SystemDnsMonitorCheck> {
+        Ok(SystemDnsMonitorCheck {
+            ok: true,
+            detail: "system DNS monitor is not required on this platform".to_owned(),
+        })
     }
 }
 

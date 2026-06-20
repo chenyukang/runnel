@@ -1,7 +1,8 @@
 use super::{
     WG_OBFS_MAX_PADDING, WgObfsMode, WgObfsProfile, WgRuntimeConfig,
-    client::WgClientArgs,
+    client::{WgClientArgs, dns_stage_detail},
     dns::{DnsCaptureController, DomainRuleEngine, start_dns_capture},
+    health::{WgClientHealthMonitorConfig, report_tunnel_stage, start_client_health_monitor},
     hooks::{
         DynamicRouteManager, HookGuard, SwitchableHookGuard, effective_hook_plan,
         plan_client_hooks, plan_server_hooks, run_hooks,
@@ -30,7 +31,7 @@ use std::{
 use tokio::{
     io::unix::AsyncFd,
     net::UdpSocket,
-    sync::Mutex,
+    sync::{Mutex, watch},
     time::{MissedTickBehavior, interval, sleep},
 };
 use tracing::{debug, error, info, warn};
@@ -62,6 +63,10 @@ pub(super) async fn run_client_session(
     restart_count: u64,
 ) -> Result<()> {
     let (tun, actual_device) = open_tun_device(&args.device)?;
+    report_tunnel_stage(
+        telemetry::TunnelState::InterfaceUp,
+        format!("wg noise device {actual_device} is up"),
+    );
     let socket = UdpSocket::bind(bind_addr_for_endpoint(runtime.bind, endpoint))
         .await
         .with_context(|| format!("failed to bind wg noise client UDP socket {}", runtime.bind))?;
@@ -100,6 +105,10 @@ pub(super) async fn run_client_session(
         });
 
     run_hooks(&plan.up)?;
+    report_tunnel_stage(
+        telemetry::TunnelState::RoutesApplied,
+        format!("wg noise routes applied for {actual_device}"),
+    );
     let route_switch = SwitchableHookGuard::new("wg-client", plan);
     let dns_capture = match (args.dns_capture, args.dns) {
         (true, Some(dns)) => Some(start_dns_capture(dns, domain_rules).await?),
@@ -112,9 +121,17 @@ pub(super) async fn run_client_session(
         (Some(dns), false) => system_proxy::maybe_activate_tun_dns(&[dns.to_string()])?,
         (None, _) => None,
     };
+    report_tunnel_stage(
+        telemetry::TunnelState::DnsApplied,
+        dns_stage_detail(args.dns, args.dns_capture),
+    );
+    let dns_monitor = dns_guard
+        .as_ref()
+        .map(system_proxy::SystemDnsGuard::monitor);
     let bypass_dns = dns_guard
         .as_ref()
         .and_then(system_proxy::SystemDnsGuard::direct_dns_upstream);
+    let (traffic_state_tx, traffic_state_rx) = watch::channel(telemetry::TrafficState::Proxying);
     let traffic_switch = Arc::new(Mutex::new(WgNoiseTrafficSwitch::new(
         route_switch,
         domain_route_manager,
@@ -122,12 +139,21 @@ pub(super) async fn run_client_session(
         dns_capture_control,
         args.dns.filter(|_| args.dns_capture),
         bypass_dns,
+        traffic_state_tx,
     )));
     telemetry::set_traffic_state(telemetry::TrafficState::Proxying);
     let traffic_switch_task = tokio::spawn(run_wg_noise_traffic_switch_control(
         telemetry::init_control_channel(),
         Arc::clone(&traffic_switch),
     ));
+    let health_task = start_client_health_monitor(WgClientHealthMonitorConfig {
+        role: "wg-noise-client",
+        peer_tunnel_ip: runtime.peer_tunnel_ip,
+        uapi_socket: None,
+        dns_monitor,
+        dns_capture: args.dns_capture,
+        traffic_state: traffic_state_rx,
+    });
 
     info!(
         device = %actual_device,
@@ -153,6 +179,18 @@ pub(super) async fn run_client_session(
         args.obfs_profile(),
     )
     .await;
+    match &result {
+        Ok(()) => report_tunnel_stage(
+            telemetry::TunnelState::Stopping,
+            "wg noise client shutting down",
+        ),
+        Err(error) => report_tunnel_stage(
+            telemetry::TunnelState::Degraded,
+            format!("wg noise client session ended: {error:#}"),
+        ),
+    }
+    health_task.abort();
+    let _ = health_task.await;
     traffic_switch_task.abort();
     let _ = traffic_switch_task.await;
     result
@@ -212,6 +250,7 @@ struct WgNoiseTrafficSwitch {
     dns_capture: Option<DnsCaptureController>,
     proxy_dns: Option<IpAddr>,
     bypass_dns: Option<IpAddr>,
+    traffic_state_tx: watch::Sender<telemetry::TrafficState>,
 }
 
 impl WgNoiseTrafficSwitch {
@@ -222,6 +261,7 @@ impl WgNoiseTrafficSwitch {
         dns_capture: Option<DnsCaptureController>,
         proxy_dns: Option<IpAddr>,
         bypass_dns: Option<IpAddr>,
+        traffic_state_tx: watch::Sender<telemetry::TrafficState>,
     ) -> Self {
         Self {
             state: telemetry::TrafficState::Proxying,
@@ -231,6 +271,7 @@ impl WgNoiseTrafficSwitch {
             dns_capture,
             proxy_dns,
             bypass_dns,
+            traffic_state_tx,
         }
     }
 
@@ -281,6 +322,7 @@ impl WgNoiseTrafficSwitch {
 
         self.state = next;
         telemetry::set_traffic_state(next);
+        let _ = self.traffic_state_tx.send(next);
         emit_traffic_switch(next);
         Ok(next)
     }

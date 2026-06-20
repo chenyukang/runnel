@@ -2,6 +2,7 @@ use super::{
     DEFAULT_TUNNEL_MTU, WgEngine, WgObfsMode, WgObfsProfile, WgRuntimeConfig, create_device_handle,
     default_client_allowed_ips_for,
     dns::{DnsCaptureController, DomainRuleEngine, start_dns_capture},
+    health::{WgClientHealthMonitorConfig, report_tunnel_stage, start_client_health_monitor},
     hooks::{
         DynamicRouteManager, EgressRouteNotReady, SwitchableHookGuard, effective_hook_plan,
         log_plan_lines, plan_client_hooks, print_plan, run_hooks,
@@ -25,6 +26,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::sync::watch;
 use tokio::{net::UdpSocket, sync::Mutex, time::timeout};
 use tracing::{info, warn};
 
@@ -336,8 +338,18 @@ async fn run_client_session(
     restart_count: u64,
     session_started: &mut bool,
 ) -> Result<()> {
+    report_tunnel_stage(telemetry::TunnelState::Starting, "wg client starting");
     if !args.skip_handshake_probe {
         probe_server_handshake(&runtime, args.obfs, obfs_profile, HANDSHAKE_PROBE_TIMEOUT).await?;
+        report_tunnel_stage(
+            telemetry::TunnelState::ConnectivityOk,
+            "wg client handshake probe succeeded",
+        );
+    } else {
+        report_tunnel_stage(
+            telemetry::TunnelState::Starting,
+            "wg client handshake probe skipped",
+        );
     }
     *session_started = true;
 
@@ -356,6 +368,10 @@ async fn run_device_client_session(
 ) -> Result<()> {
     let endpoint = runtime.endpoint.context("wg client endpoint missing")?;
     let (_device_handle, actual_device) = create_device_handle(&args.device)?;
+    report_tunnel_stage(
+        telemetry::TunnelState::InterfaceUp,
+        format!("wg device {actual_device} is up"),
+    );
     let socket_path = control_socket_path(&actual_device);
     apply_device_config(&socket_path, &runtime)?;
     start_stats_poller("wg-client", socket_path.clone());
@@ -392,6 +408,10 @@ async fn run_device_client_session(
                 .map(|_| DomainRuleEngine::new(args.domain_rules.clone(), None, adblock.clone()))
         });
     run_hooks(&plan.up)?;
+    report_tunnel_stage(
+        telemetry::TunnelState::RoutesApplied,
+        format!("wg routes applied for {actual_device}"),
+    );
 
     // Keep the device alive until we receive a shutdown signal. The guard is declared
     // after the handle so cleanup hooks run before the device file descriptor closes.
@@ -407,9 +427,17 @@ async fn run_device_client_session(
         (Some(dns), false) => system_proxy::maybe_activate_tun_dns(&[dns.to_string()])?,
         (None, _) => None,
     };
+    report_tunnel_stage(
+        telemetry::TunnelState::DnsApplied,
+        dns_stage_detail(args.dns, args.dns_capture),
+    );
+    let dns_monitor = dns_guard
+        .as_ref()
+        .map(system_proxy::SystemDnsGuard::monitor);
     let bypass_dns = dns_guard
         .as_ref()
         .and_then(system_proxy::SystemDnsGuard::direct_dns_upstream);
+    let (traffic_state_tx, traffic_state_rx) = watch::channel(telemetry::TrafficState::Proxying);
     let traffic_switch = Arc::new(Mutex::new(WgTrafficSwitch::new(
         route_switch,
         domain_route_manager.clone(),
@@ -417,12 +445,21 @@ async fn run_device_client_session(
         dns_capture_control,
         args.dns.filter(|_| args.dns_capture),
         bypass_dns,
+        traffic_state_tx,
     )));
     telemetry::set_traffic_state(telemetry::TrafficState::Proxying);
     let traffic_switch_task = tokio::spawn(run_wg_traffic_switch_control(
         telemetry::init_control_channel(),
         Arc::clone(&traffic_switch),
     ));
+    let health_task = start_client_health_monitor(WgClientHealthMonitorConfig {
+        role: "wg-client",
+        peer_tunnel_ip: runtime.peer_tunnel_ip,
+        uapi_socket: Some(socket_path.clone()),
+        dns_monitor,
+        dns_capture: args.dns_capture,
+        traffic_state: traffic_state_rx,
+    });
 
     info!(
         device = %actual_device,
@@ -438,9 +475,23 @@ async fn run_device_client_session(
     );
 
     let result = wait_for_shutdown_signal().await;
+    report_tunnel_stage(telemetry::TunnelState::Stopping, "wg client shutting down");
+    health_task.abort();
+    let _ = health_task.await;
     traffic_switch_task.abort();
     let _ = traffic_switch_task.await;
     result
+}
+
+pub(super) fn dns_stage_detail(dns: Option<IpAddr>, dns_capture: bool) -> String {
+    match (dns, dns_capture) {
+        (Some(upstream), true) => {
+            format!("system DNS points at loopback capture; upstream resolver {upstream}")
+        }
+        (Some(upstream), false) => format!("system DNS points at tunnel resolver {upstream}"),
+        (None, true) => "DNS capture requested without an upstream resolver".to_owned(),
+        (None, false) => "wg DNS override disabled".to_owned(),
+    }
 }
 
 struct WgTrafficSwitch {
@@ -451,6 +502,7 @@ struct WgTrafficSwitch {
     dns_capture: Option<DnsCaptureController>,
     proxy_dns: Option<IpAddr>,
     bypass_dns: Option<IpAddr>,
+    traffic_state_tx: watch::Sender<telemetry::TrafficState>,
 }
 
 impl WgTrafficSwitch {
@@ -461,6 +513,7 @@ impl WgTrafficSwitch {
         dns_capture: Option<DnsCaptureController>,
         proxy_dns: Option<IpAddr>,
         bypass_dns: Option<IpAddr>,
+        traffic_state_tx: watch::Sender<telemetry::TrafficState>,
     ) -> Self {
         Self {
             state: telemetry::TrafficState::Proxying,
@@ -470,6 +523,7 @@ impl WgTrafficSwitch {
             dns_capture,
             proxy_dns,
             bypass_dns,
+            traffic_state_tx,
         }
     }
 
@@ -520,6 +574,7 @@ impl WgTrafficSwitch {
 
         self.state = next;
         telemetry::set_traffic_state(next);
+        let _ = self.traffic_state_tx.send(next);
         emit_traffic_switch(next);
         Ok(next)
     }

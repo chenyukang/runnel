@@ -1,6 +1,7 @@
 pub mod client;
 pub mod configgen;
 mod dns;
+mod health;
 mod hooks;
 pub mod keys;
 mod noise;

@@ -30,7 +30,8 @@ use tokio::{
 
 use crate::telemetry::{
     DashboardSnapshot, MonitorContext, RecentTargetSnapshot, RouteStats, TraceEvent, TrafficState,
-    attach_socket, event_impacts_health, route_bucket_for_event,
+    TunnelCheckState, TunnelHealth, TunnelState, attach_socket, event_impacts_health,
+    route_bucket_for_event,
 };
 
 const HISTORY_LEN: usize = 48;
@@ -150,6 +151,7 @@ struct DashboardApp {
     total_uploaded: u64,
     total_downloaded: u64,
     route_stats: RouteStats,
+    tunnel_health: TunnelHealth,
     upload_history: Vec<u64>,
     download_history: Vec<u64>,
     last_bucket_at: Instant,
@@ -211,6 +213,7 @@ impl DashboardApp {
             total_uploaded: 0,
             total_downloaded: 0,
             route_stats: RouteStats::default(),
+            tunnel_health: TunnelHealth::default(),
             upload_history: vec![0; HISTORY_LEN],
             download_history: vec![0; HISTORY_LEN],
             last_bucket_at: Instant::now(),
@@ -236,6 +239,7 @@ impl DashboardApp {
             total_uploaded,
             total_downloaded,
             route_stats,
+            tunnel_health,
             upload_history,
             download_history,
             recent_targets,
@@ -256,6 +260,7 @@ impl DashboardApp {
             total_uploaded,
             total_downloaded,
             route_stats,
+            tunnel_health,
             upload_history: fit_history(upload_history),
             download_history: fit_history(download_history),
             last_bucket_at: Instant::now(),
@@ -299,6 +304,7 @@ impl DashboardApp {
         }
 
         self.capture_traffic_state(&event);
+        self.capture_tunnel_health(&event);
         self.capture_listener_context(&event);
         self.capture_recent_event(&event);
         self.capture_recent_domain_ip(&event);
@@ -441,6 +447,10 @@ impl DashboardApp {
     }
 
     fn status(&self) -> (&'static str, Color) {
+        if self.tunnel_health.state != TunnelState::Unknown {
+            return tunnel_health_status(self.tunnel_health.state);
+        }
+
         if self
             .last_warning_at
             .is_some_and(|seen| seen.elapsed() <= Duration::from_secs(20))
@@ -459,6 +469,38 @@ impl DashboardApp {
         } else {
             ("idle", Color::DarkGray)
         }
+    }
+
+    fn capture_tunnel_health(&mut self, event: &TraceEvent) {
+        if event.message != "tunnel health" {
+            return;
+        }
+        let Some(state) = event
+            .fields
+            .get("state")
+            .and_then(|state| tunnel_state_from_str(state))
+        else {
+            return;
+        };
+
+        self.tunnel_health = TunnelHealth {
+            state,
+            detail: event.fields.get("detail").cloned().unwrap_or_default(),
+            dns: event
+                .fields
+                .get("dns")
+                .and_then(|state| tunnel_check_state_from_str(state))
+                .unwrap_or_default(),
+            connectivity: event
+                .fields
+                .get("connectivity")
+                .and_then(|state| tunnel_check_state_from_str(state))
+                .unwrap_or_default(),
+            handshake_age_secs: event
+                .fields
+                .get("handshake_age_secs")
+                .and_then(|age| age.parse::<u64>().ok()),
+        };
     }
 
     fn capture_listener_context(&mut self, event: &TraceEvent) {
@@ -500,7 +542,10 @@ impl DashboardApp {
     }
 
     fn capture_recent_event(&mut self, event: &TraceEvent) {
-        if event.message == "traffic sample" || event.message == "dns query" {
+        if event.message == "traffic sample"
+            || event.message == "dns query"
+            || (event.message == "tunnel health" && event.level != "WARN")
+        {
             return;
         }
         if event.message.contains("relay completed") && self.recent_events.len() >= RECENT_EVENTS {
@@ -517,6 +562,48 @@ impl DashboardApp {
             suffix
         ));
         self.recent_events.truncate(RECENT_EVENTS);
+    }
+}
+
+fn tunnel_health_status(state: TunnelState) -> (&'static str, Color) {
+    match state {
+        TunnelState::Unknown => ("idle", Color::DarkGray),
+        TunnelState::Starting
+        | TunnelState::InterfaceUp
+        | TunnelState::RoutesApplied
+        | TunnelState::DnsApplied
+        | TunnelState::ConnectivityOk => (state.as_str(), Color::Cyan),
+        TunnelState::Active => ("active", Color::Green),
+        TunnelState::Bypass => ("bypass", Color::Yellow),
+        TunnelState::Degraded => ("degraded", Color::Yellow),
+        TunnelState::Stopping => ("stopping", Color::DarkGray),
+    }
+}
+
+fn tunnel_state_from_str(value: &str) -> Option<TunnelState> {
+    match value {
+        "unknown" => Some(TunnelState::Unknown),
+        "starting" => Some(TunnelState::Starting),
+        "interface-up" => Some(TunnelState::InterfaceUp),
+        "routes-applied" => Some(TunnelState::RoutesApplied),
+        "dns-applied" => Some(TunnelState::DnsApplied),
+        "connectivity-ok" => Some(TunnelState::ConnectivityOk),
+        "active" => Some(TunnelState::Active),
+        "bypass" => Some(TunnelState::Bypass),
+        "degraded" => Some(TunnelState::Degraded),
+        "stopping" => Some(TunnelState::Stopping),
+        _ => None,
+    }
+}
+
+fn tunnel_check_state_from_str(value: &str) -> Option<TunnelCheckState> {
+    match value {
+        "unknown" => Some(TunnelCheckState::Unknown),
+        "disabled" => Some(TunnelCheckState::Disabled),
+        "ok" => Some(TunnelCheckState::Ok),
+        "warn" => Some(TunnelCheckState::Warn),
+        "error" => Some(TunnelCheckState::Error),
+        _ => None,
     }
 }
 

@@ -53,6 +53,8 @@ pub struct DashboardSnapshot {
     pub total_downloaded: u64,
     #[serde(default)]
     pub route_stats: RouteStats,
+    #[serde(default)]
+    pub tunnel_health: TunnelHealth,
     pub upload_history: Vec<u64>,
     pub download_history: Vec<u64>,
     pub recent_targets: Vec<RecentTargetSnapshot>,
@@ -82,6 +84,179 @@ impl RouteStats {
             RouteBucket::Proxy => self.proxy += 1,
             RouteBucket::Direct => self.direct += 1,
             RouteBucket::Blocked => self.blocked += 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct TunnelHealth {
+    pub state: TunnelState,
+    #[serde(default)]
+    pub detail: String,
+    #[serde(default)]
+    pub dns: TunnelCheckState,
+    #[serde(default)]
+    pub connectivity: TunnelCheckState,
+    pub handshake_age_secs: Option<u64>,
+}
+
+impl Default for TunnelHealth {
+    fn default() -> Self {
+        Self {
+            state: TunnelState::Unknown,
+            detail: String::new(),
+            dns: TunnelCheckState::Unknown,
+            connectivity: TunnelCheckState::Unknown,
+            handshake_age_secs: None,
+        }
+    }
+}
+
+impl TunnelHealth {
+    pub fn stage(state: TunnelState, detail: impl Into<String>) -> Self {
+        Self {
+            state,
+            detail: detail.into(),
+            ..Self::default()
+        }
+    }
+
+    pub fn as_fields(&self) -> BTreeMap<String, String> {
+        let mut fields = BTreeMap::new();
+        fields.insert("state".to_owned(), self.state.as_str().to_owned());
+        if !self.detail.is_empty() {
+            fields.insert("detail".to_owned(), self.detail.clone());
+        }
+        fields.insert("dns".to_owned(), self.dns.as_str().to_owned());
+        fields.insert(
+            "connectivity".to_owned(),
+            self.connectivity.as_str().to_owned(),
+        );
+        if let Some(age) = self.handshake_age_secs {
+            fields.insert("handshake_age_secs".to_owned(), age.to_string());
+        }
+        fields
+    }
+
+    fn from_event(event: &TraceEvent) -> Option<Self> {
+        if event.message != "tunnel health" {
+            return None;
+        }
+        let state = event
+            .fields
+            .get("state")
+            .and_then(|state| TunnelState::from_str(state))?;
+        let detail = event.fields.get("detail").cloned().unwrap_or_default();
+        let dns = event
+            .fields
+            .get("dns")
+            .and_then(|state| TunnelCheckState::from_str(state))
+            .unwrap_or_default();
+        let connectivity = event
+            .fields
+            .get("connectivity")
+            .and_then(|state| TunnelCheckState::from_str(state))
+            .unwrap_or_default();
+        let handshake_age_secs = event
+            .fields
+            .get("handshake_age_secs")
+            .and_then(|age| age.parse::<u64>().ok());
+
+        Some(Self {
+            state,
+            detail,
+            dns,
+            connectivity,
+            handshake_age_secs,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TunnelState {
+    #[default]
+    Unknown,
+    Starting,
+    InterfaceUp,
+    RoutesApplied,
+    DnsApplied,
+    ConnectivityOk,
+    Active,
+    Bypass,
+    Degraded,
+    Stopping,
+}
+
+impl TunnelState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Starting => "starting",
+            Self::InterfaceUp => "interface-up",
+            Self::RoutesApplied => "routes-applied",
+            Self::DnsApplied => "dns-applied",
+            Self::ConnectivityOk => "connectivity-ok",
+            Self::Active => "active",
+            Self::Bypass => "bypass",
+            Self::Degraded => "degraded",
+            Self::Stopping => "stopping",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "unknown" => Some(Self::Unknown),
+            "starting" => Some(Self::Starting),
+            "interface-up" => Some(Self::InterfaceUp),
+            "routes-applied" => Some(Self::RoutesApplied),
+            "dns-applied" => Some(Self::DnsApplied),
+            "connectivity-ok" => Some(Self::ConnectivityOk),
+            "active" => Some(Self::Active),
+            "bypass" => Some(Self::Bypass),
+            "degraded" => Some(Self::Degraded),
+            "stopping" => Some(Self::Stopping),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for TunnelState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum TunnelCheckState {
+    #[default]
+    Unknown,
+    Disabled,
+    Ok,
+    Warn,
+    Error,
+}
+
+impl TunnelCheckState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Disabled => "disabled",
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "unknown" => Some(Self::Unknown),
+            "disabled" => Some(Self::Disabled),
+            "ok" => Some(Self::Ok),
+            "warn" => Some(Self::Warn),
+            "error" => Some(Self::Error),
+            _ => None,
         }
     }
 }
@@ -225,6 +400,7 @@ struct SnapshotState {
     total_uploaded: u64,
     total_downloaded: u64,
     route_stats: RouteStats,
+    tunnel_health: TunnelHealth,
     upload_history: Vec<u64>,
     download_history: Vec<u64>,
     last_bucket_at: Instant,
@@ -246,6 +422,7 @@ impl Default for SnapshotState {
             total_uploaded: 0,
             total_downloaded: 0,
             route_stats: RouteStats::default(),
+            tunnel_health: TunnelHealth::default(),
             upload_history: vec![0; HISTORY_LEN],
             download_history: vec![0; HISTORY_LEN],
             last_bucket_at: Instant::now(),
@@ -289,6 +466,9 @@ impl SnapshotState {
 
         self.capture_recent_event(event);
         self.capture_recent_domain_ip(event);
+        if let Some(health) = TunnelHealth::from_event(event) {
+            self.tunnel_health = health;
+        }
         if let Some(bucket) = route_bucket_for_event(event) {
             self.route_stats.record(bucket);
         }
@@ -436,6 +616,7 @@ impl SnapshotState {
             total_uploaded: self.total_uploaded,
             total_downloaded: self.total_downloaded,
             route_stats: self.route_stats,
+            tunnel_health: self.tunnel_health.clone(),
             upload_history: self.upload_history.clone(),
             download_history: self.download_history.clone(),
             recent_targets: self.recent_targets.iter().cloned().collect(),
@@ -455,7 +636,10 @@ impl SnapshotState {
     }
 
     fn capture_recent_event(&mut self, event: &TraceEvent) {
-        if event.message == "traffic sample" || event.message == "dns query" {
+        if event.message == "traffic sample"
+            || event.message == "dns query"
+            || (event.message == "tunnel health" && event.level != "WARN")
+        {
             return;
         }
         if event.message.contains("relay completed") && self.recent_events.len() >= RECENT_EVENTS {
@@ -599,6 +783,15 @@ pub fn set_traffic_state(state: TrafficState) {
     if let Ok(mut snapshot) = hub.snapshot.lock() {
         snapshot.set_traffic_state(state);
     }
+}
+
+pub fn set_tunnel_health(health: TunnelHealth) {
+    let level = if health.state == TunnelState::Degraded {
+        "WARN"
+    } else {
+        "INFO"
+    };
+    emit(level, "tunnel health", health.as_fields());
 }
 
 pub fn init_control_channel() -> mpsc::Receiver<ControlEnvelope> {
