@@ -1003,10 +1003,10 @@ pub async fn attach_socket(
             let Ok(message) = serde_json::from_str::<WireMessage>(&line) else {
                 continue;
             };
-            if let WireMessage::Event(event) = message {
-                if tx.send(event).is_err() {
-                    break;
-                }
+            if let WireMessage::Event(event) = message
+                && tx.send(event).is_err()
+            {
+                break;
             }
         }
     });

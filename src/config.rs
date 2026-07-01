@@ -293,25 +293,25 @@ pub fn apply_global_config(
     base_dir: &Path,
 ) {
     maybe_assign(log, &config.log, should_override(matches, "log"));
-    if should_override(matches, "log_file") {
-        if let Some(path) = &config.log_file {
-            *log_file = resolve_path(base_dir, path);
-        }
+    if should_override(matches, "log_file")
+        && let Some(path) = &config.log_file
+    {
+        *log_file = resolve_path(base_dir, path);
     }
     maybe_assign(
         log_timezone,
         &config.log_timezone,
         should_override(matches, "log_timezone"),
     );
-    if should_override(matches, "telemetry_sock") {
-        if let Some(path) = &config.telemetry_sock {
-            *telemetry_sock = Some(resolve_path(base_dir, path));
-        }
+    if should_override(matches, "telemetry_sock")
+        && let Some(path) = &config.telemetry_sock
+    {
+        *telemetry_sock = Some(resolve_path(base_dir, path));
     }
-    if should_override(matches, "pid_file") {
-        if let Some(path) = &config.pid_file {
-            *pid_file = Some(resolve_path(base_dir, path));
-        }
+    if should_override(matches, "pid_file")
+        && let Some(path) = &config.pid_file
+    {
+        *pid_file = Some(resolve_path(base_dir, path));
     }
     maybe_assign(tui, &config.tui, should_override(matches, "tui"));
     maybe_assign(daemon, &config.daemon, should_override(matches, "daemon"));
@@ -1066,15 +1066,15 @@ pub fn apply_cert(args: &mut CertArgs, config: &FileConfig, matches: &ArgMatches
         return;
     };
 
-    if should_override(matches, "cert") {
-        if let Some(path) = &cert.cert {
-            args.cert = resolve_path(base_dir, path);
-        }
+    if should_override(matches, "cert")
+        && let Some(path) = &cert.cert
+    {
+        args.cert = resolve_path(base_dir, path);
     }
-    if should_override(matches, "key") {
-        if let Some(path) = &cert.key {
-            args.key = resolve_path(base_dir, path);
-        }
+    if should_override(matches, "key")
+        && let Some(path) = &cert.key
+    {
+        args.key = resolve_path(base_dir, path);
     }
     maybe_assign(
         &mut args.names,
@@ -1090,18 +1090,14 @@ fn should_override(matches: &ArgMatches, id: &str) -> bool {
 }
 
 fn maybe_assign<T: Clone>(slot: &mut T, config: &Option<T>, allowed: bool) {
-    if allowed {
-        if let Some(value) = config {
-            *slot = value.clone();
-        }
+    if allowed && let Some(value) = config {
+        *slot = value.clone();
     }
 }
 
 fn maybe_assign_optional<T: Clone>(slot: &mut Option<T>, config: &Option<T>, allowed: bool) {
-    if allowed {
-        if let Some(value) = config {
-            *slot = Some(value.clone());
-        }
+    if allowed && let Some(value) = config {
+        *slot = Some(value.clone());
     }
 }
 
@@ -1111,10 +1107,8 @@ fn maybe_assign_path(
     allowed: bool,
     base_dir: &Path,
 ) {
-    if allowed {
-        if let Some(path) = config {
-            *slot = Some(resolve_path(base_dir, path));
-        }
+    if allowed && let Some(path) = config {
+        *slot = Some(resolve_path(base_dir, path));
     }
 }
 

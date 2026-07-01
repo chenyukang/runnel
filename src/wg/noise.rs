@@ -548,6 +548,7 @@ async fn apply_noise_action(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_network_packet(
     role: &'static str,
     socket: &UdpSocket,

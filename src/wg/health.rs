@@ -123,7 +123,7 @@ async fn run_client_health_monitor(config: WgClientHealthMonitorConfig) {
             let dns = check_dns(&config.dns_monitor, config.dns_capture).await;
             let connectivity =
                 check_connectivity(config.peer_tunnel_ip, config.uapi_socket.clone()).await;
-            compose_client_health(&config.role, dns, connectivity)
+            compose_client_health(config.role, dns, connectivity)
         };
 
         reporter.report(health);

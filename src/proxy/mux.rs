@@ -181,10 +181,10 @@ impl MuxClient {
 
     async fn ensure_session(&self) -> Result<ClientSession> {
         let mut current = self.session.lock().await;
-        if let Some(session) = current.as_ref() {
-            if !session.is_closed() {
-                return Ok(session.clone());
-            }
+        if let Some(session) = current.as_ref()
+            && !session.is_closed()
+        {
+            return Ok(session.clone());
         }
 
         let session = self.connect_session().await?;

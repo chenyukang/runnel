@@ -52,7 +52,7 @@ fn write_private_key_file(path: &Path, contents: &str) -> Result<()> {
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
         file.write_all(contents.as_bytes())?;
         file.flush()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]

@@ -80,9 +80,7 @@ fn is_restricted_v6(ip: Ipv6Addr) -> bool {
         || ip.is_unique_local()
         || ip.is_unicast_link_local()
         || ip.is_multicast()
-        || ip
-            .to_ipv4_mapped()
-            .is_some_and(|mapped| is_restricted_v4(mapped))
+        || ip.to_ipv4_mapped().is_some_and(is_restricted_v4)
         || (segments[0] == 0x2001 && segments[1] == 0x0db8)
 }
 
