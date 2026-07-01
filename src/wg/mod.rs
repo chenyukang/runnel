@@ -29,6 +29,7 @@ use std::{
 pub(crate) const AUTO_WG_DEVICE: &str = "auto";
 pub(crate) const DEFAULT_TUNNEL_MTU: u16 = 1420;
 pub(crate) const HANDSHAKE_BUFFER_SIZE: usize = 2048;
+pub(crate) const HEALTH_CHECK_DNS_PROBE_DOMAIN: &str = "runnel-health-check.invalid";
 const WG_KEY_LEN: usize = 32;
 #[cfg(target_os = "macos")]
 const MACOS_AUTO_WG_START_INDEX: u16 = 233;

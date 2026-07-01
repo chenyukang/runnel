@@ -1,3 +1,4 @@
+use super::HEALTH_CHECK_DNS_PROBE_DOMAIN;
 use super::uapi::read_last_handshake_age;
 use crate::{
     system_proxy::SystemDnsMonitor,
@@ -22,8 +23,6 @@ const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const DNS_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(3);
 const FRESH_HANDSHAKE_MAX_AGE: Duration = Duration::from_secs(180);
-const DNS_PROBE_DOMAIN: &str = "runnel-health-check.invalid";
-
 pub(crate) struct WgClientHealthMonitorConfig {
     pub role: &'static str,
     pub peer_tunnel_ip: IpAddr,
@@ -191,7 +190,7 @@ async fn check_loopback_dns_capture() -> HealthCheckResult {
 
 async fn probe_loopback_dns_capture() -> Result<()> {
     let query_id = dns_probe_id();
-    let query = build_dns_query(query_id, DNS_PROBE_DOMAIN)?;
+    let query = build_dns_query(query_id, HEALTH_CHECK_DNS_PROBE_DOMAIN)?;
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .context("failed to bind DNS health probe socket")?;
@@ -437,7 +436,7 @@ mod tests {
 
     #[test]
     fn dns_query_and_response_use_matching_id() {
-        let query = build_dns_query(0x1234, DNS_PROBE_DOMAIN).unwrap();
+        let query = build_dns_query(0x1234, HEALTH_CHECK_DNS_PROBE_DOMAIN).unwrap();
         assert_eq!(&query[..2], &[0x12, 0x34]);
 
         let mut response = vec![0u8; 12];

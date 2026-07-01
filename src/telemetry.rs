@@ -464,6 +464,10 @@ impl SnapshotState {
             self.last_warning_at = Some(Instant::now());
         }
 
+        if is_health_check_dns_probe(event) {
+            return;
+        }
+
         self.capture_recent_event(event);
         self.capture_recent_domain_ip(event);
         if let Some(health) = TunnelHealth::from_event(event) {
@@ -667,6 +671,9 @@ impl SnapshotState {
 }
 
 pub fn route_bucket_for_event(event: &TraceEvent) -> Option<RouteBucket> {
+    if is_health_check_dns_probe(event) {
+        return None;
+    }
     if event.message == "dns query" {
         return route_bucket_from_label(
             event
@@ -692,6 +699,19 @@ pub fn route_bucket_for_event(event: &TraceEvent) -> Option<RouteBucket> {
             .and_then(|route| route_bucket_from_label(route));
     }
     None
+}
+
+pub(crate) fn is_health_check_dns_probe(event: &TraceEvent) -> bool {
+    event.message == "dns query"
+        && (event
+            .fields
+            .get("target")
+            .is_some_and(|target| target == crate::wg::HEALTH_CHECK_DNS_PROBE_DOMAIN)
+            || event
+                .fields
+                .get("link")
+                .and_then(|link| link.strip_prefix("dns://"))
+                .is_some_and(|domain| domain == crate::wg::HEALTH_CHECK_DNS_PROBE_DOMAIN))
 }
 
 fn route_bucket_from_label(route: &str) -> Option<RouteBucket> {
@@ -1576,6 +1596,29 @@ mod tests {
         assert_eq!(snapshot.recent_targets[0].detail, "wg tunnel");
         assert_eq!(snapshot.recent_targets[0].repeat_count, 1);
         assert_eq!(snapshot.route_stats.proxy, 1);
+        assert_eq!(snapshot.route_stats.direct, 0);
+        assert_eq!(snapshot.route_stats.blocked, 0);
+    }
+
+    #[test]
+    fn health_check_dns_probe_does_not_fill_recent_domains_or_route_stats() {
+        let mut snapshot = SnapshotState::default();
+        let link = format!("dns://{}", crate::wg::HEALTH_CHECK_DNS_PROBE_DOMAIN);
+        let event = trace_event(
+            "INFO",
+            "dns query",
+            &[
+                ("target", crate::wg::HEALTH_CHECK_DNS_PROBE_DOMAIN),
+                ("link", &link),
+                ("route", "wg-dns"),
+            ],
+        );
+
+        snapshot.ingest(&event);
+
+        assert!(snapshot.recent_events.is_empty());
+        assert!(snapshot.recent_targets.is_empty());
+        assert_eq!(snapshot.route_stats.proxy, 0);
         assert_eq!(snapshot.route_stats.direct, 0);
         assert_eq!(snapshot.route_stats.blocked, 0);
     }

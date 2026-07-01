@@ -31,7 +31,7 @@ use tokio::{
 use crate::telemetry::{
     DashboardSnapshot, MonitorContext, RecentTargetSnapshot, RouteStats, TraceEvent, TrafficState,
     TunnelCheckState, TunnelHealth, TunnelState, attach_socket, event_impacts_health,
-    route_bucket_for_event,
+    is_health_check_dns_probe, route_bucket_for_event,
 };
 
 const HISTORY_LEN: usize = 48;
@@ -301,6 +301,10 @@ impl DashboardApp {
         }
         if impacts_health {
             self.last_warning_at = Some(Instant::now());
+        }
+
+        if is_health_check_dns_probe(&event) {
+            return;
         }
 
         self.capture_traffic_state(&event);
@@ -1539,6 +1543,38 @@ mod tests {
         assert_eq!(app.recent_targets[0].detail, "wg tunnel");
         assert_eq!(app.recent_targets[0].repeat_count, 1);
         assert_eq!(app.route_stats.proxy, 1);
+        assert_eq!(app.route_stats.direct, 0);
+        assert_eq!(app.route_stats.blocked, 0);
+    }
+
+    #[test]
+    fn health_check_dns_probe_does_not_fill_recent_domains_or_route_stats() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("runnel.log"),
+            log_filter: "info".to_owned(),
+            log_timezone_offset_secs: 0,
+        });
+        let link = format!("dns://{}", crate::wg::HEALTH_CHECK_DNS_PROBE_DOMAIN);
+
+        app.ingest(trace_event(
+            "INFO",
+            "dns query",
+            &[
+                ("target", crate::wg::HEALTH_CHECK_DNS_PROBE_DOMAIN),
+                ("link", &link),
+                ("route", "wg-dns"),
+            ],
+        ));
+
+        assert!(app.recent_events.is_empty());
+        assert!(app.recent_targets.is_empty());
+        assert_eq!(app.route_stats.proxy, 0);
         assert_eq!(app.route_stats.direct, 0);
         assert_eq!(app.route_stats.blocked, 0);
     }
