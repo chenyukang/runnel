@@ -205,7 +205,7 @@ pub(super) async fn run_client_session(
         "wg client started"
     );
 
-    let noise_loop = run_noise_loop("wg-client", tun, transport, Some(endpoint), false);
+    let noise_loop = run_noise_loop("wg-client", tun, transport, Some(endpoint), false, None);
     tokio::pin!(noise_loop);
     let result = tokio::select! {
         result = &mut noise_loop => result,
@@ -270,7 +270,7 @@ pub(crate) async fn run_server(args: WgServerArgs, runtime: WgRuntimeConfig) -> 
         "wg server started"
     );
 
-    run_noise_loop("wg-server", tun, transport, None, true).await
+    run_noise_loop("wg-server", tun, transport, None, true, Some(runtime)).await
 }
 
 struct WgNoiseTrafficSwitch {
@@ -403,6 +403,7 @@ async fn run_noise_loop(
     transport: NoiseTransport,
     initial_endpoint: Option<SocketAddr>,
     learn_endpoint: bool,
+    roam_reset_runtime: Option<WgRuntimeConfig>,
 ) -> Result<()> {
     let NoiseTransport {
         socket,
@@ -467,7 +468,15 @@ async fn run_noise_loop(
                     debug!(role, source = %source, "wg noise obfs packet ignored");
                     continue;
                 };
-                let action = noise_action(tunnel.decapsulate(Some(source.ip()), &decoded_packet[..decoded_len], &mut out_packet));
+                let action = decapsulate_network_packet(
+                    role,
+                    &mut tunnel,
+                    roam_reset_runtime.as_ref(),
+                    peer.endpoint(),
+                    source,
+                    &decoded_packet[..decoded_len],
+                    &mut out_packet,
+                );
                 let response_target = peer.observe_source(role, source, &action);
                 apply_noise_action(role, &tun, &socket, &codec, &mut encoded_packet, response_target, action, &mut traffic, &mut path_health).await?;
                 flush_queued_packets(role, &mut tunnel, &tun, &socket, &codec, peer.endpoint(), &mut out_packet, &mut encoded_packet, &mut traffic, &mut path_health).await?;
@@ -481,6 +490,56 @@ async fn run_noise_loop(
                 traffic.emit(role);
             }
         }
+    }
+}
+
+fn decapsulate_network_packet(
+    role: &'static str,
+    tunnel: &mut Tunn,
+    roam_reset_runtime: Option<&WgRuntimeConfig>,
+    current_endpoint: Option<SocketAddr>,
+    source: SocketAddr,
+    packet: &[u8],
+    out_packet: &mut [u8],
+) -> NoiseAction {
+    let action = noise_action(tunnel.decapsulate(Some(source.ip()), packet, out_packet));
+    let Some(runtime) = roam_reset_runtime else {
+        return action;
+    };
+    if current_endpoint.is_none_or(|endpoint| endpoint == source)
+        || wireguard_message_type(packet) != Some(1)
+        || !matches!(
+            &action,
+            NoiseAction::SendNetwork(response) if wireguard_message_type(response) == Some(2)
+        )
+    {
+        return action;
+    }
+
+    // The existing tunnel authenticated the roaming peer. Re-process that handshake in a fresh
+    // tunnel so stale rekey state from the old UDP path cannot poison the new data session.
+    let mut replacement = runtime.new_tunnel(next_tunnel_index());
+    let replacement_action =
+        noise_action(replacement.decapsulate(Some(source.ip()), packet, out_packet));
+    if matches!(
+        &replacement_action,
+        NoiseAction::SendNetwork(response) if wireguard_message_type(response) == Some(2)
+    ) {
+        info!(
+            role,
+            old_endpoint = %current_endpoint.expect("checked above"),
+            endpoint = %source,
+            "wg noise reset stale server tunnel after authenticated endpoint roam"
+        );
+        *tunnel = replacement;
+        replacement_action
+    } else {
+        warn!(
+            role,
+            endpoint = %source,
+            "wg noise could not rebuild server tunnel after authenticated endpoint roam"
+        );
+        action
     }
 }
 
@@ -1260,8 +1319,8 @@ mod tests {
         LOCAL_PATH_LOST_SEND_THRESHOLD, MASK_HEADER_LEN, MASK_TAG_LEN, MAX_NOISE_UDP_PACKET_SIZE,
         MAX_WG_PACKET_SIZE, NoiseAction, NoisePacketCodec, NoisePeerState, UdpPathHealth,
         UdpSendFailureKind, WgNoiseConnectionExpired, WgNoiseLocalPathLost, bind_addr_for_endpoint,
-        classify_udp_send_error, encapsulate_tun_packet, noise_action, timer_action,
-        udp_os_error_name,
+        classify_udp_send_error, decapsulate_network_packet, encapsulate_tun_packet, noise_action,
+        timer_action, udp_os_error_name,
     };
     use crate::wg::{
         WgObfsMode, WgObfsProfile, WgRuntimeConfig, default_client_allowed_ips,
@@ -1705,6 +1764,67 @@ mod tests {
             &inbound,
             Ipv4Addr::new(1, 1, 1, 1),
         );
+    }
+
+    #[test]
+    fn server_accepts_fresh_client_transport_after_endpoint_roam() {
+        let client_private = [0x11u8; 32];
+        let server_private = [0x22u8; 32];
+        let client_public = public_key(client_private);
+        let server_public = public_key(server_private);
+        let server_endpoint = SocketAddr::from(([198, 51, 100, 10], 1443));
+        let old_client_endpoint = SocketAddr::from(([203, 0, 113, 10], 4242));
+        let new_client_endpoint = SocketAddr::from(([203, 0, 113, 10], 5252));
+        let client_runtime = client_runtime(server_endpoint, client_private, server_public);
+        let server_runtime = server_runtime(server_private, client_public);
+        let mut server = server_runtime.new_tunnel(2);
+        let mut server_peer = NoisePeerState::new(None, true);
+        let mut server_buf = vec![0u8; MAX_WG_PACKET_SIZE];
+
+        for (index, client_endpoint) in [(1, old_client_endpoint), (3, new_client_endpoint)] {
+            let mut client = client_runtime.new_tunnel(index);
+            let mut client_buf = vec![0u8; MAX_WG_PACKET_SIZE];
+            let outbound = ipv4_packet(Ipv4Addr::new(10, 8, 0, 2), Ipv4Addr::new(1, 1, 1, 1), 17);
+            let handshake_init =
+                network_packet(noise_action(client.encapsulate(&outbound, &mut client_buf)));
+            let server_action = decapsulate_network_packet(
+                "wg-server",
+                &mut server,
+                Some(&server_runtime),
+                server_peer.endpoint(),
+                client_endpoint,
+                &handshake_init,
+                &mut server_buf,
+            );
+            assert_eq!(
+                server_peer.observe_source("wg-server", client_endpoint, &server_action),
+                Some(client_endpoint)
+            );
+            let handshake_response = network_packet(server_action);
+            let keepalive = network_packet(noise_action(client.decapsulate(
+                Some(server_endpoint.ip()),
+                &handshake_response,
+                &mut client_buf,
+            )));
+            let queued_data =
+                network_packet(noise_action(client.decapsulate(None, &[], &mut client_buf)));
+
+            assert_done(noise_action(server.decapsulate(
+                Some(client_endpoint.ip()),
+                &keepalive,
+                &mut server_buf,
+            )));
+            expect_tunnel_ipv4(
+                noise_action(server.decapsulate(
+                    Some(client_endpoint.ip()),
+                    &queued_data,
+                    &mut server_buf,
+                )),
+                &outbound,
+                Ipv4Addr::new(10, 8, 0, 2),
+            );
+            assert_eq!(server_peer.endpoint(), Some(client_endpoint));
+        }
     }
 
     fn client_runtime(
