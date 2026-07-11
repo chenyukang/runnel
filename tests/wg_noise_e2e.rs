@@ -438,7 +438,9 @@ mod linux {
     }
 
     fn runnel_bin() -> Result<String> {
-        std::env::var("CARGO_BIN_EXE_runnel").context("cargo did not provide CARGO_BIN_EXE_runnel")
+        std::env::var("RUNNEL_E2E_BIN")
+            .or_else(|_| std::env::var("CARGO_BIN_EXE_runnel"))
+            .context("test runner did not provide RUNNEL_E2E_BIN or CARGO_BIN_EXE_runnel")
     }
 
     fn unique_id() -> String {

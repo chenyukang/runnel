@@ -44,13 +44,14 @@ jobs:
 
       - name: Run Privileged WG Noise Recovery Test
         run: |
+          cargo build --locked --bin runnel
           test_bin="$(
             cargo test --locked --test wg_noise_e2e --no-run --message-format=json |
               jq -r 'select(.reason == "compiler-artifact" and .target.name == "wg_noise_e2e" and .executable != null) | .executable' |
               tail -n 1
           )"
           test -n "$test_bin"
-          sudo "$test_bin" \
+          sudo env "RUNNEL_E2E_BIN=$PWD/target/debug/runnel" "$test_bin" \
             linux::wg_noise_engine_recovers_from_old_udp_source_port_blackhole \
             --ignored --nocapture
 
