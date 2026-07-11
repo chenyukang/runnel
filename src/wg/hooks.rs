@@ -1168,7 +1168,9 @@ fn parse_linux_route_get(target: &str, output: &str) -> Result<RouteInfo> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EgressRouteNotReady, RouteInfo, build_client_hook_plan, exclude_routes};
+    #[cfg(target_os = "macos")]
+    use super::EgressRouteNotReady;
+    use super::{RouteInfo, build_client_hook_plan, exclude_routes};
     use crate::wg::{WgRuntimeConfig, default_client_allowed_ips};
     use ipnet::IpNet;
     use std::{
