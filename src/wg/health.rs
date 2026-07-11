@@ -26,6 +26,7 @@ const DNS_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(3);
 const FRESH_HANDSHAKE_MAX_AGE: Duration = Duration::from_secs(180);
 const RECOVERY_DEGRADED_CHECKS_THRESHOLD: u32 = 3;
+const HEALTH_STATE_TRANSITION_CHECKS_THRESHOLD: u32 = 2;
 
 pub(crate) struct WgClientHealthMonitorConfig {
     pub role: &'static str,
@@ -452,15 +453,58 @@ fn compose_client_health(
 #[derive(Default)]
 struct HealthReporter {
     last_key: Option<HealthKey>,
+    pending_state: Option<TunnelState>,
+    pending_checks: u32,
 }
 
 impl HealthReporter {
     fn report(&mut self, health: TunnelHealth) {
-        let key = HealthKey::from(&health);
-        if self.last_key.as_ref() != Some(&key) {
+        if self.accept(&health) {
             telemetry::set_tunnel_health(health);
-            self.last_key = Some(key);
         }
+    }
+
+    fn accept(&mut self, health: &TunnelHealth) -> bool {
+        let key = HealthKey::from(health);
+        let Some(last_key) = self.last_key.as_ref() else {
+            self.last_key = Some(key);
+            return true;
+        };
+
+        if last_key == &key {
+            self.clear_pending_transition();
+            return false;
+        }
+
+        let debounce_state_transition = matches!(
+            (last_key.state, key.state),
+            (TunnelState::Active, TunnelState::Degraded)
+                | (TunnelState::Degraded, TunnelState::Active)
+        );
+        if !debounce_state_transition {
+            self.clear_pending_transition();
+            self.last_key = Some(key);
+            return true;
+        }
+
+        if self.pending_state == Some(key.state) {
+            self.pending_checks += 1;
+        } else {
+            self.pending_state = Some(key.state);
+            self.pending_checks = 1;
+        }
+        if self.pending_checks < HEALTH_STATE_TRANSITION_CHECKS_THRESHOLD {
+            return false;
+        }
+
+        self.clear_pending_transition();
+        self.last_key = Some(key);
+        true
+    }
+
+    fn clear_pending_transition(&mut self) {
+        self.pending_state = None;
+        self.pending_checks = 0;
     }
 }
 
@@ -541,6 +585,36 @@ mod tests {
     }
 
     #[test]
+    fn health_reporter_ignores_one_failed_check() {
+        let active = test_tunnel_health(TunnelState::Active);
+        let degraded = test_tunnel_health(TunnelState::Degraded);
+        let mut reporter = HealthReporter::default();
+
+        assert!(reporter.accept(&active));
+        assert!(!reporter.accept(&degraded));
+        assert!(!reporter.accept(&active));
+        assert_eq!(reporter.pending_state, None);
+        assert_eq!(reporter.pending_checks, 0);
+        assert_eq!(reporter.last_key, Some(HealthKey::from(&active)));
+    }
+
+    #[test]
+    fn health_reporter_debounces_degraded_and_active_transitions() {
+        let active = test_tunnel_health(TunnelState::Active);
+        let degraded = test_tunnel_health(TunnelState::Degraded);
+        let mut reporter = HealthReporter::default();
+
+        assert!(reporter.accept(&active));
+        assert!(!reporter.accept(&degraded));
+        assert!(reporter.accept(&degraded));
+        assert_eq!(reporter.last_key, Some(HealthKey::from(&degraded)));
+
+        assert!(!reporter.accept(&active));
+        assert!(reporter.accept(&active));
+        assert_eq!(reporter.last_key, Some(HealthKey::from(&active)));
+    }
+
+    #[test]
     fn recovery_streak_triggers_after_consecutive_connectivity_errors() {
         let health = TunnelHealth {
             state: TunnelState::Degraded,
@@ -607,5 +681,20 @@ mod tests {
 
         assert_eq!(combined.state, TunnelCheckState::Error);
         assert_eq!(combined.detail, "system DNS ok; capture failed");
+    }
+
+    fn test_tunnel_health(state: TunnelState) -> TunnelHealth {
+        let degraded = state == TunnelState::Degraded;
+        TunnelHealth {
+            state,
+            detail: state.as_str().to_owned(),
+            dns: if degraded {
+                TunnelCheckState::Error
+            } else {
+                TunnelCheckState::Ok
+            },
+            connectivity: TunnelCheckState::Ok,
+            handshake_age_secs: None,
+        }
     }
 }
