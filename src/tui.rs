@@ -31,7 +31,7 @@ use tokio::{
 use crate::telemetry::{
     DashboardSnapshot, MonitorContext, RecentTargetSnapshot, RouteStats, TraceEvent, TrafficState,
     TunnelCheckState, TunnelHealth, TunnelState, attach_socket, event_impacts_health,
-    is_health_check_dns_probe, route_bucket_for_event,
+    is_health_check_dns_probe, is_suppressed_recent_event, route_bucket_for_event,
 };
 
 const HISTORY_LEN: usize = 48;
@@ -546,10 +546,7 @@ impl DashboardApp {
     }
 
     fn capture_recent_event(&mut self, event: &TraceEvent) {
-        if event.message == "traffic sample"
-            || event.message == "dns query"
-            || (event.message == "tunnel health" && event.level != "WARN")
-        {
+        if is_suppressed_recent_event(event) {
             return;
         }
         if event.message.contains("relay completed") && self.recent_events.len() >= RECENT_EVENTS {
@@ -1448,6 +1445,25 @@ mod tests {
         assert_eq!(app.upload_history.last().copied(), Some(12));
         assert_eq!(app.download_history.last().copied(), Some(34));
         assert!(app.last_traffic_at.is_some());
+    }
+
+    #[test]
+    fn wg_packet_debug_does_not_fill_tui_recent_events() {
+        let mut app = DashboardApp::new(DashboardContext {
+            command_label: "wg-client".to_owned(),
+            mode_label: "wg".to_owned(),
+            traffic_state: crate::telemetry::TrafficState::Proxying,
+            listen: None,
+            upstream: None,
+            path: None,
+            log_file: PathBuf::from("runnel.log"),
+            log_filter: "debug".to_owned(),
+            log_timezone_offset_secs: 0,
+        });
+
+        app.ingest(trace_event("DEBUG", "wg noise packet sent", &[]));
+
+        assert!(app.recent_events.is_empty());
     }
 
     #[test]
