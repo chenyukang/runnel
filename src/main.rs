@@ -42,6 +42,12 @@ struct Cli {
     #[arg(
         long,
         global = true,
+        help = "Shortcut for --log debug unless --log or RUNNEL_LOG is set"
+    )]
+    debug: bool,
+    #[arg(
+        long,
+        global = true,
         default_value = DEFAULT_RUN_LOG_FILE,
         hide_default_value = true,
         help = "Write logs to this file; service commands default to ~/.runnel/logs/<role>.log"
@@ -335,6 +341,7 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).context("failed to parse CLI arguments")?;
+    let log_from_cli_or_env = value_from_command_or_env(&matches, "log");
     let log_file_from_cli_or_env = value_from_command_or_env(&matches, "log_file");
     let mut log_file_from_config = false;
     let config_path = cli.config.clone().or_else(discover_default_config_path);
@@ -401,6 +408,7 @@ async fn main() -> Result<()> {
             }
         }
     }
+    apply_debug_log_shortcut(&mut cli, log_from_cli_or_env);
     normalize_cli_modes(&mut cli);
     let log_file_is_default = !log_file_from_cli_or_env && !log_file_from_config;
     if log_file_is_default {
@@ -533,6 +541,12 @@ fn normalize_cli_modes(cli: &mut Cli) {
     if cli.daemon && cli.tui {
         eprintln!("runnel: disabling TUI because daemon mode runs in the background");
         cli.tui = false;
+    }
+}
+
+fn apply_debug_log_shortcut(cli: &mut Cli, log_from_cli_or_env: bool) {
+    if cli.debug && !log_from_cli_or_env {
+        cli.log = "debug".to_owned();
     }
 }
 
@@ -905,11 +919,12 @@ fn command_requires_strict_config(command: &Commands) -> bool {
 mod tests {
     use super::{
         Cli, Commands, ReloadArgs, ServiceRole, StatusArgs, StopArgs, SwitchArgs, SwitchRole,
-        build_log_file_appender, cli_daemon, cli_service, command_requires_strict_config,
-        default_config_paths_for, first_existing_config_path, parse_log_timezone, read_file_tail,
-        run_utility_command, wait_for_daemon_startup,
+        apply_debug_log_shortcut, build_log_file_appender, cli_daemon, cli_service,
+        command_requires_strict_config, default_config_paths_for, first_existing_config_path,
+        parse_log_timezone, read_file_tail, run_utility_command, value_from_command_or_env,
+        wait_for_daemon_startup,
     };
-    use clap::CommandFactory;
+    use clap::{CommandFactory, FromArgMatches};
     use runnel::wg;
     use std::{
         ffi::OsString,
@@ -1094,6 +1109,27 @@ mod tests {
     }
 
     #[test]
+    fn debug_flag_sets_debug_log_filter() {
+        let matches = Cli::command().get_matches_from(["runnel", "--debug", "status"]);
+        let mut cli = Cli::from_arg_matches(&matches).unwrap();
+
+        apply_debug_log_shortcut(&mut cli, value_from_command_or_env(&matches, "log"));
+
+        assert_eq!(cli.log, "debug");
+    }
+
+    #[test]
+    fn explicit_log_filter_wins_over_debug_flag() {
+        let matches =
+            Cli::command().get_matches_from(["runnel", "--debug", "--log", "trace", "status"]);
+        let mut cli = Cli::from_arg_matches(&matches).unwrap();
+
+        apply_debug_log_shortcut(&mut cli, value_from_command_or_env(&matches, "log"));
+
+        assert_eq!(cli.log, "trace");
+    }
+
+    #[test]
     fn status_defaults_can_use_role_log_files() {
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
             return;
@@ -1229,6 +1265,7 @@ mod tests {
     fn reload_start_args_restarts_selected_role_as_daemon() {
         let cli = Cli {
             log: "debug".to_owned(),
+            debug: false,
             log_file: PathBuf::from("runnel.log"),
             log_timezone: "Asia/Shanghai".to_owned(),
             telemetry_sock: Some(PathBuf::from("runnel.sock")),

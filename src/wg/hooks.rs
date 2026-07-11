@@ -531,6 +531,7 @@ pub(crate) fn build_client_hook_plan(
         }
 
         let mut up = vec![macos_ifconfig_command(device, tunnel, runtime.mtu)];
+        up.push(macos_tunnel_peer_route_command(device, tunnel.peer_ip()));
         up.push(macos_bypass_route(endpoint_ip, route));
         up.extend(
             routes
@@ -543,6 +544,7 @@ pub(crate) fn build_client_hook_plan(
             .rev()
             .map(|route| macos_delete_route_command(*route))
             .collect::<Vec<_>>();
+        down.push(macos_delete_host_route_command(tunnel.peer_ip()));
         down.push(macos_delete_host_route_command(endpoint_ip));
         down.push(format!("ifconfig {device} down >/dev/null 2>&1 || true"));
         return Ok(HookPlan { up, down });
@@ -836,6 +838,19 @@ fn macos_ifconfig_command(device: &str, tunnel: TunnelPair, mtu: u16) -> String 
         TunnelPair::V6 { local, peer } => {
             format!("ifconfig {device} inet6 {local} {peer} prefixlen 128 mtu {mtu} up")
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_tunnel_peer_route_command(device: &str, peer: IpAddr) -> String {
+    if peer.is_ipv6() {
+        format!(
+            "route -q -n add -inet6 -host {peer} -interface {device} >/dev/null 2>&1 || route -q -n change -inet6 -host {peer} -interface {device}"
+        )
+    } else {
+        format!(
+            "route -q -n add -host {peer} -interface {device} >/dev/null 2>&1 || route -q -n change -host {peer} -interface {device}"
+        )
     }
 }
 
@@ -1430,12 +1445,22 @@ destination: 172.235.244.118
         assert!(
             plan.up
                 .iter()
+                .any(|hook| hook.contains("route -q -n add -host 10.8.0.1 -interface utun123"))
+        );
+        assert!(
+            plan.up
+                .iter()
                 .any(|hook| hook.contains("route -q -n add -net 0.0.0.0/1 10.8.0.1"))
         );
         assert!(
             plan.up
                 .iter()
                 .any(|hook| hook.contains("route -q -n add -net 128.0.0.0/1 10.8.0.1"))
+        );
+        assert!(
+            plan.down
+                .iter()
+                .any(|hook| hook.contains("route -q -n delete -host 10.8.0.1"))
         );
         assert!(
             plan.down
@@ -1496,6 +1521,9 @@ destination: 172.235.244.118
                 .iter()
                 .any(|hook| hook.contains("route -q -n add -inet6 -host 2001:db8::10 fe80::1"))
         );
+        assert!(plan.up.iter().any(|hook| {
+            hook.contains("route -q -n add -inet6 -host fd00:8::1 -interface utun123")
+        }));
         assert!(
             plan.up
                 .iter()

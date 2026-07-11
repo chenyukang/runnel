@@ -202,6 +202,10 @@ pub(super) async fn run_client_session(
     let _ = health_task.await;
     traffic_switch_task.abort();
     let _ = traffic_switch_task.await;
+    drop(traffic_switch);
+    if let Some(dns_capture) = dns_capture {
+        dns_capture.shutdown().await;
+    }
     result
 }
 

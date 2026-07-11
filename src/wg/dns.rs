@@ -5,7 +5,12 @@ use std::{
     sync::{Arc, RwLock},
     time::Duration,
 };
-use tokio::{net::UdpSocket, task::JoinHandle, time::timeout};
+use tokio::{
+    net::UdpSocket,
+    sync::Mutex,
+    task::JoinHandle,
+    time::{sleep, timeout},
+};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -20,10 +25,14 @@ use super::hooks::DynamicRouteManager;
 
 const DNS_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 53);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+const DNS_BIND_RETRY_ATTEMPTS: usize = 20;
+const DNS_BIND_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_DNS_PACKET: usize = 4096;
+type DnsForwardTasks = Arc<Mutex<Vec<JoinHandle<()>>>>;
 
 pub(crate) struct DnsCaptureGuard {
-    handle: JoinHandle<()>,
+    handle: Option<JoinHandle<()>>,
+    forward_tasks: DnsForwardTasks,
     controller: DnsCaptureController,
 }
 
@@ -41,13 +50,28 @@ pub(crate) struct DomainRuleEngine {
 
 impl Drop for DnsCaptureGuard {
     fn drop(&mut self) {
-        self.handle.abort();
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+        if let Ok(mut tasks) = self.forward_tasks.try_lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
     }
 }
 
 impl DnsCaptureGuard {
     pub(crate) fn controller(&self) -> DnsCaptureController {
         self.controller.clone()
+    }
+
+    pub(crate) async fn shutdown(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        abort_forward_tasks(&self.forward_tasks).await;
     }
 }
 
@@ -129,20 +153,59 @@ pub(crate) async fn start_dns_capture(
     upstream: IpAddr,
     domain_rules: Option<DomainRuleEngine>,
 ) -> Result<DnsCaptureGuard> {
-    let socket = Arc::new(
-        UdpSocket::bind(DNS_LISTEN)
-            .await
-            .with_context(|| format!("failed to bind WG DNS capture listener on {DNS_LISTEN}"))?,
-    );
+    let socket = Arc::new(bind_dns_capture_listener().await?);
     let controller = DnsCaptureController::new(SocketAddr::new(upstream, 53));
-    let handle = tokio::spawn(run_dns_capture(socket, controller.clone(), domain_rules));
-    Ok(DnsCaptureGuard { handle, controller })
+    let forward_tasks = Arc::new(Mutex::new(Vec::new()));
+    let handle = tokio::spawn(run_dns_capture(
+        socket,
+        controller.clone(),
+        domain_rules,
+        Arc::clone(&forward_tasks),
+    ));
+    Ok(DnsCaptureGuard {
+        handle: Some(handle),
+        forward_tasks,
+        controller,
+    })
+}
+
+async fn bind_dns_capture_listener() -> Result<UdpSocket> {
+    let mut last_error = None;
+    for attempt in 1..=DNS_BIND_RETRY_ATTEMPTS {
+        match UdpSocket::bind(DNS_LISTEN).await {
+            Ok(socket) => return Ok(socket),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse
+                    && attempt < DNS_BIND_RETRY_ATTEMPTS =>
+            {
+                warn!(
+                    listen = %DNS_LISTEN,
+                    attempt,
+                    retry_delay_ms = DNS_BIND_RETRY_DELAY.as_millis(),
+                    error = %error,
+                    "wg DNS capture listener address is in use; retrying"
+                );
+                last_error = Some(error);
+                sleep(DNS_BIND_RETRY_DELAY).await;
+            }
+            Err(error) => {
+                last_error = Some(error);
+                break;
+            }
+        }
+    }
+
+    let error = last_error
+        .unwrap_or_else(|| std::io::Error::other("failed to bind WG DNS capture listener"));
+    Err::<UdpSocket, _>(error)
+        .with_context(|| format!("failed to bind WG DNS capture listener on {DNS_LISTEN}"))
 }
 
 async fn run_dns_capture(
     socket: Arc<UdpSocket>,
     upstream: DnsCaptureController,
     domain_rules: Option<DomainRuleEngine>,
+    forward_tasks: DnsForwardTasks,
 ) {
     let mut buffer = vec![0u8; MAX_DNS_PACKET];
     loop {
@@ -178,7 +241,7 @@ async fn run_dns_capture(
         let socket = Arc::clone(&socket);
         let domain_rules = domain_rules.clone();
         let upstream = upstream.upstream();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             if let Err(err) = forward_dns_packet(
                 socket,
                 upstream,
@@ -193,6 +256,20 @@ async fn run_dns_capture(
                 debug!(error = %err, "wg dns capture forward failed");
             }
         });
+        let mut tasks = forward_tasks.lock().await;
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+    }
+}
+
+async fn abort_forward_tasks(forward_tasks: &DnsForwardTasks) {
+    let tasks = {
+        let mut tasks = forward_tasks.lock().await;
+        std::mem::take(&mut *tasks)
+    };
+    for task in tasks {
+        task.abort();
+        let _ = task.await;
     }
 }
 
@@ -411,7 +488,8 @@ fn nxdomain_response(packet: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_domain_rules, nxdomain_response, parse_dns_answer_ips, parse_dns_query_name,
+        DnsCaptureController, DnsCaptureGuard, decide_domain_rules, nxdomain_response,
+        parse_dns_answer_ips, parse_dns_query_name,
     };
     use crate::proxy::{
         adblock::Adblocker,
@@ -539,5 +617,47 @@ mod tests {
         controller.set_upstream("192.168.3.1".parse().unwrap());
 
         assert_eq!(controller.upstream(), "192.168.3.1:53".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn dns_capture_shutdown_aborts_listener_and_forward_tasks() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let listener_dropped = Arc::new(AtomicBool::new(false));
+        let listener_flag = Arc::clone(&listener_dropped);
+        let handle = tokio::spawn(async move {
+            let _drop_flag = DropFlag(listener_flag);
+            std::future::pending::<()>().await;
+        });
+
+        let forward_dropped = Arc::new(AtomicBool::new(false));
+        let forward_flag = Arc::clone(&forward_dropped);
+        let forward_task = tokio::spawn(async move {
+            let _drop_flag = DropFlag(forward_flag);
+            std::future::pending::<()>().await;
+        });
+
+        let guard = DnsCaptureGuard {
+            handle: Some(handle),
+            forward_tasks: Arc::new(tokio::sync::Mutex::new(vec![forward_task])),
+            controller: DnsCaptureController::new("1.1.1.1:53".parse().unwrap()),
+        };
+
+        tokio::task::yield_now().await;
+        guard.shutdown().await;
+
+        assert!(listener_dropped.load(Ordering::SeqCst));
+        assert!(forward_dropped.load(Ordering::SeqCst));
     }
 }
