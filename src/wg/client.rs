@@ -27,7 +27,7 @@ use std::{
     fmt, io,
     net::{IpAddr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::watch;
 use tokio::{net::UdpSocket, sync::Mutex, time::timeout};
@@ -41,6 +41,7 @@ use crate::{
 const HANDSHAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const WG_CLIENT_RECOVERY_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const WG_CLIENT_RECOVERY_MAX_DELAY: Duration = Duration::from_secs(10);
+const WG_CLIENT_RECOVERY_RESET_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct WgClientNetworkNotReady {
@@ -248,6 +249,7 @@ async fn run_with_recovery(
     let mut session_started = false;
 
     loop {
+        let attempt_started_at = Instant::now();
         let result = run_client_session(
             args.clone(),
             runtime.clone(),
@@ -259,6 +261,19 @@ async fn run_with_recovery(
         match result {
             Ok(()) => return Ok(()),
             Err(error) => {
+                let attempt_runtime = attempt_started_at.elapsed();
+                let reset_delay = recovery_delay_after_attempt(restart_delay, attempt_runtime);
+                if reset_delay != restart_delay {
+                    info!(
+                        engine = ?args.engine,
+                        endpoint = %endpoint,
+                        stable_for_ms = attempt_runtime.as_millis(),
+                        previous_backoff_ms = restart_delay.as_millis(),
+                        backoff_ms = reset_delay.as_millis(),
+                        "wg client stable session reset recovery backoff"
+                    );
+                    restart_delay = reset_delay;
+                }
                 if let Some(local_path_lost) = error.downcast_ref::<noise::WgNoiseLocalPathLost>() {
                     restart_count += 1;
                     warn!(
@@ -664,6 +679,14 @@ fn next_recovery_delay(delay: Duration) -> Duration {
     delay.saturating_mul(2).min(WG_CLIENT_RECOVERY_MAX_DELAY)
 }
 
+fn recovery_delay_after_attempt(delay: Duration, attempt_runtime: Duration) -> Duration {
+    if attempt_runtime >= WG_CLIENT_RECOVERY_RESET_AFTER {
+        WG_CLIENT_RECOVERY_INITIAL_DELAY
+    } else {
+        delay
+    }
+}
+
 fn recoverable_handshake_probe_timeout(
     error: &anyhow::Error,
     session_started: bool,
@@ -1026,7 +1049,7 @@ mod tests {
         WG_CLIENT_RECOVERY_INITIAL_DELAY, WgClientArgs, WgClientHandshakeProbeTimedOut,
         WgClientNetworkNotReady, is_recoverable_udp_path_error, next_recovery_delay, plan_lines,
         probe_noise_handshake, probe_server_handshake, recoverable_handshake_probe_timeout,
-        udp_os_error_name,
+        recovery_delay_after_attempt, udp_os_error_name,
     };
     use crate::proxy::route::RouteRuleConfig;
     use crate::wg::{
@@ -1109,6 +1132,20 @@ mod tests {
                 Duration::from_secs(10),
                 Duration::from_secs(10),
             ]
+        );
+    }
+
+    #[test]
+    fn stable_session_resets_recovery_backoff() {
+        let delay = Duration::from_secs(10);
+
+        assert_eq!(
+            recovery_delay_after_attempt(delay, Duration::from_secs(29)),
+            delay
+        );
+        assert_eq!(
+            recovery_delay_after_attempt(delay, Duration::from_secs(30)),
+            WG_CLIENT_RECOVERY_INITIAL_DELAY
         );
     }
 
