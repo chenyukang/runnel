@@ -287,6 +287,22 @@ async fn run_with_recovery(
                         last_error = %local_path_lost.last_error,
                         "wg client local UDP path lost; rebuilding session after backoff"
                     );
+                } else if let Some(udp_path_blackholed) =
+                    error.downcast_ref::<noise::WgNoiseUdpPathBlackholed>()
+                {
+                    restart_count += 1;
+                    warn!(
+                        engine = ?args.engine,
+                        endpoint = %udp_path_blackholed.endpoint,
+                        role = udp_path_blackholed.role,
+                        signal = udp_path_blackholed.signal,
+                        handshake_attempts = udp_path_blackholed.attempts,
+                        socket_rotations = udp_path_blackholed.socket_rotations,
+                        recovery_detail = %udp_path_blackholed.detail,
+                        restart_count,
+                        backoff_ms = restart_delay.as_millis(),
+                        "wg client UDP path remained blackholed; rebuilding session after backoff"
+                    );
                 } else if error
                     .downcast_ref::<noise::WgNoiseConnectionExpired>()
                     .is_some()

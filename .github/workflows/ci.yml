@@ -42,6 +42,18 @@ jobs:
       - name: Run Tests
         run: cargo test --all-targets --all-features
 
+      - name: Run Privileged WG Noise Recovery Test
+        run: |
+          test_bin="$(
+            cargo test --locked --test wg_noise_e2e --no-run --message-format=json |
+              jq -r 'select(.reason == "compiler-artifact" and .target.name == "wg_noise_e2e" and .executable != null) | .executable' |
+              tail -n 1
+          )"
+          test -n "$test_bin"
+          sudo "$test_bin" \
+            linux::wg_noise_engine_recovers_from_old_udp_source_port_blackhole \
+            --ignored --nocapture
+
   macos:
     name: macOS
     runs-on: macos-14

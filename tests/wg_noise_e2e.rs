@@ -40,8 +40,8 @@ mod linux {
     const WG_DEVICE: &str = "rwg0";
 
     #[test]
-    #[ignore = "requires Linux root privileges, network namespaces, /dev/net/tun, ip, and ping"]
-    fn wg_noise_engine_connects_two_linux_namespaces() -> Result<()> {
+    #[ignore = "requires Linux root privileges, network namespaces, /dev/net/tun, ip, iptables, and ping"]
+    fn wg_noise_engine_recovers_from_old_udp_source_port_blackhole() -> Result<()> {
         ensure!(
             cfg!(target_os = "linux"),
             "wg noise e2e only runs on Linux because it uses network namespaces"
@@ -55,6 +55,7 @@ mod linux {
             "wg noise e2e requires root; run: sudo cargo test --test wg_noise_e2e -- --ignored --nocapture"
         );
         require_command("ip")?;
+        require_command("iptables")?;
         require_command("ping")?;
         run(["ip", "netns", "list"])?;
 
@@ -192,9 +193,80 @@ mod linux {
                 .arg("1420"),
         )?;
         wait_for_log(&client_log, "wg client started", &mut client)?;
+        let client_pid = client.id();
 
         wait_for_ping(&client_ns, WG_SERVER_IP, &mut server, &mut client)
             .with_context(|| e2e_debug(&server_ns, &client_ns, &server_log, &client_log))?;
+
+        let old_client_port = wait_for_peer_endpoint_port(
+            &server_log,
+            CLIENT_UNDERLAY,
+            Duration::from_secs(5),
+            &mut server,
+        )?;
+        let old_client_port = old_client_port.to_string();
+        run([
+            "ip",
+            "netns",
+            "exec",
+            &server_ns,
+            "iptables",
+            "-I",
+            "INPUT",
+            "1",
+            "-p",
+            "udp",
+            "-s",
+            CLIENT_UNDERLAY,
+            "--sport",
+            &old_client_port,
+            "--dport",
+            WG_PORT,
+            "-j",
+            "DROP",
+        ])?;
+
+        let blocked_ping = ping_once(&server_ns, WG_CLIENT_IP)?;
+        ensure!(
+            !blocked_ping.status.success(),
+            "server-to-client ping unexpectedly survived the old UDP source-port blackhole"
+        );
+        wait_for_log_timeout(
+            &client_log,
+            "wg noise detected UDP path blackhole; rotated client source port in place",
+            Duration::from_secs(45),
+            &mut client,
+        )
+        .with_context(|| e2e_debug(&server_ns, &client_ns, &server_log, &client_log))?;
+        ensure!(
+            client.id() == client_pid,
+            "client process changed while recovering the UDP path"
+        );
+        wait_for_ping(&server_ns, WG_CLIENT_IP, &mut server, &mut client)
+            .with_context(|| e2e_debug(&server_ns, &client_ns, &server_log, &client_log))?;
+        wait_for_log_timeout(
+            &client_log,
+            "wg noise UDP path recovered after source port rotation",
+            Duration::from_secs(5),
+            &mut client,
+        )?;
+
+        let recovered_port = wait_for_peer_endpoint_port(
+            &server_log,
+            CLIENT_UNDERLAY,
+            Duration::from_secs(5),
+            &mut server,
+        )?;
+        ensure!(
+            recovered_port.to_string() != old_client_port,
+            "server did not learn a new client UDP source port"
+        );
+        ensure!(
+            !fs::read_to_string(&client_log)
+                .unwrap_or_default()
+                .contains("wg client rebuilding session"),
+            "client performed a full session rebuild instead of in-place UDP recovery"
+        );
 
         Ok(())
     }
@@ -210,12 +282,7 @@ mod linux {
         while started.elapsed() < Duration::from_secs(8) {
             server.ensure_running()?;
             client.ensure_running()?;
-            let output = Command::new("ip")
-                .args([
-                    "netns", "exec", client_ns, "ping", "-c", "1", "-W", "1", target,
-                ])
-                .output()
-                .context("failed to run ping inside client netns")?;
+            let output = ping_once(client_ns, target)?;
             if output.status.success() {
                 return Ok(());
             }
@@ -225,9 +292,27 @@ mod linux {
         bail!("timed out waiting for WG noise ping to {target}\n{last}");
     }
 
+    fn ping_once(namespace: &str, target: &str) -> Result<std::process::Output> {
+        Command::new("ip")
+            .args([
+                "netns", "exec", namespace, "ping", "-c", "1", "-W", "1", target,
+            ])
+            .output()
+            .with_context(|| format!("failed to run ping inside {namespace}"))
+    }
+
     fn wait_for_log(path: &Path, needle: &str, child: &mut ChildGuard) -> Result<()> {
+        wait_for_log_timeout(path, needle, Duration::from_secs(5), child)
+    }
+
+    fn wait_for_log_timeout(
+        path: &Path,
+        needle: &str,
+        timeout: Duration,
+        child: &mut ChildGuard,
+    ) -> Result<()> {
         let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(5) {
+        while started.elapsed() < timeout {
             child.ensure_running()?;
             if fs::read_to_string(path)
                 .unwrap_or_default()
@@ -241,6 +326,32 @@ mod linux {
             "timed out waiting for log line `{needle}` in {}",
             path.display()
         );
+    }
+
+    fn wait_for_peer_endpoint_port(
+        path: &Path,
+        peer_ip: &str,
+        timeout: Duration,
+        child: &mut ChildGuard,
+    ) -> Result<u16> {
+        let started = Instant::now();
+        let prefix = format!("endpoint={peer_ip}:");
+        while started.elapsed() < timeout {
+            child.ensure_running()?;
+            let log = fs::read_to_string(path).unwrap_or_default();
+            if let Some(port) = log.lines().rev().find_map(|line| {
+                line.split_whitespace()
+                    .find_map(|field| field.strip_prefix(&prefix))
+                    .and_then(|port| port.parse().ok())
+            }) {
+                return Ok(port);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        bail!(
+            "timed out waiting for learned peer endpoint {peer_ip} in {}",
+            path.display()
+        )
     }
 
     fn require_command(command: &str) -> Result<()> {
@@ -397,6 +508,10 @@ mod linux {
                 );
             }
             Ok(())
+        }
+
+        fn id(&self) -> u32 {
+            self.child.id()
         }
     }
 

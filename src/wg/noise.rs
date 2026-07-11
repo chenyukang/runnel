@@ -26,7 +26,7 @@ use std::{
     fmt, io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::unix::AsyncFd,
@@ -54,6 +54,10 @@ const MASK_TAG_LEN: usize = 8;
 const MASK_HEADER_LEN: usize = MASK_NONCE_LEN + MASK_LEN_LEN + MASK_PAD_LEN;
 const MASK_FRAME_OVERHEAD: usize = MASK_HEADER_LEN + MASK_TAG_LEN + WG_OBFS_MAX_PADDING as usize;
 const LOCAL_PATH_LOST_SEND_THRESHOLD: u32 = 3;
+const UDP_BLACKHOLE_HANDSHAKE_ATTEMPTS: u32 = 3;
+const UDP_BLACKHOLE_RETRY_MIN_GAP: Duration = Duration::from_secs(4);
+const UDP_BLACKHOLE_RETRY_MAX_GAP: Duration = Duration::from_secs(12);
+const UDP_BLACKHOLE_MAX_SOCKET_ROTATIONS: u32 = 3;
 type HmacSha256 = Hmac<Sha256>;
 
 pub(super) struct NoiseTransport {
@@ -62,6 +66,12 @@ pub(super) struct NoiseTransport {
     pub(super) codec: NoisePacketCodec,
     pub(super) handshake_established: bool,
     index: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClientUdpRecoveryConfig {
+    bind: SocketAddr,
+    endpoint: SocketAddr,
 }
 
 pub(super) async fn prepare_client_transport(
@@ -165,7 +175,6 @@ pub(super) async fn run_client_session(
     let bypass_dns = dns_guard
         .as_ref()
         .and_then(system_proxy::SystemDnsGuard::direct_dns_upstream);
-    let (health_recovery_tx, mut health_recovery_rx) = tokio::sync::mpsc::channel(1);
     let (traffic_state_tx, traffic_state_rx) = watch::channel(telemetry::TrafficState::Proxying);
     let traffic_switch = Arc::new(Mutex::new(WgNoiseTrafficSwitch::new(
         route_switch,
@@ -188,7 +197,8 @@ pub(super) async fn run_client_session(
         dns_monitor,
         dns_capture: args.dns_capture,
         traffic_state: traffic_state_rx,
-        recovery_tx: Some(health_recovery_tx),
+        // Noise has no UAPI handshake signal, so ping failures remain observational.
+        recovery_tx: None,
     });
 
     info!(
@@ -205,15 +215,18 @@ pub(super) async fn run_client_session(
         "wg client started"
     );
 
-    let noise_loop = run_noise_loop("wg-client", tun, transport, Some(endpoint), false, None);
-    tokio::pin!(noise_loop);
-    let result = tokio::select! {
-        result = &mut noise_loop => result,
-        recovery = health_recovery_rx.recv() => match recovery {
-            Some(recovery) => Err(recovery.into()),
-            None => wait_for_shutdown_signal().await,
-        },
-    };
+    let result = run_noise_loop(
+        "wg-client",
+        tun,
+        transport,
+        Some(endpoint),
+        false,
+        Some(ClientUdpRecoveryConfig {
+            bind: runtime.bind,
+            endpoint,
+        }),
+    )
+    .await;
     match &result {
         Ok(()) => report_tunnel_stage(
             telemetry::TunnelState::Stopping,
@@ -270,7 +283,7 @@ pub(crate) async fn run_server(args: WgServerArgs, runtime: WgRuntimeConfig) -> 
         "wg server started"
     );
 
-    run_noise_loop("wg-server", tun, transport, None, true, Some(runtime)).await
+    run_noise_loop("wg-server", tun, transport, None, true, None).await
 }
 
 struct WgNoiseTrafficSwitch {
@@ -403,10 +416,10 @@ async fn run_noise_loop(
     transport: NoiseTransport,
     initial_endpoint: Option<SocketAddr>,
     learn_endpoint: bool,
-    roam_reset_runtime: Option<WgRuntimeConfig>,
+    client_recovery_config: Option<ClientUdpRecoveryConfig>,
 ) -> Result<()> {
     let NoiseTransport {
-        socket,
+        mut socket,
         mut tunnel,
         codec,
         handshake_established,
@@ -424,21 +437,23 @@ async fn run_noise_loop(
     traffic_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut traffic = TrafficCounters::default();
     let mut path_health = UdpPathHealth::default();
+    let mut udp_recovery = client_recovery_config.map(ClientUdpRecovery::new);
     let shutdown = wait_for_shutdown_signal();
     tokio::pin!(shutdown);
 
     if !handshake_established && let Some(endpoint) = peer.endpoint() {
         let action = noise_action(tunnel.format_handshake_initiation(&mut out_packet, false));
-        apply_noise_action(
+        apply_noise_action_with_recovery(
             role,
             &tun,
-            &socket,
+            &mut socket,
             &codec,
             &mut encoded_packet,
             Some(endpoint),
             action,
             &mut traffic,
             &mut path_health,
+            &mut udp_recovery,
         )
         .await?;
     }
@@ -460,7 +475,7 @@ async fn run_noise_loop(
                     debug!(role, bytes = len, "wg noise dropped TUN packet before peer endpoint was known");
                     continue;
                 };
-                apply_noise_action(role, &tun, &socket, &codec, &mut encoded_packet, peer.endpoint(), action, &mut traffic, &mut path_health).await?;
+                apply_noise_action_with_recovery(role, &tun, &mut socket, &codec, &mut encoded_packet, peer.endpoint(), action, &mut traffic, &mut path_health, &mut udp_recovery).await?;
             }
             received = socket.recv_from(&mut udp_packet) => {
                 let (len, source) = received.context("failed to receive wg noise UDP packet")?;
@@ -468,78 +483,26 @@ async fn run_noise_loop(
                     debug!(role, source = %source, "wg noise obfs packet ignored");
                     continue;
                 };
-                let action = decapsulate_network_packet(
-                    role,
-                    &mut tunnel,
-                    roam_reset_runtime.as_ref(),
-                    peer.endpoint(),
-                    source,
-                    &decoded_packet[..decoded_len],
-                    &mut out_packet,
-                );
+                let action = noise_action(tunnel.decapsulate(Some(source.ip()), &decoded_packet[..decoded_len], &mut out_packet));
+                if let Some(signal) = udp_recovery.as_mut().and_then(|recovery| {
+                    recovery.observe_inbound(&decoded_packet[..decoded_len], &action, Instant::now())
+                }) {
+                    rotate_client_udp_socket(role, &mut socket, &mut udp_recovery, signal).await?;
+                    path_health = UdpPathHealth::default();
+                }
                 let response_target = peer.observe_source(role, source, &action);
-                apply_noise_action(role, &tun, &socket, &codec, &mut encoded_packet, response_target, action, &mut traffic, &mut path_health).await?;
-                flush_queued_packets(role, &mut tunnel, &tun, &socket, &codec, peer.endpoint(), &mut out_packet, &mut encoded_packet, &mut traffic, &mut path_health).await?;
+                apply_noise_action_with_recovery(role, &tun, &mut socket, &codec, &mut encoded_packet, response_target, action, &mut traffic, &mut path_health, &mut udp_recovery).await?;
+                flush_queued_packets(role, &mut tunnel, &tun, &mut socket, &codec, peer.endpoint(), &mut out_packet, &mut encoded_packet, &mut traffic, &mut path_health, &mut udp_recovery).await?;
             }
             _ = timers.tick() => {
                 if let Some(action) = timer_action(role, &mut peer, tunnel.update_timers(&mut out_packet))? {
-                    apply_noise_action(role, &tun, &socket, &codec, &mut encoded_packet, peer.endpoint(), action, &mut traffic, &mut path_health).await?;
+                    apply_noise_action_with_recovery(role, &tun, &mut socket, &codec, &mut encoded_packet, peer.endpoint(), action, &mut traffic, &mut path_health, &mut udp_recovery).await?;
                 }
             }
             _ = traffic_timer.tick() => {
                 traffic.emit(role);
             }
         }
-    }
-}
-
-fn decapsulate_network_packet(
-    role: &'static str,
-    tunnel: &mut Tunn,
-    roam_reset_runtime: Option<&WgRuntimeConfig>,
-    current_endpoint: Option<SocketAddr>,
-    source: SocketAddr,
-    packet: &[u8],
-    out_packet: &mut [u8],
-) -> NoiseAction {
-    let action = noise_action(tunnel.decapsulate(Some(source.ip()), packet, out_packet));
-    let Some(runtime) = roam_reset_runtime else {
-        return action;
-    };
-    if current_endpoint.is_none_or(|endpoint| endpoint == source)
-        || wireguard_message_type(packet) != Some(1)
-        || !matches!(
-            &action,
-            NoiseAction::SendNetwork(response) if wireguard_message_type(response) == Some(2)
-        )
-    {
-        return action;
-    }
-
-    // The existing tunnel authenticated the roaming peer. Re-process that handshake in a fresh
-    // tunnel so stale rekey state from the old UDP path cannot poison the new data session.
-    let mut replacement = runtime.new_tunnel(next_tunnel_index());
-    let replacement_action =
-        noise_action(replacement.decapsulate(Some(source.ip()), packet, out_packet));
-    if matches!(
-        &replacement_action,
-        NoiseAction::SendNetwork(response) if wireguard_message_type(response) == Some(2)
-    ) {
-        info!(
-            role,
-            old_endpoint = %current_endpoint.expect("checked above"),
-            endpoint = %source,
-            "wg noise reset stale server tunnel after authenticated endpoint roam"
-        );
-        *tunnel = replacement;
-        replacement_action
-    } else {
-        warn!(
-            role,
-            endpoint = %source,
-            "wg noise could not rebuild server tunnel after authenticated endpoint roam"
-        );
-        action
     }
 }
 
@@ -575,13 +538,14 @@ async fn flush_queued_packets(
     role: &'static str,
     tunnel: &mut Tunn,
     tun: &AsyncFd<TunSocket>,
-    socket: &UdpSocket,
+    socket: &mut UdpSocket,
     codec: &NoisePacketCodec,
     peer_endpoint: Option<SocketAddr>,
     out_packet: &mut [u8],
     encoded_packet: &mut [u8],
     traffic: &mut TrafficCounters,
     path_health: &mut UdpPathHealth,
+    udp_recovery: &mut Option<ClientUdpRecovery>,
 ) -> Result<()> {
     for _ in 0..MAX_QUEUE_FLUSH {
         let action = noise_action(tunnel.decapsulate(None, &[], out_packet));
@@ -589,7 +553,7 @@ async fn flush_queued_packets(
             return Ok(());
         }
         let should_continue = matches!(action, NoiseAction::SendNetwork(_));
-        apply_noise_action(
+        apply_noise_action_with_recovery(
             role,
             tun,
             socket,
@@ -599,6 +563,7 @@ async fn flush_queued_packets(
             action,
             traffic,
             path_health,
+            udp_recovery,
         )
         .await?;
         if !should_continue {
@@ -607,6 +572,41 @@ async fn flush_queued_packets(
     }
     warn!(role, "wg noise queued packet flush hit iteration limit");
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_noise_action_with_recovery(
+    role: &'static str,
+    tun: &AsyncFd<TunSocket>,
+    socket: &mut UdpSocket,
+    codec: &NoisePacketCodec,
+    encoded_packet: &mut [u8],
+    peer_endpoint: Option<SocketAddr>,
+    action: NoiseAction,
+    traffic: &mut TrafficCounters,
+    path_health: &mut UdpPathHealth,
+    udp_recovery: &mut Option<ClientUdpRecovery>,
+) -> Result<()> {
+    if let Some(signal) = udp_recovery
+        .as_mut()
+        .and_then(|recovery| recovery.observe_outbound(&action, Instant::now()))
+    {
+        rotate_client_udp_socket(role, socket, udp_recovery, signal).await?;
+        *path_health = UdpPathHealth::default();
+    }
+
+    apply_noise_action(
+        role,
+        tun,
+        socket,
+        codec,
+        encoded_packet,
+        peer_endpoint,
+        action,
+        traffic,
+        path_health,
+    )
+    .await
 }
 
 async fn read_tun_packet(tun: &AsyncFd<TunSocket>, dst: &mut [u8]) -> Result<usize> {
@@ -750,6 +750,223 @@ async fn send_udp_packet(
             Ok(false)
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UdpBlackholeSignalKind {
+    LocalHandshakeRetries,
+    PeerHandshakeRetries,
+}
+
+impl UdpBlackholeSignalKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalHandshakeRetries => "local_handshake_retries",
+            Self::PeerHandshakeRetries => "peer_handshake_retries",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UdpBlackholeSignal {
+    kind: UdpBlackholeSignalKind,
+    attempts: u32,
+}
+
+#[derive(Debug, Default)]
+struct HandshakeRetryTracker {
+    attempts: u32,
+    last_attempt: Option<Instant>,
+}
+
+impl HandshakeRetryTracker {
+    fn record(&mut self, now: Instant) -> Option<u32> {
+        if let Some(last_attempt) = self.last_attempt {
+            let gap = now.duration_since(last_attempt);
+            if gap < UDP_BLACKHOLE_RETRY_MIN_GAP {
+                return None;
+            }
+            if gap > UDP_BLACKHOLE_RETRY_MAX_GAP {
+                self.attempts = 0;
+            }
+        }
+
+        self.last_attempt = Some(now);
+        self.attempts += 1;
+        Some(self.attempts)
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[derive(Debug)]
+struct ClientUdpRecovery {
+    config: ClientUdpRecoveryConfig,
+    local_handshake_retries: HandshakeRetryTracker,
+    peer_handshake_retries: HandshakeRetryTracker,
+    pending_peer_response_index: Option<u32>,
+    rotations_without_progress: u32,
+}
+
+impl ClientUdpRecovery {
+    fn new(config: ClientUdpRecoveryConfig) -> Self {
+        Self {
+            config,
+            local_handshake_retries: HandshakeRetryTracker::default(),
+            peer_handshake_retries: HandshakeRetryTracker::default(),
+            pending_peer_response_index: None,
+            rotations_without_progress: 0,
+        }
+    }
+
+    fn observe_outbound(
+        &mut self,
+        action: &NoiseAction,
+        now: Instant,
+    ) -> Option<UdpBlackholeSignal> {
+        let packet = action.network_packet()?;
+        if wireguard_message_type(packet) != Some(1) {
+            return None;
+        }
+
+        let attempts = self.local_handshake_retries.record(now)?;
+        (attempts >= UDP_BLACKHOLE_HANDSHAKE_ATTEMPTS).then_some(UdpBlackholeSignal {
+            kind: UdpBlackholeSignalKind::LocalHandshakeRetries,
+            attempts,
+        })
+    }
+
+    fn observe_inbound(
+        &mut self,
+        packet: &[u8],
+        action: &NoiseAction,
+        now: Instant,
+    ) -> Option<UdpBlackholeSignal> {
+        if matches!(action, NoiseAction::Error(_)) {
+            return None;
+        }
+
+        match wireguard_message_type(packet) {
+            Some(1) => {
+                let response = action.network_packet()?;
+                if wireguard_message_type(response) != Some(2) {
+                    return None;
+                }
+                self.pending_peer_response_index = wireguard_sender_index(response);
+                let attempts = self.peer_handshake_retries.record(now)?;
+                (attempts >= UDP_BLACKHOLE_HANDSHAKE_ATTEMPTS).then_some(UdpBlackholeSignal {
+                    kind: UdpBlackholeSignalKind::PeerHandshakeRetries,
+                    attempts,
+                })
+            }
+            Some(2) => {
+                self.confirm_progress("handshake response");
+                None
+            }
+            Some(4) if wireguard_receiver_index(packet) == self.pending_peer_response_index => {
+                self.confirm_progress("peer data on rotated session");
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn confirm_progress(&mut self, confirmation: &'static str) {
+        if self.rotations_without_progress > 0 {
+            info!(
+                endpoint = %self.config.endpoint,
+                rotations = self.rotations_without_progress,
+                confirmation,
+                "wg noise UDP path recovered after source port rotation"
+            );
+        }
+        self.rotations_without_progress = 0;
+        self.local_handshake_retries.reset();
+        self.peer_handshake_retries.reset();
+        self.pending_peer_response_index = None;
+    }
+
+    fn record_rotation(&mut self) {
+        self.rotations_without_progress += 1;
+        self.local_handshake_retries.reset();
+        self.peer_handshake_retries.reset();
+    }
+
+    fn blackhole_error(
+        &self,
+        role: &'static str,
+        signal: UdpBlackholeSignal,
+        detail: impl Into<String>,
+    ) -> WgNoiseUdpPathBlackholed {
+        WgNoiseUdpPathBlackholed {
+            role,
+            endpoint: self.config.endpoint,
+            signal: signal.kind.as_str(),
+            attempts: signal.attempts,
+            socket_rotations: self.rotations_without_progress,
+            detail: detail.into(),
+        }
+    }
+}
+
+async fn rotate_client_udp_socket(
+    role: &'static str,
+    socket: &mut UdpSocket,
+    recovery: &mut Option<ClientUdpRecovery>,
+    signal: UdpBlackholeSignal,
+) -> Result<()> {
+    let recovery = recovery
+        .as_mut()
+        .expect("UDP recovery signal requires client recovery state");
+    if recovery.rotations_without_progress >= UDP_BLACKHOLE_MAX_SOCKET_ROTATIONS {
+        return Err(recovery
+            .blackhole_error(
+                role,
+                signal,
+                "source port rotations did not restore authenticated bidirectional traffic",
+            )
+            .into());
+    }
+    if recovery.config.bind.port() != 0 {
+        return Err(recovery
+            .blackhole_error(
+                role,
+                signal,
+                format!(
+                    "configured client UDP bind port {} cannot be rotated in place",
+                    recovery.config.bind.port()
+                ),
+            )
+            .into());
+    }
+
+    let old_local = socket.local_addr().ok();
+    let bind = bind_addr_for_endpoint(recovery.config.bind, recovery.config.endpoint);
+    let replacement = UdpSocket::bind(bind).await.map_err(|error| {
+        recovery.blackhole_error(
+            role,
+            signal,
+            format!("failed to bind replacement UDP socket on {bind}: {error}"),
+        )
+    })?;
+    let new_local = replacement.local_addr().ok();
+    *socket = replacement;
+    recovery.record_rotation();
+
+    warn!(
+        role,
+        endpoint = %recovery.config.endpoint,
+        signal = signal.kind.as_str(),
+        handshake_attempts = signal.attempts,
+        old_local = ?old_local,
+        new_local = ?new_local,
+        rotation = recovery.rotations_without_progress,
+        max_rotations = UDP_BLACKHOLE_MAX_SOCKET_ROTATIONS,
+        "wg noise detected UDP path blackhole; rotated client source port in place"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -905,6 +1122,33 @@ impl fmt::Display for WgNoiseLocalPathLost {
 }
 
 impl StdError for WgNoiseLocalPathLost {}
+
+#[derive(Debug)]
+pub(super) struct WgNoiseUdpPathBlackholed {
+    pub(super) role: &'static str,
+    pub(super) endpoint: SocketAddr,
+    pub(super) signal: &'static str,
+    pub(super) attempts: u32,
+    pub(super) socket_rotations: u32,
+    pub(super) detail: String,
+}
+
+impl fmt::Display for WgNoiseUdpPathBlackholed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} UDP path to {} remained blackholed after {} source port rotations (signal={}, attempts={}): {}",
+            self.role,
+            self.endpoint,
+            self.socket_rotations,
+            self.signal,
+            self.attempts,
+            self.detail,
+        )
+    }
+}
+
+impl StdError for WgNoiseUdpPathBlackholed {}
 
 #[derive(Debug)]
 pub(super) struct WgNoiseConnectionExpired {
@@ -1157,6 +1401,16 @@ fn wireguard_message_type(packet: &[u8]) -> Option<u32> {
     Some(u32::from_le_bytes(prefix))
 }
 
+fn wireguard_sender_index(packet: &[u8]) -> Option<u32> {
+    let index: [u8; 4] = packet.get(4..8)?.try_into().ok()?;
+    Some(u32::from_le_bytes(index))
+}
+
+fn wireguard_receiver_index(packet: &[u8]) -> Option<u32> {
+    let index: [u8; 4] = packet.get(4..8)?.try_into().ok()?;
+    Some(u32::from_le_bytes(index))
+}
+
 fn nonce_from_frame(frame: &[u8]) -> &[u8] {
     &frame[..MASK_NONCE_LEN]
 }
@@ -1285,6 +1539,13 @@ impl NoiseAction {
     fn is_valid_peer_packet(&self) -> bool {
         !matches!(self, Self::Error(_))
     }
+
+    fn network_packet(&self) -> Option<&[u8]> {
+        match self {
+            Self::SendNetwork(packet) => Some(packet),
+            Self::Done | Self::Error(_) | Self::WriteTunnelV4(_) | Self::WriteTunnelV6(_) => None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1316,11 +1577,14 @@ impl TrafficCounters {
 #[cfg(test)]
 mod tests {
     use super::{
+        ClientUdpRecovery, ClientUdpRecoveryConfig, HandshakeRetryTracker,
         LOCAL_PATH_LOST_SEND_THRESHOLD, MASK_HEADER_LEN, MASK_TAG_LEN, MAX_NOISE_UDP_PACKET_SIZE,
-        MAX_WG_PACKET_SIZE, NoiseAction, NoisePacketCodec, NoisePeerState, UdpPathHealth,
-        UdpSendFailureKind, WgNoiseConnectionExpired, WgNoiseLocalPathLost, bind_addr_for_endpoint,
-        classify_udp_send_error, decapsulate_network_packet, encapsulate_tun_packet, noise_action,
-        timer_action, udp_os_error_name,
+        MAX_WG_PACKET_SIZE, NoiseAction, NoisePacketCodec, NoisePeerState,
+        UDP_BLACKHOLE_HANDSHAKE_ATTEMPTS, UdpBlackholeSignal, UdpBlackholeSignalKind,
+        UdpPathHealth, UdpSendFailureKind, WgNoiseConnectionExpired, WgNoiseLocalPathLost,
+        WgNoiseUdpPathBlackholed, bind_addr_for_endpoint, classify_udp_send_error,
+        encapsulate_tun_packet, noise_action, rotate_client_udp_socket, timer_action,
+        udp_os_error_name,
     };
     use crate::wg::{
         WgObfsMode, WgObfsProfile, WgRuntimeConfig, default_client_allowed_ips,
@@ -1333,7 +1597,9 @@ mod tests {
     use std::{
         io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        time::{Duration, Instant},
     };
+    use tokio::{net::UdpSocket, time::timeout};
 
     #[test]
     fn bind_addr_for_endpoint_preserves_endpoint_family() {
@@ -1469,6 +1735,148 @@ mod tests {
             )
             .unwrap();
         assert_eq!(health.consecutive_local_path_failures, 0);
+    }
+
+    #[test]
+    fn handshake_retry_tracker_requires_retries_in_boringtun_retry_window() {
+        let start = Instant::now();
+        let mut tracker = HandshakeRetryTracker::default();
+
+        assert_eq!(tracker.record(start), Some(1));
+        assert_eq!(tracker.record(start + Duration::from_secs(1)), None);
+        assert_eq!(tracker.record(start + Duration::from_secs(5)), Some(2));
+        assert_eq!(tracker.record(start + Duration::from_secs(10)), Some(3));
+        assert_eq!(tracker.attempts, UDP_BLACKHOLE_HANDSHAKE_ATTEMPTS);
+
+        assert_eq!(tracker.record(start + Duration::from_secs(30)), Some(1));
+    }
+
+    #[test]
+    fn normal_two_minute_rekeys_do_not_trigger_udp_recovery() {
+        let endpoint = SocketAddr::from(([198, 51, 100, 10], 51820));
+        let mut recovery = ClientUdpRecovery::new(ClientUdpRecoveryConfig {
+            bind: SocketAddr::from(([0, 0, 0, 0], 0)),
+            endpoint,
+        });
+        let action = NoiseAction::SendNetwork(indexed_wg_packet(1, 7));
+        let start = Instant::now();
+
+        for interval in 0..4 {
+            assert_eq!(
+                recovery.observe_outbound(&action, start + Duration::from_secs(120 * interval),),
+                None
+            );
+            assert_eq!(recovery.local_handshake_retries.attempts, 1);
+        }
+    }
+
+    #[test]
+    fn repeated_authenticated_peer_handshakes_trigger_udp_rotation() {
+        let endpoint = SocketAddr::from(([198, 51, 100, 10], 51820));
+        let mut recovery = ClientUdpRecovery::new(ClientUdpRecoveryConfig {
+            bind: SocketAddr::from(([0, 0, 0, 0], 0)),
+            endpoint,
+        });
+        let initiation = indexed_wg_packet(1, 11);
+        let response = NoiseAction::SendNetwork(indexed_wg_packet(2, 29));
+        let start = Instant::now();
+
+        assert_eq!(
+            recovery.observe_inbound(&initiation, &response, start),
+            None
+        );
+        assert_eq!(
+            recovery.observe_inbound(&initiation, &response, start + Duration::from_secs(5),),
+            None
+        );
+        assert_eq!(
+            recovery.observe_inbound(&initiation, &response, start + Duration::from_secs(10),),
+            Some(UdpBlackholeSignal {
+                kind: UdpBlackholeSignalKind::PeerHandshakeRetries,
+                attempts: 3,
+            })
+        );
+        assert_eq!(recovery.pending_peer_response_index, Some(29));
+    }
+
+    #[test]
+    fn authenticated_data_confirms_rotated_udp_path() {
+        let endpoint = SocketAddr::from(([198, 51, 100, 10], 51820));
+        let mut recovery = ClientUdpRecovery::new(ClientUdpRecoveryConfig {
+            bind: SocketAddr::from(([0, 0, 0, 0], 0)),
+            endpoint,
+        });
+        recovery.rotations_without_progress = 2;
+        recovery.pending_peer_response_index = Some(29);
+        recovery.local_handshake_retries.attempts = 2;
+        recovery.peer_handshake_retries.attempts = 2;
+
+        let data = indexed_wg_packet(4, 29);
+        assert_eq!(
+            recovery.observe_inbound(&data, &NoiseAction::Done, Instant::now()),
+            None
+        );
+        assert_eq!(recovery.rotations_without_progress, 0);
+        assert_eq!(recovery.pending_peer_response_index, None);
+        assert_eq!(recovery.local_handshake_retries.attempts, 0);
+        assert_eq!(recovery.peer_handshake_retries.attempts, 0);
+    }
+
+    #[tokio::test]
+    async fn client_udp_recovery_rotates_ephemeral_source_port_in_place() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = receiver.local_addr().unwrap();
+        let mut socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let old_local = socket.local_addr().unwrap();
+        let mut recovery = Some(ClientUdpRecovery::new(ClientUdpRecoveryConfig {
+            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            endpoint,
+        }));
+        let signal = UdpBlackholeSignal {
+            kind: UdpBlackholeSignalKind::LocalHandshakeRetries,
+            attempts: UDP_BLACKHOLE_HANDSHAKE_ATTEMPTS,
+        };
+
+        rotate_client_udp_socket("wg-client", &mut socket, &mut recovery, signal)
+            .await
+            .unwrap();
+        let new_local = socket.local_addr().unwrap();
+        assert_ne!(new_local.port(), old_local.port());
+
+        socket.send_to(b"rotated", endpoint).await.unwrap();
+        let mut packet = [0u8; 16];
+        let (len, source) = timeout(Duration::from_secs(1), receiver.recv_from(&mut packet))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&packet[..len], b"rotated");
+        assert_eq!(source.port(), new_local.port());
+        assert_eq!(recovery.unwrap().rotations_without_progress, 1,);
+    }
+
+    #[tokio::test]
+    async fn fixed_client_udp_port_escalates_to_outer_recovery() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = receiver.local_addr().unwrap();
+        let mut socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut recovery = Some(ClientUdpRecovery::new(ClientUdpRecoveryConfig {
+            bind: SocketAddr::from(([127, 0, 0, 1], 2886)),
+            endpoint,
+        }));
+        let signal = UdpBlackholeSignal {
+            kind: UdpBlackholeSignalKind::LocalHandshakeRetries,
+            attempts: UDP_BLACKHOLE_HANDSHAKE_ATTEMPTS,
+        };
+
+        let error = rotate_client_udp_socket("wg-client", &mut socket, &mut recovery, signal)
+            .await
+            .unwrap_err();
+        let blackholed = error
+            .downcast_ref::<WgNoiseUdpPathBlackholed>()
+            .expect("fixed bind should request an outer session rebuild");
+        assert_eq!(blackholed.endpoint, endpoint);
+        assert_eq!(blackholed.socket_rotations, 0);
+        assert!(blackholed.detail.contains("cannot be rotated in place"));
     }
 
     #[test]
@@ -1767,7 +2175,7 @@ mod tests {
     }
 
     #[test]
-    fn server_accepts_fresh_client_transport_after_endpoint_roam() {
+    fn server_accepts_fresh_client_transport_after_endpoint_roam_without_reset() {
         let client_private = [0x11u8; 32];
         let server_private = [0x22u8; 32];
         let client_public = public_key(client_private);
@@ -1787,15 +2195,11 @@ mod tests {
             let outbound = ipv4_packet(Ipv4Addr::new(10, 8, 0, 2), Ipv4Addr::new(1, 1, 1, 1), 17);
             let handshake_init =
                 network_packet(noise_action(client.encapsulate(&outbound, &mut client_buf)));
-            let server_action = decapsulate_network_packet(
-                "wg-server",
-                &mut server,
-                Some(&server_runtime),
-                server_peer.endpoint(),
-                client_endpoint,
+            let server_action = noise_action(server.decapsulate(
+                Some(client_endpoint.ip()),
                 &handshake_init,
                 &mut server_buf,
-            );
+            ));
             assert_eq!(
                 server_peer.observe_source("wg-server", client_endpoint, &server_action),
                 Some(client_endpoint)
@@ -1893,6 +2297,10 @@ mod tests {
         let mut packet = message_type.to_le_bytes().to_vec();
         packet.extend_from_slice(body);
         packet
+    }
+
+    fn indexed_wg_packet(message_type: u32, index: u32) -> Vec<u8> {
+        wg_packet(message_type, &index.to_le_bytes())
     }
 
     fn public_key(private_key: [u8; 32]) -> [u8; 32] {
