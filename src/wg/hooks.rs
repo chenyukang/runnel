@@ -672,9 +672,9 @@ pub(crate) fn build_server_hook_plan(
                 );
             }
             up.push("sysctl -w net.ipv4.ip_forward=1 >/dev/null".to_owned());
-            up.push(format!("iptables -A FORWARD -i {device} -j ACCEPT"));
+            up.push(format!("iptables -I FORWARD 1 -i {device} -j ACCEPT"));
             up.push(format!(
-                "iptables -A FORWARD -o {device} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+                "iptables -I FORWARD 1 -o {device} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
             ));
             up.push(format!(
                 "iptables -t nat -A POSTROUTING -o {nat_if} -j MASQUERADE"
@@ -1685,6 +1685,13 @@ destination: 172.235.244.118
             up.iter()
                 .any(|hook| hook.contains("POSTROUTING -o eth0 -j MASQUERADE"))
         );
+        assert!(
+            up.iter()
+                .any(|hook| hook == "iptables -I FORWARD 1 -i runnelwg0 -j ACCEPT")
+        );
+        assert!(up.iter().any(|hook| {
+            hook == "iptables -I FORWARD 1 -o runnelwg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT"
+        }));
         assert!(
             down.iter()
                 .any(|hook| hook.contains("-D POSTROUTING -o eth0 -j MASQUERADE"))
