@@ -41,3 +41,33 @@ jobs:
 
       - name: Run Tests
         run: cargo test --all-targets --all-features
+
+  macos:
+    name: macOS
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --locked --all-targets --all-features
+
+      - name: Run Non-Privileged Tests
+        run: cargo test --locked --all-targets --all-features
