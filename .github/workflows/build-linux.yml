@@ -1,0 +1,52 @@
+name: Build Linux Binary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build linux-x86_64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: ${{ runner.os }}-x86_64-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-x86_64-cargo-release-
+
+      - name: Build Release Binary
+        run: cargo build --release --locked
+
+      - name: Prepare Artifact
+        run: |
+          mkdir -p dist
+          install -m 755 target/release/runnel dist/runnel
+          (cd dist && sha256sum runnel > runnel.sha256)
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: runnel-linux-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 3
