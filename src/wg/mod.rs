@@ -24,6 +24,10 @@ use serde::Deserialize;
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 pub(crate) const AUTO_WG_DEVICE: &str = "auto";
@@ -31,8 +35,26 @@ pub(crate) const DEFAULT_TUNNEL_MTU: u16 = 1420;
 pub(crate) const HANDSHAKE_BUFFER_SIZE: usize = 2048;
 pub(crate) const HEALTH_CHECK_DNS_PROBE_DOMAIN: &str = "runnel-health-check.invalid";
 const WG_KEY_LEN: usize = 32;
+const MAX_TUNNEL_INDEX: u32 = u32::MAX >> 8;
+static NEXT_TUNNEL_INDEX: OnceLock<AtomicU32> = OnceLock::new();
 #[cfg(target_os = "macos")]
 const MACOS_AUTO_WG_START_INDEX: u16 = 233;
+
+pub(crate) fn next_tunnel_index() -> u32 {
+    let counter = NEXT_TUNNEL_INDEX.get_or_init(|| {
+        let seed = getrandom::u32().unwrap_or_else(|_| std::process::id());
+        AtomicU32::new(seed % MAX_TUNNEL_INDEX + 1)
+    });
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(if current == MAX_TUNNEL_INDEX {
+                1
+            } else {
+                current + 1
+            })
+        })
+        .expect("tunnel index update always succeeds")
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -401,8 +423,8 @@ pub(crate) async fn wait_for_shutdown_signal() -> Result<()> {
 mod tests {
     use super::{
         AUTO_WG_DEVICE, HANDSHAKE_BUFFER_SIZE, WgRuntimeConfig, default_client_allowed_ips,
-        default_server_allowed_ips, is_auto_device, normalize_allowed_ips, parse_key,
-        resolve_requested_device,
+        default_server_allowed_ips, is_auto_device, next_tunnel_index, normalize_allowed_ips,
+        parse_key, resolve_requested_device,
     };
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use boringtun::{
@@ -441,6 +463,18 @@ mod tests {
             other => panic!("expected handshake packet, got {other:?}"),
         };
         assert_eq!(packet_len, 148);
+    }
+
+    #[test]
+    fn generated_tunnel_indices_are_nonzero_and_unique() {
+        let first = next_tunnel_index();
+        let second = next_tunnel_index();
+
+        assert_ne!(first, 0);
+        assert_ne!(second, 0);
+        assert_ne!(first, second);
+        assert!(first <= super::MAX_TUNNEL_INDEX);
+        assert!(second <= super::MAX_TUNNEL_INDEX);
     }
 
     #[test]

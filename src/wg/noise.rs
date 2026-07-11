@@ -7,7 +7,7 @@ use super::{
         DynamicRouteManager, HookGuard, SwitchableHookGuard, effective_hook_plan,
         plan_client_hooks, plan_server_hooks, run_hooks,
     },
-    select_device_name,
+    next_tunnel_index, select_device_name,
     server::WgServerArgs,
     tcpdump::{self, TcpdumpFilter},
     wait_for_shutdown_signal,
@@ -56,20 +56,54 @@ const MASK_FRAME_OVERHEAD: usize = MASK_HEADER_LEN + MASK_TAG_LEN + WG_OBFS_MAX_
 const LOCAL_PATH_LOST_SEND_THRESHOLD: u32 = 3;
 type HmacSha256 = Hmac<Sha256>;
 
+pub(super) struct NoiseTransport {
+    pub(super) socket: UdpSocket,
+    pub(super) tunnel: Tunn,
+    pub(super) codec: NoisePacketCodec,
+    pub(super) handshake_established: bool,
+    index: u32,
+}
+
+pub(super) async fn prepare_client_transport(
+    runtime: &WgRuntimeConfig,
+    endpoint: SocketAddr,
+    obfs: WgObfsMode,
+    obfs_profile: WgObfsProfile,
+) -> Result<NoiseTransport> {
+    let socket = UdpSocket::bind(bind_addr_for_endpoint(runtime.bind, endpoint))
+        .await
+        .with_context(|| format!("failed to bind wg noise client UDP socket {}", runtime.bind))?;
+    Ok(new_transport(socket, runtime, obfs, obfs_profile))
+}
+
+fn new_transport(
+    socket: UdpSocket,
+    runtime: &WgRuntimeConfig,
+    obfs: WgObfsMode,
+    obfs_profile: WgObfsProfile,
+) -> NoiseTransport {
+    let index = next_tunnel_index();
+    NoiseTransport {
+        socket,
+        tunnel: runtime.new_tunnel(index),
+        codec: NoisePacketCodec::new(obfs, obfs_profile, runtime),
+        handshake_established: false,
+        index,
+    }
+}
+
 pub(super) async fn run_client_session(
     args: WgClientArgs,
     runtime: WgRuntimeConfig,
     endpoint: SocketAddr,
     restart_count: u64,
+    transport: NoiseTransport,
 ) -> Result<()> {
     let (tun, actual_device) = open_tun_device(&args.device)?;
     report_tunnel_stage(
         telemetry::TunnelState::InterfaceUp,
         format!("wg noise device {actual_device} is up"),
     );
-    let socket = UdpSocket::bind(bind_addr_for_endpoint(runtime.bind, endpoint))
-        .await
-        .with_context(|| format!("failed to bind wg noise client UDP socket {}", runtime.bind))?;
     let _tcpdump = args.tcpdump.then(|| {
         tcpdump::start(
             "wg-client",
@@ -166,20 +200,12 @@ pub(super) async fn run_client_session(
         dns_capture = args.dns_capture,
         mtu = runtime.mtu,
         restart_count,
+        tunnel_index = transport.index,
         engine = "noise",
         "wg client started"
     );
 
-    let noise_loop = run_noise_loop(
-        "wg-client",
-        tun,
-        socket,
-        runtime,
-        Some(endpoint),
-        false,
-        args.obfs,
-        args.obfs_profile(),
-    );
+    let noise_loop = run_noise_loop("wg-client", tun, transport, Some(endpoint), false);
     tokio::pin!(noise_loop);
     let result = tokio::select! {
         result = &mut noise_loop => result,
@@ -214,6 +240,7 @@ pub(crate) async fn run_server(args: WgServerArgs, runtime: WgRuntimeConfig) -> 
     let socket = UdpSocket::bind(runtime.bind)
         .await
         .with_context(|| format!("failed to bind wg noise server UDP socket {}", runtime.bind))?;
+    let transport = new_transport(socket, &runtime, args.obfs, args.obfs_profile());
     let _tcpdump = args.tcpdump.then(|| {
         tcpdump::start(
             "wg-server",
@@ -238,21 +265,12 @@ pub(crate) async fn run_server(args: WgServerArgs, runtime: WgRuntimeConfig) -> 
         peer_tunnel_ip = %runtime.peer_tunnel_ip,
         mtu = runtime.mtu,
         nat_out_interface = ?args.nat_out_interface,
+        tunnel_index = transport.index,
         engine = "noise",
         "wg server started"
     );
 
-    run_noise_loop(
-        "wg-server",
-        tun,
-        socket,
-        runtime,
-        None,
-        true,
-        args.obfs,
-        args.obfs_profile(),
-    )
-    .await
+    run_noise_loop("wg-server", tun, transport, None, true).await
 }
 
 struct WgNoiseTrafficSwitch {
@@ -382,15 +400,17 @@ fn open_tun_device(requested_device: &str) -> Result<(AsyncFd<TunSocket>, String
 async fn run_noise_loop(
     role: &'static str,
     tun: AsyncFd<TunSocket>,
-    socket: UdpSocket,
-    runtime: WgRuntimeConfig,
+    transport: NoiseTransport,
     initial_endpoint: Option<SocketAddr>,
     learn_endpoint: bool,
-    obfs: WgObfsMode,
-    obfs_profile: WgObfsProfile,
 ) -> Result<()> {
-    let mut tunnel = runtime.new_tunnel(1);
-    let codec = NoisePacketCodec::new(obfs, obfs_profile, &runtime);
+    let NoiseTransport {
+        socket,
+        mut tunnel,
+        codec,
+        handshake_established,
+        ..
+    } = transport;
     let mut peer = NoisePeerState::new(initial_endpoint, learn_endpoint);
     let mut tun_packet = vec![0u8; MAX_IP_PACKET_SIZE];
     let mut udp_packet = vec![0u8; MAX_NOISE_UDP_PACKET_SIZE];
@@ -406,7 +426,7 @@ async fn run_noise_loop(
     let shutdown = wait_for_shutdown_signal();
     tokio::pin!(shutdown);
 
-    if let Some(endpoint) = peer.endpoint() {
+    if !handshake_established && let Some(endpoint) = peer.endpoint() {
         let action = noise_action(tunnel.format_handshake_initiation(&mut out_packet, false));
         apply_noise_action(
             role,

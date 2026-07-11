@@ -355,6 +355,27 @@ async fn run_client_session(
     session_started: &mut bool,
 ) -> Result<()> {
     report_tunnel_stage(telemetry::TunnelState::Starting, "wg client starting");
+
+    if args.engine == WgEngine::Noise {
+        let endpoint = runtime.endpoint.context("wg client endpoint missing")?;
+        let mut transport =
+            noise::prepare_client_transport(&runtime, endpoint, args.obfs, obfs_profile).await?;
+        if !args.skip_handshake_probe {
+            probe_noise_handshake(&mut transport, endpoint, HANDSHAKE_PROBE_TIMEOUT).await?;
+            report_tunnel_stage(
+                telemetry::TunnelState::ConnectivityOk,
+                "wg client handshake probe succeeded",
+            );
+        } else {
+            report_tunnel_stage(
+                telemetry::TunnelState::Starting,
+                "wg client handshake probe skipped",
+            );
+        }
+        *session_started = true;
+        return noise::run_client_session(args, runtime, endpoint, restart_count, transport).await;
+    }
+
     if !args.skip_handshake_probe {
         probe_server_handshake(&runtime, args.obfs, obfs_profile, HANDSHAKE_PROBE_TIMEOUT).await?;
         report_tunnel_stage(
@@ -368,11 +389,6 @@ async fn run_client_session(
         );
     }
     *session_started = true;
-
-    if args.engine == WgEngine::Noise {
-        let endpoint = runtime.endpoint.context("wg client endpoint missing")?;
-        return noise::run_client_session(args, runtime, endpoint, restart_count).await;
-    }
 
     run_device_client_session(args, runtime, restart_count).await
 }
@@ -647,16 +663,25 @@ async fn probe_server_handshake(
     timeout_duration: Duration,
 ) -> Result<()> {
     let endpoint = runtime.endpoint.context("wg client endpoint missing")?;
-    let socket = UdpSocket::bind(probe_bind_addr(runtime.bind, endpoint))
-        .await
-        .with_context(|| {
-            format!(
-                "failed to bind wg client handshake probe socket for {}",
-                runtime.bind
-            )
-        })?;
-    let mut tunnel = runtime.new_tunnel(1);
-    let codec = noise::NoisePacketCodec::new(obfs, obfs_profile, runtime);
+    let mut probe_runtime = runtime.clone();
+    probe_runtime.bind = probe_bind_addr(runtime.bind, endpoint);
+    let mut transport =
+        noise::prepare_client_transport(&probe_runtime, endpoint, obfs, obfs_profile).await?;
+    probe_noise_handshake(&mut transport, endpoint, timeout_duration).await
+}
+
+async fn probe_noise_handshake(
+    transport: &mut noise::NoiseTransport,
+    endpoint: SocketAddr,
+    timeout_duration: Duration,
+) -> Result<()> {
+    let noise::NoiseTransport {
+        socket,
+        tunnel,
+        codec,
+        handshake_established,
+        ..
+    } = transport;
     let mut send_buf = [0u8; super::HANDSHAKE_BUFFER_SIZE];
     let packet = match tunnel.format_handshake_initiation(&mut send_buf, false) {
         TunnResult::WriteToNetwork(packet) => packet.to_vec(),
@@ -674,7 +699,7 @@ async fn probe_server_handshake(
     let encoded_len = codec.encode(&packet, &mut encoded_buf)?;
 
     send_probe_udp_packet(
-        &socket,
+        socket,
         &encoded_buf[..encoded_len],
         endpoint,
         "sending WG handshake probe",
@@ -701,15 +726,17 @@ async fn probe_server_handshake(
                 TunnResult::WriteToNetwork(packet) => {
                     let encoded_len = codec.encode(packet, &mut encoded_buf)?;
                     send_probe_udp_packet(
-                        &socket,
+                        socket,
                         &encoded_buf[..encoded_len],
                         endpoint,
                         "sending WG handshake probe keepalive",
                     )
                     .await?;
+                    *handshake_established = true;
                     return Ok(());
                 }
                 TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
+                    *handshake_established = true;
                     return Ok(());
                 }
                 TunnResult::Done | TunnResult::Err(_) => continue,
@@ -983,7 +1010,8 @@ mod tests {
     use super::{
         WG_CLIENT_RECOVERY_INITIAL_DELAY, WgClientArgs, WgClientHandshakeProbeTimedOut,
         WgClientNetworkNotReady, is_recoverable_udp_path_error, next_recovery_delay, plan_lines,
-        probe_server_handshake, recoverable_handshake_probe_timeout, udp_os_error_name,
+        probe_noise_handshake, probe_server_handshake, recoverable_handshake_probe_timeout,
+        udp_os_error_name,
     };
     use crate::proxy::route::RouteRuleConfig;
     use crate::wg::{
@@ -1307,6 +1335,47 @@ mod tests {
         )
         .await
         .unwrap();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn noise_handshake_probe_preserves_established_transport() {
+        let client_private = [0x11u8; 32];
+        let server_private = [0x22u8; 32];
+        let client_public = public_key(client_private);
+        let server_public = public_key(server_private);
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = server_socket.local_addr().unwrap();
+        let server_task = spawn_handshake_responder(
+            server_socket,
+            server_runtime(endpoint.port(), server_private, client_public),
+            WgObfsMode::Off,
+        );
+        let runtime = client_runtime(endpoint, client_private, server_public);
+        let mut transport = noise::prepare_client_transport(
+            &runtime,
+            endpoint,
+            WgObfsMode::Off,
+            WgObfsProfile::default(),
+        )
+        .await
+        .unwrap();
+
+        probe_noise_handshake(&mut transport, endpoint, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert!(transport.handshake_established);
+        let packet = [
+            0x45, 0x00, 0x00, 0x14, 0x12, 0x34, 0x00, 0x00, 64, 17, 0x00, 0x00, 10, 8, 0, 2, 1, 1,
+            1, 1,
+        ];
+        let mut output = [0u8; super::super::HANDSHAKE_BUFFER_SIZE];
+        let encrypted = match transport.tunnel.encapsulate(&packet, &mut output) {
+            TunnResult::WriteToNetwork(packet) => packet,
+            other => panic!("expected established data packet, got {other:?}"),
+        };
+        assert_eq!(u32::from_le_bytes(encrypted[..4].try_into().unwrap()), 4);
         server_task.await.unwrap();
     }
 
