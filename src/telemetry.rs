@@ -640,7 +640,10 @@ impl SnapshotState {
     }
 
     fn capture_recent_event(&mut self, event: &TraceEvent) {
-        if is_suppressed_recent_event(event) {
+        if event.message == "traffic sample"
+            || event.message == "dns query"
+            || (event.message == "tunnel health" && event.level != "WARN")
+        {
             return;
         }
         if event.message.contains("relay completed") && self.recent_events.len() >= RECENT_EVENTS {
@@ -665,13 +668,6 @@ impl SnapshotState {
             .map(|context| context.log_timezone_offset_secs)
             .unwrap_or_default()
     }
-}
-
-pub(crate) fn is_suppressed_recent_event(event: &TraceEvent) -> bool {
-    event.message == "traffic sample"
-        || event.message == "dns query"
-        || event.message == "wg noise packet sent"
-        || (event.message == "tunnel health" && event.level != "WARN")
 }
 
 pub fn route_bucket_for_event(event: &TraceEvent) -> Option<RouteBucket> {
@@ -1531,15 +1527,6 @@ mod tests {
         assert_eq!(snapshot.upload_history.last().copied(), Some(12));
         assert_eq!(snapshot.download_history.last().copied(), Some(34));
         assert!(snapshot.last_traffic_at.is_some());
-    }
-
-    #[test]
-    fn wg_packet_debug_does_not_fill_snapshot_recent_events() {
-        let mut snapshot = SnapshotState::default();
-
-        snapshot.ingest(&trace_event("DEBUG", "wg noise packet sent", &[]));
-
-        assert!(snapshot.recent_events.is_empty());
     }
 
     #[test]
