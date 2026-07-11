@@ -8,7 +8,7 @@ use super::{
     },
     hooks::{
         DynamicRouteManager, EgressRouteNotReady, SwitchableHookGuard, effective_hook_plan,
-        log_plan_lines, plan_client_hooks, print_plan, run_hooks,
+        log_plan_lines, plan_client_hooks, prepare_client_endpoint_bypass, print_plan, run_hooks,
     },
     noise, normalize_allowed_ips, parse_key, parse_socket_addr,
     preflight::{WgPreflightRole, check as check_preflight},
@@ -367,6 +367,9 @@ async fn run_client_session(
     session_started: &mut bool,
 ) -> Result<()> {
     report_tunnel_stage(telemetry::TunnelState::Starting, "wg client starting");
+    // Install the physical endpoint route before binding the UDP socket so macOS does not cache
+    // a stale tunnel or pre-roam path for the lifetime of the recovered session.
+    let _endpoint_bypass = prepare_client_endpoint_bypass(&runtime)?;
 
     if args.engine == WgEngine::Noise {
         let endpoint = runtime.endpoint.context("wg client endpoint missing")?;

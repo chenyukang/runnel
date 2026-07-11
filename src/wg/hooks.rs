@@ -490,6 +490,39 @@ pub(crate) fn plan_client_hooks(device: &str, runtime: &WgRuntimeConfig) -> Resu
     build_client_hook_plan(device, endpoint_ip, runtime, &route)
 }
 
+pub(crate) fn prepare_client_endpoint_bypass(runtime: &WgRuntimeConfig) -> Result<HookGuard> {
+    let endpoint_ip = runtime
+        .endpoint_ip()
+        .context("wg client endpoint is required to prepare its bypass route")?;
+    let route = detect_egress_route(endpoint_ip)?;
+    let plan = build_client_endpoint_bypass_plan(endpoint_ip, &route)?;
+    run_hooks(&plan.up)?;
+    Ok(HookGuard::new("wg-client-endpoint", plan.down))
+}
+
+fn build_client_endpoint_bypass_plan(endpoint_ip: IpAddr, route: &RouteInfo) -> Result<HookPlan> {
+    let interface = route.interface.as_deref();
+    if interface.is_none() {
+        bail!(
+            "failed to determine outbound interface for {}; explicit hooks are required",
+            endpoint_ip
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    if interface.is_some_and(is_macos_tunnel_interface) {
+        bail!(
+            "route to WG endpoint {endpoint_ip} currently resolves to tunnel interface {}; clean stale tunnel routes before starting the client",
+            interface.unwrap()
+        );
+    }
+
+    Ok(HookPlan {
+        up: vec![direct_host_add_command(endpoint_ip, route)],
+        down: vec![direct_host_delete_command(endpoint_ip)],
+    })
+}
+
 pub(crate) fn plan_server_hooks(
     device: &str,
     runtime: &WgRuntimeConfig,
@@ -516,19 +549,7 @@ pub(crate) fn build_client_hook_plan(
 
     #[cfg(target_os = "macos")]
     {
-        let interface = route.interface.as_deref();
-        if interface.is_none() {
-            bail!(
-                "failed to determine macOS outbound interface for {}; explicit hooks are required",
-                endpoint_ip
-            );
-        }
-        if interface.is_some_and(is_macos_tunnel_interface) {
-            bail!(
-                "route to WG endpoint {endpoint_ip} currently resolves to tunnel interface {}; clean stale tunnel routes before starting the client",
-                interface.unwrap()
-            );
-        }
+        build_client_endpoint_bypass_plan(endpoint_ip, route)?;
 
         let mut up = vec![macos_ifconfig_command(device, tunnel, runtime.mtu)];
         up.push(macos_tunnel_peer_route_command(device, tunnel.peer_ip()));
@@ -552,12 +573,7 @@ pub(crate) fn build_client_hook_plan(
 
     #[cfg(target_os = "linux")]
     {
-        if route.interface.is_none() {
-            bail!(
-                "failed to determine linux outbound interface for {}; explicit hooks are required",
-                endpoint_ip
-            );
-        }
+        build_client_endpoint_bypass_plan(endpoint_ip, route)?;
 
         let mut up = vec![
             linux_address_add_command(device, tunnel),
@@ -1170,7 +1186,9 @@ fn parse_linux_route_get(target: &str, output: &str) -> Result<RouteInfo> {
 mod tests {
     #[cfg(target_os = "macos")]
     use super::EgressRouteNotReady;
-    use super::{RouteInfo, build_client_hook_plan, exclude_routes};
+    use super::{
+        RouteInfo, build_client_endpoint_bypass_plan, build_client_hook_plan, exclude_routes,
+    };
     use crate::wg::{WgRuntimeConfig, default_client_allowed_ips};
     use ipnet::IpNet;
     use std::{
@@ -1399,6 +1417,27 @@ destination: 172.235.244.118
                 .route_output_for_log()
                 .expect("route output should be preserved")
                 .contains("destination: 172.235.244.118")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_endpoint_bypass_plan_is_ready_before_client_routes() {
+        let endpoint = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+        let plan = build_client_endpoint_bypass_plan(
+            endpoint,
+            &RouteInfo {
+                interface: Some("en0".to_owned()),
+                gateway: Some("192.168.3.1".to_owned()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.up.len(), 1);
+        assert!(plan.up[0].contains("route -q -n add -host 198.51.100.10 192.168.3.1"));
+        assert_eq!(
+            plan.down,
+            vec!["route -q -n delete -host 198.51.100.10 >/dev/null 2>&1 || true"]
         );
     }
 
