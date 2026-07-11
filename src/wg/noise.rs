@@ -131,6 +131,7 @@ pub(super) async fn run_client_session(
     let bypass_dns = dns_guard
         .as_ref()
         .and_then(system_proxy::SystemDnsGuard::direct_dns_upstream);
+    let (health_recovery_tx, mut health_recovery_rx) = tokio::sync::mpsc::channel(1);
     let (traffic_state_tx, traffic_state_rx) = watch::channel(telemetry::TrafficState::Proxying);
     let traffic_switch = Arc::new(Mutex::new(WgNoiseTrafficSwitch::new(
         route_switch,
@@ -153,6 +154,7 @@ pub(super) async fn run_client_session(
         dns_monitor,
         dns_capture: args.dns_capture,
         traffic_state: traffic_state_rx,
+        recovery_tx: Some(health_recovery_tx),
     });
 
     info!(
@@ -168,7 +170,7 @@ pub(super) async fn run_client_session(
         "wg client started"
     );
 
-    let result = run_noise_loop(
+    let noise_loop = run_noise_loop(
         "wg-client",
         tun,
         socket,
@@ -177,8 +179,15 @@ pub(super) async fn run_client_session(
         false,
         args.obfs,
         args.obfs_profile(),
-    )
-    .await;
+    );
+    tokio::pin!(noise_loop);
+    let result = tokio::select! {
+        result = &mut noise_loop => result,
+        recovery = health_recovery_rx.recv() => match recovery {
+            Some(recovery) => Err(recovery.into()),
+            None => wait_for_shutdown_signal().await,
+        },
+    };
     match &result {
         Ok(()) => report_tunnel_stage(
             telemetry::TunnelState::Stopping,

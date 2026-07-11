@@ -2,7 +2,10 @@ use super::{
     DEFAULT_TUNNEL_MTU, WgEngine, WgObfsMode, WgObfsProfile, WgRuntimeConfig, create_device_handle,
     default_client_allowed_ips_for,
     dns::{DnsCaptureController, DomainRuleEngine, start_dns_capture},
-    health::{WgClientHealthMonitorConfig, report_tunnel_stage, start_client_health_monitor},
+    health::{
+        WgClientHealthMonitorConfig, WgClientHealthRecovery, report_tunnel_stage,
+        start_client_health_monitor,
+    },
     hooks::{
         DynamicRouteManager, EgressRouteNotReady, SwitchableHookGuard, effective_hook_plan,
         log_plan_lines, plan_client_hooks, print_plan, run_hooks,
@@ -297,6 +300,19 @@ async fn run_with_recovery(
                         backoff_ms = restart_delay.as_millis(),
                         "wg client network not ready; retrying session after backoff"
                     );
+                } else if let Some(health_recovery) = error.downcast_ref::<WgClientHealthRecovery>()
+                {
+                    restart_count += 1;
+                    warn!(
+                        engine = ?args.engine,
+                        endpoint = %endpoint,
+                        role = health_recovery.role,
+                        consecutive_failures = health_recovery.consecutive_failures,
+                        health_detail = %health_recovery.detail,
+                        restart_count,
+                        backoff_ms = restart_delay.as_millis(),
+                        "wg client tunnel health degraded; rebuilding session after backoff"
+                    );
                 } else if let Some(probe_timeout) =
                     recoverable_handshake_probe_timeout(&error, session_started)
                 {
@@ -437,6 +453,7 @@ async fn run_device_client_session(
     let bypass_dns = dns_guard
         .as_ref()
         .and_then(system_proxy::SystemDnsGuard::direct_dns_upstream);
+    let (health_recovery_tx, mut health_recovery_rx) = tokio::sync::mpsc::channel(1);
     let (traffic_state_tx, traffic_state_rx) = watch::channel(telemetry::TrafficState::Proxying);
     let traffic_switch = Arc::new(Mutex::new(WgTrafficSwitch::new(
         route_switch,
@@ -459,6 +476,7 @@ async fn run_device_client_session(
         dns_monitor,
         dns_capture: args.dns_capture,
         traffic_state: traffic_state_rx,
+        recovery_tx: Some(health_recovery_tx),
     });
 
     info!(
@@ -474,7 +492,13 @@ async fn run_device_client_session(
         "wg client started"
     );
 
-    let result = wait_for_shutdown_signal().await;
+    let result = tokio::select! {
+        signal = wait_for_shutdown_signal() => signal,
+        recovery = health_recovery_rx.recv() => match recovery {
+            Some(recovery) => Err(recovery.into()),
+            None => wait_for_shutdown_signal().await,
+        },
+    };
     report_tunnel_stage(telemetry::TunnelState::Stopping, "wg client shutting down");
     health_task.abort();
     let _ = health_task.await;

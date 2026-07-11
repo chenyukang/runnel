@@ -6,6 +6,8 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use std::{
+    error::Error as StdError,
+    fmt,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
     process::Stdio,
@@ -14,7 +16,7 @@ use std::{
 use tokio::{
     net::UdpSocket,
     process::Command,
-    sync::watch,
+    sync::{mpsc, watch},
     task::JoinHandle,
     time::{MissedTickBehavior, interval, timeout},
 };
@@ -23,6 +25,8 @@ const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const DNS_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECTIVITY_TIMEOUT: Duration = Duration::from_secs(3);
 const FRESH_HANDSHAKE_MAX_AGE: Duration = Duration::from_secs(180);
+const RECOVERY_DEGRADED_CHECKS_THRESHOLD: u32 = 3;
+
 pub(crate) struct WgClientHealthMonitorConfig {
     pub role: &'static str,
     pub peer_tunnel_ip: IpAddr,
@@ -30,7 +34,27 @@ pub(crate) struct WgClientHealthMonitorConfig {
     pub dns_monitor: Option<SystemDnsMonitor>,
     pub dns_capture: bool,
     pub traffic_state: watch::Receiver<TrafficState>,
+    pub recovery_tx: Option<mpsc::Sender<WgClientHealthRecovery>>,
 }
+
+#[derive(Clone, Debug)]
+pub(crate) struct WgClientHealthRecovery {
+    pub(crate) role: &'static str,
+    pub(crate) detail: String,
+    pub(crate) consecutive_failures: u32,
+}
+
+impl fmt::Display for WgClientHealthRecovery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} tunnel health degraded for {} consecutive checks: {}",
+            self.role, self.consecutive_failures, self.detail
+        )
+    }
+}
+
+impl StdError for WgClientHealthRecovery {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HealthCheckResult {
@@ -104,6 +128,7 @@ pub(crate) fn start_client_health_monitor(config: WgClientHealthMonitorConfig) -
 
 async fn run_client_health_monitor(config: WgClientHealthMonitorConfig) {
     let mut reporter = HealthReporter::default();
+    let mut recovery_degraded_checks = 0;
     let mut checks = interval(HEALTH_CHECK_INTERVAL);
     checks.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -125,8 +150,36 @@ async fn run_client_health_monitor(config: WgClientHealthMonitorConfig) {
             compose_client_health(config.role, dns, connectivity)
         };
 
+        let recovery = record_recovery_degraded_check(&mut recovery_degraded_checks, &health).map(
+            |consecutive_failures| WgClientHealthRecovery {
+                role: config.role,
+                detail: health.detail.clone(),
+                consecutive_failures,
+            },
+        );
         reporter.report(health);
+
+        if let (Some(recovery), Some(recovery_tx)) = (recovery, &config.recovery_tx) {
+            let _ = recovery_tx.send(recovery).await;
+            return;
+        }
     }
+}
+
+fn record_recovery_degraded_check(
+    recovery_degraded_checks: &mut u32,
+    health: &TunnelHealth,
+) -> Option<u32> {
+    if health.connectivity == TunnelCheckState::Error {
+        *recovery_degraded_checks += 1;
+        if *recovery_degraded_checks >= RECOVERY_DEGRADED_CHECKS_THRESHOLD {
+            return Some(*recovery_degraded_checks);
+        }
+    } else {
+        *recovery_degraded_checks = 0;
+    }
+
+    None
 }
 
 async fn check_dns(
@@ -485,6 +538,64 @@ mod tests {
         assert_eq!(health.state, TunnelState::Degraded);
         assert_eq!(health.dns, TunnelCheckState::Ok);
         assert_eq!(health.connectivity, TunnelCheckState::Error);
+    }
+
+    #[test]
+    fn recovery_streak_triggers_after_consecutive_connectivity_errors() {
+        let health = TunnelHealth {
+            state: TunnelState::Degraded,
+            detail: "connectivity failed".to_owned(),
+            dns: TunnelCheckState::Ok,
+            connectivity: TunnelCheckState::Error,
+            handshake_age_secs: None,
+        };
+        let mut streak = 0;
+
+        assert_eq!(record_recovery_degraded_check(&mut streak, &health), None);
+        assert_eq!(record_recovery_degraded_check(&mut streak, &health), None);
+        assert_eq!(
+            record_recovery_degraded_check(&mut streak, &health),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn recovery_streak_ignores_dns_only_errors_and_resets_on_bypass() {
+        let dns_only = TunnelHealth {
+            state: TunnelState::Degraded,
+            detail: "dns failed".to_owned(),
+            dns: TunnelCheckState::Error,
+            connectivity: TunnelCheckState::Ok,
+            handshake_age_secs: Some(2),
+        };
+        let bypass = TunnelHealth {
+            state: TunnelState::Bypass,
+            detail: "bypassing tunnel".to_owned(),
+            dns: TunnelCheckState::Disabled,
+            connectivity: TunnelCheckState::Disabled,
+            handshake_age_secs: None,
+        };
+        let connectivity_error = TunnelHealth {
+            state: TunnelState::Degraded,
+            detail: "connectivity failed".to_owned(),
+            dns: TunnelCheckState::Ok,
+            connectivity: TunnelCheckState::Error,
+            handshake_age_secs: None,
+        };
+        let mut streak = 0;
+
+        assert_eq!(
+            record_recovery_degraded_check(&mut streak, &connectivity_error),
+            None
+        );
+        assert_eq!(record_recovery_degraded_check(&mut streak, &dns_only), None);
+        assert_eq!(streak, 0);
+        assert_eq!(
+            record_recovery_degraded_check(&mut streak, &connectivity_error),
+            None
+        );
+        assert_eq!(record_recovery_degraded_check(&mut streak, &bypass), None);
+        assert_eq!(streak, 0);
     }
 
     #[test]
