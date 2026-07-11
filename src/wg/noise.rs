@@ -15,7 +15,7 @@ use super::{
 use anyhow::{Context, Result, bail};
 use boringtun::{
     device::{Error as DeviceError, tun::TunSocket},
-    noise::{Tunn, TunnResult},
+    noise::{Tunn, TunnResult, errors::WireGuardError},
     x25519::{PublicKey, StaticSecret},
 };
 use hmac::{Hmac, Mac};
@@ -450,7 +450,15 @@ async fn run_noise_loop(
                 if len == 0 {
                     continue;
                 }
-                let action = noise_action(tunnel.encapsulate(&tun_packet[..len], &mut out_packet));
+                let Some(action) = encapsulate_tun_packet(
+                    &mut tunnel,
+                    peer.endpoint(),
+                    &tun_packet[..len],
+                    &mut out_packet,
+                ) else {
+                    debug!(role, bytes = len, "wg noise dropped TUN packet before peer endpoint was known");
+                    continue;
+                };
                 apply_noise_action(role, &tun, &socket, &codec, &mut encoded_packet, peer.endpoint(), action, &mut traffic, &mut path_health).await?;
             }
             received = socket.recv_from(&mut udp_packet) => {
@@ -465,13 +473,41 @@ async fn run_noise_loop(
                 flush_queued_packets(role, &mut tunnel, &tun, &socket, &codec, peer.endpoint(), &mut out_packet, &mut encoded_packet, &mut traffic, &mut path_health).await?;
             }
             _ = timers.tick() => {
-                let action = noise_action(tunnel.update_timers(&mut out_packet));
-                apply_noise_action(role, &tun, &socket, &codec, &mut encoded_packet, peer.endpoint(), action, &mut traffic, &mut path_health).await?;
+                if let Some(action) = timer_action(role, &mut peer, tunnel.update_timers(&mut out_packet))? {
+                    apply_noise_action(role, &tun, &socket, &codec, &mut encoded_packet, peer.endpoint(), action, &mut traffic, &mut path_health).await?;
+                }
             }
             _ = traffic_timer.tick() => {
                 traffic.emit(role);
             }
         }
+    }
+}
+
+fn encapsulate_tun_packet(
+    tunnel: &mut Tunn,
+    peer_endpoint: Option<SocketAddr>,
+    packet: &[u8],
+    out_packet: &mut [u8],
+) -> Option<NoiseAction> {
+    peer_endpoint?;
+    Some(noise_action(tunnel.encapsulate(packet, out_packet)))
+}
+
+fn timer_action(
+    role: &'static str,
+    peer: &mut NoisePeerState,
+    result: TunnResult<'_>,
+) -> Result<Option<NoiseAction>> {
+    match result {
+        TunnResult::Err(WireGuardError::ConnectionExpired) if peer.learn_endpoint => {
+            peer.forget_endpoint(role);
+            Ok(None)
+        }
+        TunnResult::Err(WireGuardError::ConnectionExpired) => {
+            Err(WgNoiseConnectionExpired { role }.into())
+        }
+        result => Ok(Some(noise_action(result))),
     }
 }
 
@@ -810,6 +846,19 @@ impl fmt::Display for WgNoiseLocalPathLost {
 }
 
 impl StdError for WgNoiseLocalPathLost {}
+
+#[derive(Debug)]
+pub(super) struct WgNoiseConnectionExpired {
+    role: &'static str,
+}
+
+impl fmt::Display for WgNoiseConnectionExpired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} WireGuard session expired", self.role)
+    }
+}
+
+impl StdError for WgNoiseConnectionExpired {}
 
 async fn maybe_obfs_jitter(codec: &NoisePacketCodec) {
     let jitter = codec.jitter();
@@ -1152,6 +1201,16 @@ impl NoisePeerState {
 
         Some(source)
     }
+
+    fn forget_endpoint(&mut self, role: &'static str) {
+        if let Some(endpoint) = self.endpoint.take() {
+            warn!(
+                role,
+                endpoint = %endpoint,
+                "wg noise connection expired; forgetting stale peer endpoint"
+            );
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1200,14 +1259,18 @@ mod tests {
     use super::{
         LOCAL_PATH_LOST_SEND_THRESHOLD, MASK_HEADER_LEN, MASK_TAG_LEN, MAX_NOISE_UDP_PACKET_SIZE,
         MAX_WG_PACKET_SIZE, NoiseAction, NoisePacketCodec, NoisePeerState, UdpPathHealth,
-        UdpSendFailureKind, WgNoiseLocalPathLost, bind_addr_for_endpoint, classify_udp_send_error,
-        noise_action, udp_os_error_name,
+        UdpSendFailureKind, WgNoiseConnectionExpired, WgNoiseLocalPathLost, bind_addr_for_endpoint,
+        classify_udp_send_error, encapsulate_tun_packet, noise_action, timer_action,
+        udp_os_error_name,
     };
     use crate::wg::{
         WgObfsMode, WgObfsProfile, WgRuntimeConfig, default_client_allowed_ips,
         default_server_allowed_ips,
     };
-    use boringtun::x25519::{PublicKey, StaticSecret};
+    use boringtun::{
+        noise::{TunnResult, errors::WireGuardError},
+        x25519::{PublicKey, StaticSecret},
+    };
     use std::{
         io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -1386,6 +1449,42 @@ mod tests {
             Some(server_endpoint)
         );
         assert_eq!(client_peer.endpoint(), Some(server_endpoint));
+    }
+
+    #[test]
+    fn server_does_not_start_handshake_before_endpoint_is_known() {
+        let runtime = server_runtime([0x22; 32], public_key([0x11; 32]));
+        let mut tunnel = runtime.new_tunnel(7);
+        let mut out = vec![0u8; MAX_WG_PACKET_SIZE];
+        let packet = ipv4_packet(Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(10, 8, 0, 2), 6);
+
+        assert!(encapsulate_tun_packet(&mut tunnel, None, &packet, &mut out).is_none());
+        assert!(matches!(tunnel.update_timers(&mut out), TunnResult::Done));
+    }
+
+    #[test]
+    fn connection_expiration_forgets_server_endpoint_and_restarts_client() {
+        let endpoint = SocketAddr::from(([203, 0, 113, 10], 4242));
+        let mut server_peer = NoisePeerState::new(Some(endpoint), true);
+
+        let action = timer_action(
+            "wg-server",
+            &mut server_peer,
+            TunnResult::Err(WireGuardError::ConnectionExpired),
+        )
+        .unwrap();
+        assert!(action.is_none());
+        assert_eq!(server_peer.endpoint(), None);
+
+        let mut client_peer = NoisePeerState::new(Some(endpoint), false);
+        let error = timer_action(
+            "wg-client",
+            &mut client_peer,
+            TunnResult::Err(WireGuardError::ConnectionExpired),
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<WgNoiseConnectionExpired>().is_some());
+        assert_eq!(client_peer.endpoint(), Some(endpoint));
     }
 
     #[test]

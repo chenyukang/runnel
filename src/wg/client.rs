@@ -272,6 +272,18 @@ async fn run_with_recovery(
                         last_error = %local_path_lost.last_error,
                         "wg client local UDP path lost; rebuilding session after backoff"
                     );
+                } else if error
+                    .downcast_ref::<noise::WgNoiseConnectionExpired>()
+                    .is_some()
+                {
+                    restart_count += 1;
+                    warn!(
+                        engine = ?args.engine,
+                        endpoint = %endpoint,
+                        restart_count,
+                        backoff_ms = restart_delay.as_millis(),
+                        "wg client WireGuard session expired; rebuilding session after backoff"
+                    );
                 } else if let Some(route_not_ready) = error.downcast_ref::<EgressRouteNotReady>() {
                     restart_count += 1;
                     warn!(
